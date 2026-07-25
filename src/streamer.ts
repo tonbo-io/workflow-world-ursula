@@ -287,6 +287,24 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     return producer;
   }
 
+  async function serializeStream<T>(
+    url: URL,
+    operation: (producer: Producer) => Promise<T>
+  ): Promise<T> {
+    const producer = producerFor(url.toString());
+    const previous = producer.pending;
+    let release: () => void = () => {};
+    producer.pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation(producer);
+    } finally {
+      release();
+    }
+  }
+
   async function append(
     runId: string,
     name: string,
@@ -294,20 +312,10 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
   ): Promise<void> {
     if (records.length === 0) return;
     const url = streamUrl(runId, name);
-    await ensureStream(url);
-    await registerStream(runId, name);
-
-    const key = url.toString();
-    const producer = producerFor(key);
-    const previous = producer.pending;
-    let release: () => void = () => {};
-    producer.pending = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-
-    const sequence = producer.nextSequence;
-    try {
+    await serializeStream(url, async (producer) => {
+      await ensureStream(url);
+      await registerStream(runId, name);
+      const sequence = producer.nextSequence;
       await expectSuccess(
         'append stream',
         await fetchImpl(url, {
@@ -322,9 +330,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         })
       );
       producer.nextSequence += 1;
-    } finally {
-      release();
-    }
+    });
   }
 
   async function head(runId: string, name: string): Promise<StreamHead> {
@@ -401,19 +407,21 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       async close(runId, name) {
         const resolvedRunId = await runId;
         const url = streamUrl(resolvedRunId, name);
-        await ensureStream(url);
-        await registerStream(resolvedRunId, name);
-        const response = await fetchImpl(url, {
-          method: 'POST',
-          headers: headers({ 'stream-closed': 'true' }),
+        await serializeStream(url, async () => {
+          await ensureStream(url);
+          await registerStream(resolvedRunId, name);
+          const response = await fetchImpl(url, {
+            method: 'POST',
+            headers: headers({ 'stream-closed': 'true' }),
+          });
+          if (
+            response.status === 409 &&
+            response.headers.get('stream-closed') === 'true'
+          ) {
+            return;
+          }
+          await expectSuccess('close stream', response);
         });
-        if (
-          response.status === 409 &&
-          response.headers.get('stream-closed') === 'true'
-        ) {
-          return;
-        }
-        await expectSuccess('close stream', response);
       },
 
       async list(runId) {
