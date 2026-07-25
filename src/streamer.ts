@@ -305,7 +305,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       );
       registeredStreams.add(cacheKey);
     });
-    const tracked = registering.finally(() => {
+    const tracked = registering.then(() => {
       if (registryOperations.get(registryKey) === tracked) {
         registryOperations.delete(registryKey);
       }
@@ -528,6 +528,10 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
 
       async list(runId) {
         const url = registryUrl(runId);
+        // A live reader starts its registry write in the background so its
+        // long-poll can attach as soon as the data stream exists. Preserve
+        // read-your-writes for discovery by joining that work here.
+        await registryOperations.get(url.toString());
         await ensureStream(url);
 
         const names = new Set<string>();
@@ -605,10 +609,14 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         // invocation writes a chunk. Ursula reads require the stream to
         // exist. Register it at the same time so a later first write only pays
         // for the append in its latency-sensitive path.
-        await Promise.all([
-          ensureStream(streamUrl(runId, name)),
-          registerStream(runId, name),
-        ]);
+        const streamReady = ensureStream(streamUrl(runId, name));
+        const registration = registerStream(runId, name);
+        // Registration is discovery metadata, not a prerequisite for reading
+        // the stream. Observe failures to avoid an unhandled rejection; a
+        // writer or streams.list() still joins the retained failed operation
+        // and surfaces/retries it.
+        void registration.catch(() => undefined);
+        await streamReady;
         let cursor =
           startIndex < 0
             ? Math.max(0, (await head(runId, name)).nextRecord + startIndex)

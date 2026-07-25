@@ -399,4 +399,61 @@ describe('Ursula Workflow streamer', () => {
     expect(fetch.mock.calls[2]?.[0]?.toString()).toContain('live=long-poll');
     expect(fetch.mock.calls[3]?.[1]?.method).toBe('POST');
   });
+
+  it('attaches a live read without waiting for serialized registry metadata', async () => {
+    let finishRegistration: ((value: Response) => void) | undefined;
+    const registration = new Promise<Response>((resolve) => {
+      finishRegistration = resolve;
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>((input, init) => {
+      const url = input.toString();
+      if (
+        init?.method === 'PUT' &&
+        typeof init.body === 'string' &&
+        init.body.includes('"name":"output"')
+      ) {
+        return registration;
+      }
+      if (url.includes('live=long-poll')) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      }
+      if (url.includes('record=0')) {
+        return Promise.resolve(
+          response(JSON.stringify({ record: 0, value: { name: 'output' } }), {
+            status: 200,
+            headers: {
+              'stream-record-next': '1',
+              'stream-up-to-date': 'true',
+            },
+          })
+        );
+      }
+      return Promise.resolve(response(null, { status: 201 }));
+    });
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    const readable = await streamer.streams.get('wrun_1', 'output');
+    const reader = readable.getReader();
+    const read = reader.read();
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(3));
+    expect(fetch.mock.calls[2]?.[0]?.toString()).toContain('live=long-poll');
+
+    const list = streamer.streams.list('wrun_1');
+    await Promise.resolve();
+    expect(fetch).toHaveBeenCalledTimes(3);
+
+    finishRegistration?.(response(null, { status: 201 }));
+    await expect(list).resolves.toEqual(['output']);
+    await reader.cancel();
+    await read.catch(() => undefined);
+  });
 });
