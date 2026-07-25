@@ -515,13 +515,22 @@ export class RunJournal {
     return useCache ? cloneState(state) : state;
   }
 
-  async events(runId: string): Promise<Event[]> {
+  async events(runId: string, throughRecord?: number): Promise<Event[]> {
     let cached = this.eventCache.get(runId);
     if (!cached) {
       cached = { nextRecord: 0, events: [] };
       this.rememberEvents(runId, cached);
     } else {
       this.rememberEvents(runId, cached);
+    }
+    // A successful mutation already installed every event through its
+    // committed record in this process-local cache. Callers that only need
+    // the response page through that commit do not need an empty tail GET.
+    if (
+      throughRecord !== undefined &&
+      cached.nextRecord >= throughRecord
+    ) {
+      return [...cached.events];
     }
     let cursor = cached.nextRecord;
     let catchUpAttempt = 0;
@@ -576,11 +585,13 @@ export class RunJournal {
       expectedRecord: state.nextRecord,
       createIfMissing: state.nextRecord === 0,
     });
-    applyCommit(state, parseCommit(value), state.nextRecord);
+    // `value` was built from already validated World entities above. Parsing
+    // it again here would run Zod over every event twice on the hot path.
+    applyCommit(state, value, state.nextRecord);
     if (useCache) {
       const cached = this.cache.get(state.runId);
       if (cached && cached.nextRecord === value.previousRecord) {
-        applyCommit(cached, parseCommit(value), cached.nextRecord);
+        applyCommit(cached, value, cached.nextRecord);
       } else {
         this.rememberState(state.runId, state);
       }

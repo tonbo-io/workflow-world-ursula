@@ -154,7 +154,8 @@ async function withEventPage(
   runId: string,
   journal: RunJournal,
   request: AnyEventRequest,
-  params: Parameters<Storage['events']['create']>[2]
+  params: Parameters<Storage['events']['create']>[2],
+  throughRecord: number
 ): Promise<EventResult> {
   const preload =
     request.eventType === 'run_started' && params?.skipPreload !== true;
@@ -164,7 +165,7 @@ async function withEventPage(
     typeof params?.sinceCursor === 'string';
   if (!preload && !delta) return result;
 
-  const page = paginate(await journal.events(runId), {
+  const page = paginate(await journal.events(runId, throughRecord), {
     cursor: delta ? params?.sinceCursor : undefined,
     limit: MAX_LIMIT,
     sortOrder: 'asc',
@@ -442,7 +443,8 @@ export function createStorage(
               effectiveRunId,
               journal,
               data,
-              params
+              params,
+              state.nextRecord
             );
           }
           const removedHooks = (materialized.commit.hooks ?? [])
@@ -480,7 +482,8 @@ export function createStorage(
               effectiveRunId,
               journal,
               data,
-              params
+              params,
+              state.nextRecord
             );
           } catch (error) {
             if (
