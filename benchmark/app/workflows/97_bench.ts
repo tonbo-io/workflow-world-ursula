@@ -45,6 +45,8 @@ export interface BenchStreamChunk {
 export interface BenchStreamLatency {
   /** Date.now() in the writer step when the first chunk was written */
   writtenAt: number;
+  /** Date.now() when the durable write call settled in the writer step */
+  writeSettledAt: number;
   /** Date.now() in the reader step when the first chunk was received */
   readAt: number;
 }
@@ -207,7 +209,9 @@ export async function benchHookStreamWorkflow(): Promise<{
  * api.vercel.com read path is never involved. Initiates the SL read (which
  * establishes the server-side stream connection), signals readiness on the
  * ready stream, then awaits the first chunk and stamps `readAt`. */
-async function slReaderStep(): Promise<BenchStreamLatency> {
+async function slReaderStep(): Promise<
+  Omit<BenchStreamLatency, 'writeSettledAt'>
+> {
   'use step';
   const { workflowRunId } = getWorkflowMetadata();
   const reader = getRun<BenchStreamChunk>(workflowRunId)
@@ -245,7 +249,10 @@ async function slReaderStep(): Promise<BenchStreamLatency> {
  * writes a single chunk stamped with `writtenAt` and closes the stream. The
  * barrier read only needs to observe the marker (a retained chunk is fine), so
  * its own attach timing doesn't matter — it just gates the SL write. */
-async function slWriterStep(): Promise<void> {
+async function slWriterStep(): Promise<{
+  writtenAt: number;
+  writeSettledAt: number;
+}> {
   'use step';
   const { workflowRunId } = getWorkflowMetadata();
   const readyReader = getRun<{ ready: true }>(workflowRunId)
@@ -261,9 +268,12 @@ async function slWriterStep(): Promise<void> {
     namespace: SL_STREAM_NAMESPACE,
   });
   const writer = writable.getWriter();
-  await writer.write({ seq: 0, writtenAt: Date.now() });
+  const writtenAt = Date.now();
+  await writer.write({ seq: 0, writtenAt });
+  const writeSettledAt = Date.now();
   writer.releaseLock();
   await writable.close();
+  return { writtenAt, writeSettledAt };
 }
 
 /**
@@ -280,8 +290,16 @@ async function slWriterStep(): Promise<void> {
  */
 export async function benchSlWorkflow(): Promise<{ sl: BenchStreamLatency }> {
   'use workflow';
-  const [sl] = await Promise.all([slReaderStep(), slWriterStep()]);
-  return { sl };
+  const [reader, writer] = await Promise.all([
+    slReaderStep(),
+    slWriterStep(),
+  ]);
+  return {
+    sl: {
+      ...reader,
+      writeSettledAt: writer.writeSettledAt,
+    },
+  };
 }
 
 /** Reader half of the SO scenario. Same attach/ready handshake as
