@@ -79,8 +79,6 @@ resource "aws_db_instance" "benchmark" {
   allocated_storage     = var.db_allocated_storage_gib
   max_allocated_storage = 500
   storage_type          = "gp3"
-  iops                  = 3000
-  storage_throughput    = 125
   storage_encrypted     = true
 
   backup_retention_period      = 7
