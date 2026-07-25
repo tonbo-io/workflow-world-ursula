@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type UrsulaAppendOptions,
   UrsulaClient,
+  UrsulaRequestError,
   type UrsulaRecord,
 } from './client.js';
 import { RunJournal } from './run-journal.js';
@@ -16,6 +17,17 @@ class MemoryClient {
   readonly tailReads: string[] = [];
   readonly retainedRecords: Array<{ stream: string; record: number }> = [];
   private readonly streams = new Map<string, unknown[]>();
+
+  clearRunStreams(): void {
+    for (const stream of this.streams.keys()) {
+      if (
+        stream.startsWith('run-') &&
+        !stream.startsWith('run-checkpoint-')
+      ) {
+        this.streams.set(stream, []);
+      }
+    }
+  }
 
   async ensureJsonStream(stream: string): Promise<void> {
     if (!this.streams.has(stream)) this.streams.set(stream, []);
@@ -83,7 +95,15 @@ class MemoryClient {
     closed: boolean;
     upToDate: boolean;
   }> {
-    const records = (this.streams.get(stream) ?? [])
+    const values = this.streams.get(stream) ?? [];
+    if (start > values.length) {
+      throw new UrsulaRequestError(
+        'read records',
+        response('InvalidRecordBoundaries', { status: 400 }),
+        'InvalidRecordBoundaries'
+      );
+    }
+    const records = values
       .slice(start, start + limit)
       .map((value, index) => ({
         record: start + index,
@@ -223,6 +243,24 @@ describe('RunJournal', () => {
           start === 0
       )
     ).toBe(false);
+  });
+
+  it('rebuilds a stale hot cache when its cursor is beyond the stream tail', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.load('wrun_stale', {
+      createIfMissing: true,
+    });
+    await journal.append(state, {
+      operationId: 'stale-commit',
+      events: [],
+    });
+    expect(state.nextRecord).toBe(1);
+
+    client.clearRunStreams();
+    const recovered = await journal.load('wrun_stale');
+
+    expect(recovered.nextRecord).toBe(0);
   });
 
   it('bounds materialization cache and lets query scans bypass it', async () => {

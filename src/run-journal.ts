@@ -8,7 +8,11 @@ import {
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
-import { type UrsulaClient, UrsulaRequestError } from './client.js';
+import {
+  type UrsulaClient,
+  type UrsulaReadResult,
+  UrsulaRequestError,
+} from './client.js';
 
 export interface EntityChange<T> {
   id: string;
@@ -378,7 +382,20 @@ export class RunJournal {
       this.cache.set(runId, cached);
       let cursor = cached.nextRecord;
       while (true) {
-        const page = await this.client.read<RunCommit>(stream, cursor);
+        let page: UrsulaReadResult<RunCommit>;
+        try {
+          page = await this.client.read<RunCommit>(stream, cursor);
+        } catch (error) {
+          if (
+            error instanceof UrsulaRequestError &&
+            error.status === 400 &&
+            error.message.includes('InvalidRecordBoundaries')
+          ) {
+            this.cache.delete(runId);
+            return this.load(runId, options);
+          }
+          throw error;
+        }
         this.applyRecords(cached, page.records);
         if (page.records.length < 1000) {
           if (cached.run && isTerminalWorkflowRunStatus(cached.run.status)) {
