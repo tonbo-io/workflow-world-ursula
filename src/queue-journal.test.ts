@@ -15,6 +15,7 @@ class MemoryClient {
   beforeNextSourceReadAll?: () => Promise<void>;
   goneReads = 0;
   loseNextAppendResponse = false;
+  yieldBeforeAppend = false;
   reads = 0;
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
@@ -28,6 +29,9 @@ class MemoryClient {
     values: T | readonly T[],
     options: UrsulaAppendOptions
   ): Promise<{ startRecord: number; nextRecord: number }> {
+    if (this.yieldBeforeAppend) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
     const current = this.streams.get(stream) ?? [];
     if (
       options.expectedRecord !== undefined &&
@@ -365,6 +369,25 @@ describe('QueueJournal', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('serializes concurrent local transitions before queue CAS', async () => {
+    const memory = new MemoryClient();
+    memory.yieldBeforeAppend = true;
+    const journal = new QueueJournal(memory as unknown as UrsulaClient);
+
+    const messageIds = await Promise.all(
+      Array.from({ length: 100 }, (_, index) =>
+        journal.enqueue(
+          queueName,
+          { runId: `run-concurrent-${index}`, step: index },
+          { idempotencyKey: `concurrent-${index}` }
+        )
+      )
+    );
+
+    expect(new Set(messageIds)).toHaveLength(100);
+    expect(memory.appendedBatchSizes).toHaveLength(100);
   });
 
   it('retries a cold rebuild when retention advances after checkpoint read', async () => {

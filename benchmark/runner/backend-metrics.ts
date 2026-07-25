@@ -47,6 +47,7 @@ const URSULA_GATEWAY_COUNTERS = [
   'leader_cache_hits',
   'leader_cache_misses',
   'leader_cache_updates',
+  'leader_cache_evictions',
   'leader_redirect_ns',
   'leader_redirects',
   'requests',
