@@ -68,21 +68,27 @@ export class RunRegistry {
    * ignorable entry for an empty run stream, but never an undiscoverable run.
    */
   async register(runId: string, createdAt: Date): Promise<void> {
+    if (this.registrations.has(runId)) return;
     const shard = shardFor(runId);
-    await this.client.append(
-      RUN_REGISTRY_DIRECTORY,
-      { version: 1, shard } satisfies ShardRegistration,
-      { operationId: `register-run-shard:${shard}` }
-    );
+    if (!this.shards.has(shard)) {
+      await this.client.append(
+        RUN_REGISTRY_DIRECTORY,
+        { version: 1, shard } satisfies ShardRegistration,
+        { operationId: `register-run-shard:${shard}` }
+      );
+      this.shards.add(shard);
+    }
+    const registration = {
+      version: 1,
+      runId,
+      createdAt: createdAt.toISOString(),
+    } satisfies RunRegistration;
     await this.client.append(
       registryStream(shard),
-      {
-        version: 1,
-        runId,
-        createdAt: createdAt.toISOString(),
-      } satisfies RunRegistration,
+      registration,
       { operationId: `register-run:${runId}` }
     );
+    this.registrations.set(runId, registration);
   }
 
   async list(): Promise<RunRegistration[]> {

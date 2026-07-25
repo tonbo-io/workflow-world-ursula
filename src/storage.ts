@@ -388,7 +388,7 @@ export function createStorage(
           await registry.register(effectiveRunId, new Date());
         }
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
-          const state = await journal.load(effectiveRunId, {
+          const state = await journal.loadForMutation(effectiveRunId, {
             createIfMissing: data.eventType === 'run_created' || lazyRunStart,
           });
           const op = mutationOperationId(
@@ -477,6 +477,7 @@ export function createStorage(
               error.status === 412 &&
               attempt + 1 < MAX_COMMIT_RETRIES
             ) {
+              journal.evict(effectiveRunId);
               continue;
             }
             throw error;

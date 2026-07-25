@@ -314,6 +314,35 @@ export class RunJournal {
     this.eventCache.delete(runId);
   }
 
+  /**
+   * Returns the process-local materialization without an incremental read.
+   *
+   * Mutations are guarded by the stream record tail, so a stale cache cannot
+   * commit: the append returns 412 and the caller evicts before retrying. For
+   * a create-if-missing mutation, starting optimistically at record zero is
+   * safe for the same reason and avoids two cold reads for a brand-new run.
+   */
+  async loadForMutation(
+    runId: string,
+    options: { createIfMissing?: boolean } = {}
+  ): Promise<RunJournalState> {
+    if (options.createIfMissing) {
+      await this.client.ensureJsonStream(streamId(runId));
+    }
+    const cached = this.cache.get(runId);
+    if (cached) {
+      this.cache.delete(runId);
+      this.cache.set(runId, cached);
+      return cloneState(cached);
+    }
+    if (options.createIfMissing) {
+      const state = emptyState(runId);
+      this.rememberState(runId, state);
+      return cloneState(state);
+    }
+    return this.load(runId);
+  }
+
   private async loadCheckpoint(runId: string): Promise<RunJournalState> {
     let records: { value: unknown }[];
     try {
