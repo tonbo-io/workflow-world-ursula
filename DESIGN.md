@@ -82,6 +82,11 @@ authoritative tail to replay. Both caches are LRU-bounded, terminal run state
 is not retained in the materialization cache, and registry-wide query scans
 bypass the caches.
 
+An incremental cursor may briefly be ahead of a lagging Ursula follower even
+though the leader already acknowledged the source commit. The adapter retries
+`InvalidRecordBoundaries` on the same cursor during that bounded catch-up
+window; it never treats a follower's lower local tail as authoritative state.
+
 ## Global indexes
 
 Run logs remain authoritative Byte Streams. Global indexes should be typed

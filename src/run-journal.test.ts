@@ -14,6 +14,8 @@ function response(body: BodyInit | null, init: ResponseInit = {}): Response {
 
 class MemoryClient {
   checkpointGate?: Promise<void>;
+  failNextReadAt?: number;
+  failedReads = 0;
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly tailReads: string[] = [];
   readonly retainedRecords: Array<{ stream: string; record: number }> = [];
@@ -100,6 +102,17 @@ class MemoryClient {
     upToDate: boolean;
   }> {
     const values = this.streams.get(stream) ?? [];
+    if (this.failNextReadAt === start) {
+      this.failNextReadAt = undefined;
+      this.failedReads += 1;
+      throw new UrsulaRequestError(
+        'read records',
+        response(`record ${start} is beyond record tail ${values.length - 1}`, {
+          status: 400,
+        }),
+        `InvalidRecordBoundaries: record ${start} is beyond local tail`
+      );
+    }
     if (start > values.length) {
       throw new UrsulaRequestError(
         'read records',
@@ -301,6 +314,57 @@ describe('RunJournal', () => {
 
     releaseCheckpoint();
     await journal.flushCheckpoints();
+  });
+
+  it('retries an incremental read while a follower applies an acknowledged commit', async () => {
+    const client = new MemoryClient();
+    const first = new RunJournal(client as unknown as UrsulaClient);
+    const firstState = await first.loadForMutation('wrun_follower_lag', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    await first.append(firstState, {
+      operationId: 'lag-commit-0',
+      events: [],
+    });
+
+    const writer = new RunJournal(client as unknown as UrsulaClient);
+    const writerState = await writer.load('wrun_follower_lag');
+    await writer.append(writerState, {
+      operationId: 'lag-commit-1',
+      events: [],
+    });
+    client.failNextReadAt = 1;
+
+    await expect(first.load('wrun_follower_lag')).resolves.toMatchObject({
+      nextRecord: 2,
+    });
+    expect(client.failedReads).toBe(1);
+  });
+
+  it('retries an event-cache read while a follower applies an acknowledged commit', async () => {
+    const client = new MemoryClient();
+    const first = new RunJournal(client as unknown as UrsulaClient);
+    const firstState = await first.loadForMutation('wrun_event_follower_lag', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    await first.append(firstState, {
+      operationId: 'event-lag-commit-0',
+      events: [],
+    });
+    await first.events('wrun_event_follower_lag');
+
+    const writer = new RunJournal(client as unknown as UrsulaClient);
+    const writerState = await writer.load('wrun_event_follower_lag');
+    await writer.append(writerState, {
+      operationId: 'event-lag-commit-1',
+      events: [],
+    });
+    client.failNextReadAt = 1;
+
+    await expect(first.events('wrun_event_follower_lag')).resolves.toEqual([]);
+    expect(client.failedReads).toBe(1);
   });
 
   it('rebuilds a stale hot cache when its cursor is beyond the stream tail', async () => {

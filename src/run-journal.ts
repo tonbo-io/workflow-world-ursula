@@ -63,6 +63,20 @@ interface EventCache {
 const CHECKPOINT_INTERVAL_RECORDS = 128;
 const STATE_CACHE_MAX_RUNS = 256;
 const EVENT_CACHE_MAX_RUNS = 128;
+const FOLLOWER_CATCH_UP_RETRIES = 6;
+
+function isCursorBeyondLocalTail(error: unknown): boolean {
+  return (
+    isUrsulaRequestError(error, 400) &&
+    error.message.includes('InvalidRecordBoundaries')
+  );
+}
+
+async function waitForFollowerCatchUp(attempt: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, Math.min(25, 2 ** attempt));
+  });
+}
 
 function streamId(runId: string): string {
   const digest = createHash('sha256').update(runId).digest('base64url');
@@ -446,20 +460,27 @@ export class RunJournal {
       this.cache.delete(runId);
       this.cache.set(runId, cached);
       let cursor = cached.nextRecord;
+      let catchUpAttempt = 0;
       while (true) {
         let page: UrsulaReadResult<RunCommit>;
         try {
           page = await this.client.read<RunCommit>(stream, cursor);
         } catch (error) {
           if (
-            isUrsulaRequestError(error, 400) &&
-            error.message.includes('InvalidRecordBoundaries')
+            isCursorBeyondLocalTail(error) &&
+            catchUpAttempt < FOLLOWER_CATCH_UP_RETRIES
           ) {
+            await waitForFollowerCatchUp(catchUpAttempt);
+            catchUpAttempt += 1;
+            continue;
+          }
+          if (isCursorBeyondLocalTail(error)) {
             this.cache.delete(runId);
             return this.load(runId, options);
           }
           throw error;
         }
+        catchUpAttempt = 0;
         this.applyRecords(cached, page.records);
         if (page.records.length < 1000) {
           if (cached.run && isTerminalWorkflowRunStatus(cached.run.status)) {
@@ -503,8 +524,23 @@ export class RunJournal {
       this.rememberEvents(runId, cached);
     }
     let cursor = cached.nextRecord;
+    let catchUpAttempt = 0;
     while (true) {
-      const page = await this.client.read<RunCommit>(streamId(runId), cursor);
+      let page: UrsulaReadResult<RunCommit>;
+      try {
+        page = await this.client.read<RunCommit>(streamId(runId), cursor);
+      } catch (error) {
+        if (
+          isCursorBeyondLocalTail(error) &&
+          catchUpAttempt < FOLLOWER_CATCH_UP_RETRIES
+        ) {
+          await waitForFollowerCatchUp(catchUpAttempt);
+          catchUpAttempt += 1;
+          continue;
+        }
+        throw error;
+      }
+      catchUpAttempt = 0;
       for (const record of page.records) {
         if (record.record < cached.nextRecord) continue;
         if (record.record !== cached.nextRecord) {
