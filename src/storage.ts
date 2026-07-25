@@ -379,12 +379,17 @@ export function createStorage(
             'runId is required for non-run_created events'
           );
         }
-        if (data.eventType === 'run_created') {
+        const lazyRunStart =
+          data.eventType === 'run_started' &&
+          data.eventData?.deploymentId !== undefined &&
+          data.eventData.workflowName !== undefined &&
+          data.eventData.input !== undefined;
+        if (data.eventType === 'run_created' || lazyRunStart) {
           await registry.register(effectiveRunId, new Date());
         }
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
           const state = await journal.load(effectiveRunId, {
-            createIfMissing: data.eventType === 'run_created',
+            createIfMissing: data.eventType === 'run_created' || lazyRunStart,
           });
           const op = mutationOperationId(
             state,

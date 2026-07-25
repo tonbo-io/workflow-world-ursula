@@ -187,6 +187,62 @@ export function materializeEvent(
     };
   }
 
+  if (
+    request.eventType === 'run_started' &&
+    !state.run &&
+    request.eventData?.deploymentId &&
+    request.eventData.workflowName &&
+    request.eventData.input !== undefined
+  ) {
+    if (!options.syntheticEventId) {
+      throw new WorkflowWorldError(
+        'Lazy run start requires a synthetic run_created event ID'
+      );
+    }
+    validateAttributeChanges(
+      Object.entries(request.eventData.attributes ?? {}).map(
+        ([key, value]) => ({ key, value })
+      ),
+      {
+        allowReservedAttributes:
+          request.eventData.allowReservedAttributes === true,
+      }
+    );
+    const run = WorkflowRunSchema.parse({
+      runId: state.runId,
+      deploymentId: request.eventData.deploymentId,
+      workflowName: request.eventData.workflowName,
+      input: request.eventData.input,
+      executionContext: request.eventData.executionContext,
+      attributes: request.eventData.attributes ?? {},
+      status: 'running',
+      specVersion,
+      createdAt: now,
+      updatedAt: now,
+      startedAt: now,
+    });
+    const createdEvent: Event = {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: run.deploymentId,
+        workflowName: run.workflowName,
+        input: run.input,
+        executionContext: run.executionContext,
+        attributes: run.attributes,
+        allowReservedAttributes: request.eventData.allowReservedAttributes,
+      },
+      runId: state.runId,
+      eventId: options.syntheticEventId,
+      createdAt: now,
+      specVersion,
+    };
+    const startedEvent = eventFrom(state, request, options);
+    return {
+      commit: makeCommit(options, [createdEvent, startedEvent], { run }),
+      result: { event: startedEvent, run, maxEvents: 25_000 },
+    };
+  }
+
   let run = requireRun(state);
   terminalRunGuard(run, request);
 

@@ -80,6 +80,31 @@ describe('materializeEvent', () => {
     expect(materialized.result.run?.input).toEqual(Uint8Array.from([1]));
   });
 
+  it('atomically synthesizes run_created for a resilient run start', () => {
+    const request = {
+      eventType: 'run_started',
+      eventData: {
+        deploymentId: 'dpl_1',
+        workflowName: 'workflow//test//main',
+        input: Uint8Array.from([1]),
+        executionContext: { trace: 'context' },
+        attributes: { tenant: 'test' },
+      },
+      specVersion: 5,
+    } satisfies AnyEventRequest;
+
+    const materialized = materializeEvent(state(), request, options('evnt_2'));
+
+    expect(
+      materialized.commit?.events.map(({ eventType }) => eventType)
+    ).toEqual(['run_created', 'run_started']);
+    expect(materialized.commit?.run?.status).toBe('running');
+    expect(materialized.result.run?.attributes).toEqual({ tenant: 'test' });
+    expect(materialized.result.run?.startedAt).toEqual(
+      new Date('2026-07-24T00:00:00.000Z')
+    );
+  });
+
   it('atomically synthesizes step_created for a lazy step start', () => {
     const current = state(pendingRun());
     const request = {
