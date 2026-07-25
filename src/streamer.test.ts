@@ -54,6 +54,36 @@ describe('Ursula Workflow streamer', () => {
     expect(headers.get('producer-seq')).toBe('0');
   });
 
+  it('does not serialize a data append behind stream registration', async () => {
+    let finishRegistration: ((value: Response) => void) | undefined;
+    const registration = new Promise<Response>((resolve) => {
+      finishRegistration = resolve;
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>((_input, init) => {
+      if (
+        typeof init?.body === 'string' &&
+        init.body.includes('"name":"output"')
+      ) {
+        return registration;
+      }
+      return Promise.resolve(response(null, { status: 201 }));
+    });
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    const write = streamer.streams.write('wrun_1', 'output', 'hello');
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(fetch.mock.calls[1]?.[1]?.body as string)).toEqual({
+      v: 1,
+      data: 'aGVsbG8=',
+    });
+
+    finishRegistration?.(response(null, { status: 201 }));
+    await write;
+  });
+
   it('reuses the producer sequence when an append response is lost', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

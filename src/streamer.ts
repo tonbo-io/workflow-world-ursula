@@ -267,7 +267,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (registeredStreams.has(cacheKey)) return;
     const url = registryUrl(runId);
     const registryKey = url.toString();
-    const previous = registryOperations.get(registryKey) ?? Promise.resolve();
+    const previous = registryOperations.get(registryKey);
     const producerHeaders = headers({
       'content-type': RECORD_CONTENT_TYPE,
       'producer-id': `workflow-registry-${createHash('sha256')
@@ -276,7 +276,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       'producer-epoch': '0',
       'producer-seq': '0',
     });
-    const registering = previous.catch(() => undefined).then(async () => {
+    const performRegistration = async () => {
       if (registeredStreams.has(cacheKey)) return;
       if (!ensuredStreams.has(registryKey)) {
         const created = await fetchImpl(url, {
@@ -304,7 +304,12 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         })
       );
       registeredStreams.add(cacheKey);
-    });
+    };
+    // Start an uncontended registration immediately. Only subsequent names
+    // for the same run need to queue behind the existing registry producer.
+    const registering = previous
+      ? previous.catch(() => undefined).then(performRegistration)
+      : performRegistration();
     const tracked = registering.then(() => {
       if (registryOperations.get(registryKey) === tracked) {
         registryOperations.delete(registryKey);
@@ -360,7 +365,15 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (records.length === 0) return;
     const url = streamUrl(runId, name);
     await serializeStream(url, async (producer) => {
-      await registerStream(runId, name);
+      // Discovery metadata and the data append target different streams (and
+      // therefore potentially different Raft groups). Start registration
+      // first, but do not serialize the latency-sensitive append behind it.
+      // The write still settles only after both operations are durable.
+      const registration = registerStream(runId, name);
+      // Let an uncontended registry operation issue its request before the
+      // data request so existing request-order assertions and traces remain
+      // intuitive; neither response is awaited here.
+      await Promise.resolve();
       const sequence = producer.nextSequence;
       const appendHeaders = headers({
         'content-type': RECORD_CONTENT_TYPE,
@@ -378,6 +391,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         });
         if (created.status === 201) {
           ensuredStreams.add(key);
+          await registration;
           producer.nextSequence += 1;
           return;
         }
@@ -399,6 +413,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
           body,
         })
       );
+      await registration;
       producer.nextSequence += 1;
     });
   }
