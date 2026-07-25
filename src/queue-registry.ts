@@ -34,11 +34,17 @@ export class QueueRegistry {
   }
 
   async register(queueName: ValidQueueName): Promise<void> {
+    if (this.queueNames.has(queueName)) return;
     await this.client.append(
       QUEUE_REGISTRY_STREAM,
       { version: 1, queueName } satisfies QueueRegistration,
       { operationId: `register-queue:${queueName}` }
     );
+    this.queueNames.add(queueName);
+  }
+
+  current(): ValidQueueName[] {
+    return [...this.queueNames];
   }
 
   async list(): Promise<ValidQueueName[]> {

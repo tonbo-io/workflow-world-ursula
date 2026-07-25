@@ -132,6 +132,24 @@ class MemoryClient {
 }
 
 describe('RunJournal', () => {
+  it('starts a new mutation and reuses its materialization without cold reads', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+
+    const initial = await journal.loadForMutation('wrun_hot', {
+      createIfMissing: true,
+    });
+    await journal.append(initial, {
+      operationId: 'hot-1',
+      events: [],
+    });
+    const next = await journal.loadForMutation('wrun_hot');
+
+    expect(next.nextRecord).toBe(1);
+    expect(client.tailReads).toEqual([]);
+    expect(client.readAllStarts).toEqual([]);
+  });
+
   it('commits an event and its resulting run state in one guarded record', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

@@ -13,8 +13,13 @@ class MemoryClient {
   readonly retainedRecords: number[] = [];
   beforeNextSourceReadAll?: () => Promise<void>;
   goneReads = 0;
+  reads = 0;
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
+
+  async ensureJsonStream(stream: string): Promise<void> {
+    if (!this.streams.has(stream)) this.streams.set(stream, []);
+  }
 
   async append<T>(
     stream: string,
@@ -26,7 +31,14 @@ class MemoryClient {
       options.expectedRecord !== undefined &&
       options.expectedRecord !== current.length
     ) {
-      throw new Error('test CAS mismatch');
+      throw new UrsulaRequestError(
+        'append records',
+        new Response('record tail mismatch', {
+          status: 412,
+          headers: { 'stream-record-next': String(current.length) },
+        }),
+        'record tail mismatch'
+      );
     }
     const records = Array.isArray(values) ? values : [values];
     const startRecord = current.length;
@@ -36,6 +48,7 @@ class MemoryClient {
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
+    this.reads += 1;
     this.readAllStarts.push({ stream, start });
     if (
       this.beforeNextSourceReadAll &&
@@ -65,6 +78,7 @@ class MemoryClient {
     closed: boolean;
     upToDate: boolean;
   }> {
+    this.reads += 1;
     this.assertRetained(stream, start);
     const records = (this.streams.get(stream) ?? [])
       .slice(start, start + limit)
@@ -89,6 +103,7 @@ class MemoryClient {
     closed: boolean;
     upToDate: boolean;
   }> {
+    this.reads += 1;
     const values = this.streams.get(stream) ?? [];
     const start = Math.max(
       this.firstRecords.get(stream) ?? 0,
@@ -137,6 +152,18 @@ const payload = {
 } satisfies QueuePayload;
 
 describe('QueueJournal', () => {
+  it('uses the cached record tail for uncontended enqueue, claim, and ack', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(memory as unknown as UrsulaClient);
+
+    await journal.enqueue(queueName, payload);
+    const lease = await journal.claim(queueName, new Date(), 1000);
+    if (!lease) throw new Error('expected hot-path lease');
+    await journal.ack(queueName, lease);
+
+    expect(memory.reads).toBe(0);
+  });
+
   it('preserves message identity across retry, lease expiry and adapter restart', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     let journal = new QueueJournal(client);

@@ -416,6 +416,33 @@ export class QueueJournal {
     }
   }
 
+  private invalidate(queueName: ValidQueueName): void {
+    this.cache.delete(queueName);
+  }
+
+  /**
+   * Uses the local state as an optimistic CAS base. A remote writer can only
+   * make this state stale, never unsafe: every transition append carries the
+   * cached record tail and a 412 invalidates the cache before retry.
+   */
+  private async loadForMutation(
+    queueName: ValidQueueName,
+    options: { createIfMissing?: boolean } = {}
+  ): Promise<QueueState> {
+    const cached = this.cache.get(queueName);
+    if (cached) {
+      pruneIdempotency(cached, new Date());
+      return cached;
+    }
+    if (options.createIfMissing) {
+      await this.client.ensureJsonStream(queueStream(queueName));
+      const state = replay([]);
+      this.cache.set(queueName, state);
+      return state;
+    }
+    return this.load(queueName);
+  }
+
   async enqueue(
     queueName: ValidQueueName,
     message: QueuePayload,
@@ -424,7 +451,9 @@ export class QueueJournal {
     QueuePayloadSchema.parse(message);
     const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
     for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
-      const state = await this.load(queueName);
+      const state = await this.loadForMutation(queueName, {
+        createIfMissing: true,
+      });
       const now = new Date();
       pruneIdempotency(state, now);
       if (options.idempotencyKey) {
@@ -455,6 +484,7 @@ export class QueueJournal {
         return messageId;
       } catch (error) {
         if (error instanceof UrsulaRequestError && error.status === 412) {
+          this.invalidate(queueName);
           continue;
         }
         throw error;
@@ -505,8 +535,12 @@ export class QueueJournal {
     leaseDurationMs: number
   ): Promise<QueueLease | null> {
     for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
-      const state = await this.load(queueName);
-      const message = this.claimCandidate(state, now);
+      let state = await this.loadForMutation(queueName);
+      let message = this.claimCandidate(state, now);
+      if (!message) {
+        state = await this.load(queueName);
+        message = this.claimCandidate(state, now);
+      }
       if (!message) return null;
       const leaseId = randomUUID();
       const transition: QueueTransition = {
@@ -537,6 +571,7 @@ export class QueueJournal {
         };
       } catch (error) {
         if (error instanceof UrsulaRequestError && error.status === 412) {
+          this.invalidate(queueName);
           continue;
         }
         throw error;
@@ -573,10 +608,17 @@ export class QueueJournal {
     expiresAt: Date
   ): Promise<boolean> {
     for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
-      const state = await this.load(queueName);
+      let state = await this.loadForMutation(queueName);
       const current = state.messages.get(lease.message.messageId);
       if (current?.status !== 'leased' || current.leaseId !== lease.leaseId) {
-        return false;
+        state = await this.load(queueName);
+        const refreshed = state.messages.get(lease.message.messageId);
+        if (
+          refreshed?.status !== 'leased' ||
+          refreshed.leaseId !== lease.leaseId
+        ) {
+          return false;
+        }
       }
       try {
         const transition = {
@@ -596,6 +638,7 @@ export class QueueJournal {
         return true;
       } catch (error) {
         if (error instanceof UrsulaRequestError && error.status === 412) {
+          this.invalidate(queueName);
           continue;
         }
         throw error;
@@ -635,13 +678,21 @@ export class QueueJournal {
     transition: Extract<QueueTransition, { type: 'acked' | 'retry_scheduled' }>
   ): Promise<boolean> {
     for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
-      const state = await this.load(queueName);
-      const current = state.messages.get(lease.message.messageId);
+      let state = await this.loadForMutation(queueName);
+      let current = state.messages.get(lease.message.messageId);
       if (!current && transition.type === 'acked') {
         return true;
       }
       if (current?.status !== 'leased' || current.leaseId !== lease.leaseId) {
-        return false;
+        state = await this.load(queueName);
+        current = state.messages.get(lease.message.messageId);
+        if (!current && transition.type === 'acked') return true;
+        if (
+          current?.status !== 'leased' ||
+          current.leaseId !== lease.leaseId
+        ) {
+          return false;
+        }
       }
       try {
         await this.appendTransition(
@@ -653,6 +704,7 @@ export class QueueJournal {
         return true;
       } catch (error) {
         if (error instanceof UrsulaRequestError && error.status === 412) {
+          this.invalidate(queueName);
           continue;
         }
         throw error;

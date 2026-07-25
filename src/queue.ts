@@ -321,7 +321,7 @@ export function createQueue(
 
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: queue discovery, capacity and per-run ownership checks belong in one dispatcher pass.
   async function pump(): Promise<ValidQueueName[]> {
-    const queueNames = (await registry.list()).filter(canDeliver);
+    const queueNames = registry.current().filter(canDeliver);
     for (const queueName of queueNames) ensureQueueWatcher(queueName);
     if (inFlight.size >= concurrency || queueNames.length === 0) {
       return queueNames;
