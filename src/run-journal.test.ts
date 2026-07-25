@@ -137,6 +137,7 @@ describe('RunJournal', () => {
     const journal = new RunJournal(client as unknown as UrsulaClient);
 
     const initial = await journal.loadForMutation('wrun_hot', {
+      assumeEmpty: true,
       createIfMissing: true,
     });
     await journal.append(initial, {

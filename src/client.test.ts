@@ -1,11 +1,27 @@
 import { describe, expect, it, vi } from 'vitest';
-import { UrsulaClient, UrsulaRequestError } from './client.js';
+import {
+  isUrsulaRequestError,
+  UrsulaClient,
+  UrsulaRequestError,
+} from './client.js';
 
 function response(body: BodyInit | null, init: ResponseInit = {}): Response {
   return new Response(body, init);
 }
 
 describe('UrsulaClient', () => {
+  it('recognizes a request error created by another server bundle', () => {
+    const error = Object.assign(new Error('precondition failed'), {
+      name: 'UrsulaRequestError',
+      operation: 'append records',
+      status: 412,
+    });
+
+    expect(error).not.toBeInstanceOf(UrsulaRequestError);
+    expect(isUrsulaRequestError(error, 412)).toBe(true);
+    expect(isUrsulaRequestError(error, 404)).toBe(false);
+  });
+
   it('combines stable operation deduplication with a record-tail guard', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

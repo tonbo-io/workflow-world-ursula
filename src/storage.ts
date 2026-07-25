@@ -22,6 +22,7 @@ import {
 } from '@workflow/world';
 import { ulid } from 'ulid';
 import {
+  isUrsulaRequestError,
   UrsulaClient,
   type UrsulaClientConfig,
   UrsulaRequestError,
@@ -389,6 +390,7 @@ export function createStorage(
         }
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
           const state = await journal.loadForMutation(effectiveRunId, {
+            assumeEmpty: data.eventType === 'run_created',
             createIfMissing: data.eventType === 'run_created' || lazyRunStart,
           });
           const op = mutationOperationId(
@@ -473,8 +475,7 @@ export function createStorage(
             );
           } catch (error) {
             if (
-              error instanceof UrsulaRequestError &&
-              error.status === 412 &&
+              isUrsulaRequestError(error, 412) &&
               attempt + 1 < MAX_COMMIT_RETRIES
             ) {
               journal.evict(effectiveRunId);

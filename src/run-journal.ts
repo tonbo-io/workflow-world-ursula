@@ -9,9 +9,9 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import {
+  isUrsulaRequestError,
   type UrsulaClient,
   type UrsulaReadResult,
-  UrsulaRequestError,
 } from './client.js';
 
 export interface EntityChange<T> {
@@ -324,7 +324,7 @@ export class RunJournal {
    */
   async loadForMutation(
     runId: string,
-    options: { createIfMissing?: boolean } = {}
+    options: { assumeEmpty?: boolean; createIfMissing?: boolean } = {}
   ): Promise<RunJournalState> {
     if (options.createIfMissing) {
       await this.client.ensureJsonStream(streamId(runId));
@@ -335,7 +335,7 @@ export class RunJournal {
       this.cache.set(runId, cached);
       return cloneState(cached);
     }
-    if (options.createIfMissing) {
+    if (options.assumeEmpty) {
       const state = emptyState(runId);
       this.rememberState(runId, state);
       return cloneState(state);
@@ -349,7 +349,7 @@ export class RunJournal {
       records = (await this.client.readTail<unknown>(checkpointStreamId(runId)))
         .records;
     } catch (error) {
-      if (error instanceof UrsulaRequestError && error.status === 404) {
+      if (isUrsulaRequestError(error, 404)) {
         return emptyState(runId);
       }
       throw error;
@@ -416,8 +416,7 @@ export class RunJournal {
           page = await this.client.read<RunCommit>(stream, cursor);
         } catch (error) {
           if (
-            error instanceof UrsulaRequestError &&
-            error.status === 400 &&
+            isUrsulaRequestError(error, 400) &&
             error.message.includes('InvalidRecordBoundaries')
           ) {
             this.cache.delete(runId);
@@ -448,8 +447,7 @@ export class RunJournal {
     } catch (error) {
       if (
         options.createIfMissing &&
-        error instanceof UrsulaRequestError &&
-        error.status === 404
+        isUrsulaRequestError(error, 404)
       ) {
         if (useCache) this.rememberState(runId, state);
         return useCache ? cloneState(state) : state;
