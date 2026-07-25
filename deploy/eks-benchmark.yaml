@@ -28,7 +28,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-official-20260725-v4
+              value: workflow-benchmark-round2-v036
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
@@ -45,10 +45,10 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              cpu: "1"
+              cpu: "3"
               memory: 2Gi
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: 4Gi
 ---
 apiVersion: v1
@@ -122,7 +122,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-official-20260725-v4
+              value: workflow-benchmark-round2-v036
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1-runner
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
@@ -132,6 +132,8 @@ spec:
                 http://ursula-0.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
                 http://ursula-1.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
                 http://ursula-2.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics
+            - name: WORKFLOW_URSULA_GATEWAY_METRICS_URL
+              value: http://ursula-gateway.ursula.svc.cluster.local:4437/__ursula/gateway/metrics
             - name: WORKFLOW_BENCH_BACKEND
               value: ursula-eks
             - name: BENCH_OUTPUT_FILE

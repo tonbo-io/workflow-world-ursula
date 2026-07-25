@@ -5,6 +5,7 @@ import {
   benchSlWorkflow,
   benchSoWorkflow,
   benchStepWorkflow,
+  benchStreamCatchupWorkflow,
   benchStreamWorkflow,
 } from '../../../workflows/97_bench';
 
@@ -14,6 +15,7 @@ const workflows = {
   benchSlWorkflow,
   benchSoWorkflow,
   benchStepWorkflow,
+  benchStreamCatchupWorkflow,
   benchStreamWorkflow,
 } as const;
 
