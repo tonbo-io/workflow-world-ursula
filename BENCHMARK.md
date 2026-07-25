@@ -133,6 +133,14 @@ Benchmark both the existing bounded JSON-journal scan and that projection once
 
 ## Running the shared benchmark
 
+The EKS benchmark currently pins Vercel's public `main` tarballs at Workflow
+commit `62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91`
+(`5.0.0-beta.36-62d570e`). This keeps the Ursula and Postgres runs on the same
+Core revision as the managed baseline, including the stream group-commit and
+immediate leading-edge dispatch changes that are newer than the published
+`5.0.0-beta.36`. Replace the tarball pin with the next npm beta once those
+changes are published.
+
 For Ursula:
 
 ```sh

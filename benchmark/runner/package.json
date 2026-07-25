@@ -9,7 +9,7 @@
   "dependencies": {
     "@tonbo-io/world-ursula": "workspace:*",
     "pg": "8.20.0",
-    "workflow": "5.0.0-beta.36"
+    "workflow": "https://workflow-tarballs-341yziqn7.labs.vercel.dev/workflow.tgz"
   },
   "devDependencies": {
     "@types/node": "22.19.0",
