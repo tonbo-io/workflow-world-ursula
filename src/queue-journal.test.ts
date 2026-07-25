@@ -9,10 +9,12 @@ import {
 import { QueueJournal } from './queue-journal.js';
 
 class MemoryClient {
+  readonly appendedBatchSizes: number[] = [];
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly retainedRecords: number[] = [];
   beforeNextSourceReadAll?: () => Promise<void>;
   goneReads = 0;
+  loseNextAppendResponse = false;
   reads = 0;
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
@@ -41,9 +43,14 @@ class MemoryClient {
       );
     }
     const records = Array.isArray(values) ? values : [values];
+    this.appendedBatchSizes.push(records.length);
     const startRecord = current.length;
     current.push(...records);
     this.streams.set(stream, current);
+    if (this.loseNextAppendResponse) {
+      this.loseNextAppendResponse = false;
+      throw new TypeError('simulated lost append response');
+    }
     return { startRecord, nextRecord: current.length };
   }
 
@@ -243,6 +250,57 @@ describe('QueueJournal', () => {
     await firstJournal.ack(queueName, first);
     const sameRun = await secondJournal.claim(queueName, now, 10_000);
     expect(sameRun?.message.message).toMatchObject({ runId: 'run-one' });
+  });
+
+  it('acks and leases the next message for the same run in one append', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(memory as unknown as UrsulaClient);
+    await journal.enqueue(queueName, { runId: 'run-one', step: 1 });
+    const secondMessageId = await journal.enqueue(queueName, {
+      runId: 'run-one',
+      step: 2,
+    });
+    await journal.enqueue(queueName, { runId: 'run-two', step: 1 });
+    const now = new Date(Date.now() + 100);
+    const first = await journal.claim(queueName, now, 10_000);
+    if (!first) throw new Error('expected first lease');
+
+    const next = await journal.ackAndClaimNext(
+      queueName,
+      first,
+      now,
+      10_000
+    );
+
+    expect(next?.message.messageId).toBe(secondMessageId);
+    expect(memory.appendedBatchSizes.at(-1)).toBe(2);
+    const otherRun = await journal.claim(queueName, now, 10_000);
+    expect(otherRun?.message.message).toMatchObject({ runId: 'run-two' });
+  });
+
+  it('recovers the successor lease after an ack-and-claim response is lost', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(memory as unknown as UrsulaClient);
+    await journal.enqueue(queueName, { runId: 'run-lost', step: 1 });
+    const secondMessageId = await journal.enqueue(queueName, {
+      runId: 'run-lost',
+      step: 2,
+    });
+    const now = new Date(Date.now() + 100);
+    const first = await journal.claim(queueName, now, 10_000);
+    if (!first) throw new Error('expected first lease');
+    memory.loseNextAppendResponse = true;
+
+    const next = await journal.ackAndClaimNext(
+      queueName,
+      first,
+      now,
+      10_000
+    );
+
+    expect(next?.message.messageId).toBe(secondMessageId);
+    expect(next?.message.attempt).toBe(1);
+    expect(await journal.claim(queueName, now, 10_000)).toBeNull();
   });
 
   it('checkpoints active state, drops acked messages, and resumes from the tail', async () => {
