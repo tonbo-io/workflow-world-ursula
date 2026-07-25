@@ -127,8 +127,14 @@ function checkpointStream(queueName: ValidQueueName): string {
 }
 
 function concurrencyKey(message: QueuePayload): string {
-  if ('runId' in message) return `run:${message.runId}`;
-  if ('workflowRunId' in message) return `run:${message.workflowRunId}`;
+  if ('runId' in message) {
+    return message.stepId
+      ? `run:${message.runId}:step:${message.stepId}`
+      : `run:${message.runId}:workflow`;
+  }
+  if ('workflowRunId' in message) {
+    return `run:${message.workflowRunId}:step:${message.stepId}`;
+  }
   return `health:${message.correlationId}`;
 }
 

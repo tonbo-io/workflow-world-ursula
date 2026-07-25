@@ -231,7 +231,7 @@ describe('QueueJournal', () => {
     ).toBeNull();
   });
 
-  it('enforces one active lease per run while allowing different runs', async () => {
+  it('serializes one execution lane while allowing different runs', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const firstJournal = new QueueJournal(client);
     const secondJournal = new QueueJournal(client);
@@ -256,15 +256,41 @@ describe('QueueJournal', () => {
     expect(sameRun?.message.message).toMatchObject({ runId: 'run-one' });
   });
 
-  it('acks and leases the next message for the same run in one append', async () => {
+  it('allows parallel step lanes within the same run', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const firstJournal = new QueueJournal(client);
+    const secondJournal = new QueueJournal(client);
+    await firstJournal.enqueue(queueName, {
+      runId: 'run-parallel',
+      stepId: 'step-reader',
+    });
+    await firstJournal.enqueue(queueName, {
+      runId: 'run-parallel',
+      stepId: 'step-writer',
+    });
+    const now = new Date(Date.now() + 100);
+    const reader = await firstJournal.claim(queueName, now, 10_000);
+    const writer = await secondJournal.claim(queueName, now, 10_000);
+
+    expect(reader?.message.message).toMatchObject({
+      runId: 'run-parallel',
+      stepId: 'step-reader',
+    });
+    expect(writer?.message.message).toMatchObject({
+      runId: 'run-parallel',
+      stepId: 'step-writer',
+    });
+  });
+
+  it('acks and leases the next message for the same execution lane in one append', async () => {
     const memory = new MemoryClient();
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
-    await journal.enqueue(queueName, { runId: 'run-one', step: 1 });
+    await journal.enqueue(queueName, { runId: 'run-one', stepId: 'step-one' });
     const secondMessageId = await journal.enqueue(queueName, {
       runId: 'run-one',
-      step: 2,
+      stepId: 'step-one',
     });
-    await journal.enqueue(queueName, { runId: 'run-two', step: 1 });
+    await journal.enqueue(queueName, { runId: 'run-two', stepId: 'step-two' });
     const now = new Date(Date.now() + 100);
     const first = await journal.claim(queueName, now, 10_000);
     if (!first) throw new Error('expected first lease');
