@@ -1,6 +1,9 @@
 node_modules/
 dist/
 coverage/
+.next/
+.swc/
+*.tsbuildinfo
 .env
 .env.*
 !.env.example
