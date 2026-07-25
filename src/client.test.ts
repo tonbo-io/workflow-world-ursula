@@ -20,6 +20,14 @@ describe('UrsulaClient', () => {
     expect(error).not.toBeInstanceOf(UrsulaRequestError);
     expect(isUrsulaRequestError(error, 412)).toBe(true);
     expect(isUrsulaRequestError(error, 404)).toBe(false);
+    expect(
+      isUrsulaRequestError(
+        new Error(
+          'Ursula append records failed: HTTP 412: record tail mismatch'
+        ),
+        412
+      )
+    ).toBe(true);
   });
 
   it('combines stable operation deduplication with a record-tail guard', async () => {

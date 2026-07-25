@@ -25,7 +25,6 @@ import {
   isUrsulaRequestError,
   UrsulaClient,
   type UrsulaClientConfig,
-  UrsulaRequestError,
 } from './client.js';
 import { HookClaims } from './hook-claims.js';
 import { materializeEvent } from './reducer.js';
@@ -144,7 +143,7 @@ export function mutationOperationId(
 }
 
 function missingRun(error: unknown, runId: string): never {
-  if (error instanceof UrsulaRequestError && error.status === 404) {
+  if (isUrsulaRequestError(error, 404)) {
     throw new WorkflowRunNotFoundError(runId);
   }
   throw error;
@@ -237,8 +236,7 @@ export function createStorage(
         return state;
       } catch (error) {
         if (
-          error instanceof UrsulaRequestError &&
-          error.status === 412 &&
+          isUrsulaRequestError(error, 412) &&
           attempt + 1 < MAX_COMMIT_RETRIES
         ) {
           state = await journal.load(state.runId, { cache: options.cache });

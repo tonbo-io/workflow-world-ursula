@@ -14,7 +14,6 @@ import {
   isUrsulaRequestError,
   type UrsulaClient,
   type UrsulaRecord,
-  UrsulaRequestError,
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
@@ -319,7 +318,7 @@ export class QueueJournal {
         await this.client.readTail<unknown>(checkpointStream(queueName))
       ).records;
     } catch (error) {
-      if (error instanceof UrsulaRequestError && error.status === 404) {
+      if (isUrsulaRequestError(error, 404)) {
         return replay([]);
       }
       throw error;
@@ -732,7 +731,7 @@ export class QueueJournal {
           cursor = cached.nextRecord;
         }
       } catch (error) {
-        if (!(error instanceof UrsulaRequestError && error.status === 410)) {
+        if (!isUrsulaRequestError(error, 410)) {
           throw error;
         }
         this.cache.delete(queueName);
@@ -752,14 +751,13 @@ export class QueueJournal {
         this.cache.set(queueName, state);
         return state;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 404) {
+        if (isUrsulaRequestError(error, 404)) {
           const state = replay([]);
           this.cache.set(queueName, state);
           return state;
         }
         if (
-          error instanceof UrsulaRequestError &&
-          error.status === 410 &&
+          isUrsulaRequestError(error, 410) &&
           attempt === 0
         ) {
           continue;
@@ -790,7 +788,7 @@ export class QueueJournal {
       this.applyRecords(state, page.records);
       return page.records.length > 0;
     } catch (error) {
-      if (!(error instanceof UrsulaRequestError && error.status === 410)) {
+      if (!isUrsulaRequestError(error, 410)) {
         throw error;
       }
       this.cache.delete(queueName);
