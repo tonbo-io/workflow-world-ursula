@@ -424,7 +424,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       async close(runId, name) {
         const resolvedRunId = await runId;
         const url = streamUrl(resolvedRunId, name);
-        await serializeStream(url, async () => {
+        await serializeStream(url, async (producer) => {
           await ensureStream(url);
           await registerStream(resolvedRunId, name);
           const response = await fetchImpl(url, {
@@ -435,9 +435,15 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
             response.status === 409 &&
             response.headers.get('stream-closed') === 'true'
           ) {
+            producer.nextSequence = 0;
             return;
           }
           await expectSuccess('close stream', response);
+          // Workflow may replay the whole step in the same process after its
+          // state commit loses a CAS race. Restart the producer sequence so
+          // writes replayed before this close resolve through Ursula's dedup
+          // table instead of being treated as new writes to a closed stream.
+          producer.nextSequence = 0;
         });
       },
 
