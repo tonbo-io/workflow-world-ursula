@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   HookNotFoundError,
   WorkflowRunNotFoundError,
@@ -35,6 +36,8 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
 const MAX_COMMIT_RETRIES = 16;
 const QUERY_READ_CONCURRENCY = 16;
+const STEP_VISIBILITY_RETRIES = 8;
+const STEP_VISIBILITY_BASE_DELAY_MS = 5;
 
 async function mapWithConcurrency<T, R>(
   values: readonly T[],
@@ -349,9 +352,23 @@ export function createStorage(
     } as Storage['runs'],
     steps: {
       async get(runId, stepId, params) {
-        const step = (await loadRun(runId)).steps.get(stepId);
-        if (!step) throw new WorkflowWorldError(`Step "${stepId}" not found`);
-        return withoutStepData(step, params?.resolveData);
+        for (
+          let attempt = 0;
+          attempt < STEP_VISIBILITY_RETRIES;
+          attempt += 1
+        ) {
+          const step = (await loadRun(runId)).steps.get(stepId);
+          if (step) return withoutStepData(step, params?.resolveData);
+          if (attempt + 1 < STEP_VISIBILITY_RETRIES) {
+            // A queue message can be claimed by another adapter instance
+            // immediately after the authoritative run append commits. Evict a
+            // follower-backed materialization and briefly retry rather than
+            // turning ordinary replica catch-up into a failed delivery.
+            journal.evict(runId);
+            await delay(STEP_VISIBILITY_BASE_DELAY_MS * 2 ** attempt);
+          }
+        }
+        throw new WorkflowWorldError(`Step "${stepId}" not found`);
       },
       async list(params) {
         const steps = [...(await loadRun(params.runId)).steps.values()].sort(

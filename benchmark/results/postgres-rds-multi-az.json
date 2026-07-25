@@ -1,0 +1,390 @@
+{
+  "version": 1,
+  "methodologyVersion": 2,
+  "app": "eks-nextjs",
+  "backend": "postgres-rds-multi-az",
+  "generatedAt": "2026-07-25T18:47:46.085Z",
+  "config": {
+    "streamIterations": 30,
+    "slIterations": 30,
+    "soIterations": 30,
+    "soChunkCount": 300,
+    "soChunkRatePerSec": 100,
+    "soDurationSeconds": 3,
+    "sequentialIterations": 1,
+    "sequentialStepCount": 1020,
+    "catchupIterations": 5,
+    "catchupChunkCount": 1000,
+    "catchupResumeStartIndex": 900,
+    "concurrentIterations": 1,
+    "concurrentRunCount": 100,
+    "concurrentStepCount": 50,
+    "warmupIterations": 2
+  },
+  "scenarios": [
+    {
+      "name": "step",
+      "description": "one trivial no-op step, no stream; no hooks, so the run stays in turbo mode (in-process fast path)"
+    },
+    {
+      "name": "stream",
+      "description": "one streaming step; no hooks, so the run stays in turbo mode (in-process fast path)"
+    },
+    {
+      "name": "hook + stream",
+      "description": "registers a hook before one step, which exits turbo mode (dispatch path)"
+    },
+    {
+      "name": "1020 steps",
+      "description": "1020 trivial sequential steps; STSO is measured between consecutive steps in the given step ranges, and WO is the whole-run overhead outside step bodies"
+    },
+    {
+      "name": "stream latency",
+      "description": "parallel reader/writer steps on a dedicated stream; SL is the in-deployment write->read propagation (readAt - writtenAt)"
+    },
+    {
+      "name": "stream overhead (text)",
+      "description": "writer streams 300 variable-length text token deltas paced at 100/s for 3s (a haiku-size LLM's token throughput) while a parallel reader drains the whole stream; SO is the end-to-end write+consume time beyond the 3s generation window (overhead/backpressure)"
+    },
+    {
+      "name": "stream overhead (structured)",
+      "description": "same workload as stream overhead (text), but each delta is an AI-SDK-style structured object ({ type: 'text-delta', id, text }) instead of a raw string, so the SO gap vs the text scenario is the added serialization cost"
+    },
+    {
+      "name": "retained stream (full)",
+      "description": "fresh reader replays all 1000 chunks from a closed retained stream; reports first retained chunk and full drain latency"
+    },
+    {
+      "name": "retained stream (resume)",
+      "description": "fresh reader resumes at chunk 900 of a closed 1000-chunk stream; reports first retained chunk and suffix drain latency"
+    },
+    {
+      "name": "100 concurrent x 50 steps",
+      "description": "100 workflows execute 50 sequential no-op steps each; reports makespan, per-run TTFS/duration, and aggregate logical step throughput"
+    }
+  ],
+  "metrics": [
+    {
+      "metric": "ttfs",
+      "scenario": "step",
+      "unit": "ms",
+      "targets": {
+        "p75": 200,
+        "p90": 300,
+        "p99": 600
+      },
+      "best": 35,
+      "avg": 50.9,
+      "p75": 46,
+      "p90": 58,
+      "p99": 181,
+      "samples": 30
+    },
+    {
+      "metric": "ttfs",
+      "scenario": "stream",
+      "unit": "ms",
+      "targets": {
+        "p75": 200,
+        "p90": 300,
+        "p99": 600
+      },
+      "best": 34,
+      "avg": 46.5,
+      "p75": 44,
+      "p90": 47,
+      "p99": 208,
+      "samples": 30
+    },
+    {
+      "metric": "ttfs",
+      "scenario": "hook + stream",
+      "unit": "ms",
+      "targets": {
+        "p75": 200,
+        "p90": 300,
+        "p99": 600
+      },
+      "best": 48,
+      "avg": 54.5,
+      "p75": 56,
+      "p90": 60,
+      "p99": 91,
+      "samples": 30
+    },
+    {
+      "metric": "sl",
+      "scenario": "stream latency",
+      "unit": "ms",
+      "targets": {
+        "p75": 50,
+        "p90": 60,
+        "p99": 125
+      },
+      "best": 4,
+      "avg": 5.5,
+      "p75": 6,
+      "p90": 8,
+      "p99": 10,
+      "samples": 30
+    },
+    {
+      "metric": "producer-accept",
+      "scenario": "stream latency",
+      "unit": "ms",
+      "best": 0,
+      "avg": 0.2,
+      "p75": 0,
+      "p90": 1,
+      "p99": 1,
+      "samples": 30
+    },
+    {
+      "metric": "delivery-after-accept",
+      "scenario": "stream latency",
+      "unit": "ms",
+      "best": 4,
+      "avg": 5.3,
+      "p75": 6,
+      "p90": 7,
+      "p99": 9,
+      "samples": 30
+    },
+    {
+      "metric": "so",
+      "scenario": "stream overhead (text)",
+      "unit": "ms",
+      "targets": {
+        "p75": 250,
+        "p90": 500,
+        "p99": 1000
+      },
+      "best": 7,
+      "avg": 8.6,
+      "p75": 9,
+      "p90": 10,
+      "p99": 14,
+      "samples": 30
+    },
+    {
+      "metric": "so",
+      "scenario": "stream overhead (structured)",
+      "unit": "ms",
+      "targets": {
+        "p75": 250,
+        "p90": 500,
+        "p99": 1000
+      },
+      "best": 7,
+      "avg": 7.9,
+      "p75": 8,
+      "p90": 9,
+      "p99": 11,
+      "samples": 30
+    },
+    {
+      "metric": "retained-first",
+      "scenario": "retained stream (full)",
+      "unit": "ms",
+      "best": 6,
+      "avg": 7.8,
+      "p75": 7,
+      "p90": 12,
+      "p99": 12,
+      "samples": 5
+    },
+    {
+      "metric": "retained-drain",
+      "scenario": "retained stream (full)",
+      "unit": "ms",
+      "best": 32,
+      "avg": 197,
+      "p75": 304,
+      "p90": 461,
+      "p99": 461,
+      "samples": 5
+    },
+    {
+      "metric": "retained-first",
+      "scenario": "retained stream (resume)",
+      "unit": "ms",
+      "best": 5,
+      "avg": 6.2,
+      "p75": 6,
+      "p90": 10,
+      "p99": 10,
+      "samples": 5
+    },
+    {
+      "metric": "retained-drain",
+      "scenario": "retained stream (resume)",
+      "unit": "ms",
+      "best": 7,
+      "avg": 8.8,
+      "p75": 8,
+      "p90": 14,
+      "p99": 14,
+      "samples": 5
+    },
+    {
+      "metric": "concurrent-makespan",
+      "scenario": "100 concurrent x 50 steps",
+      "unit": "ms",
+      "best": 129714,
+      "avg": 129714,
+      "p75": 129714,
+      "p90": 129714,
+      "p99": 129714,
+      "samples": 1
+    },
+    {
+      "metric": "concurrent-run-duration",
+      "scenario": "100 concurrent x 50 steps",
+      "unit": "ms",
+      "best": 71312,
+      "avg": 111795.2,
+      "p75": 126294,
+      "p90": 127671,
+      "p99": 128868,
+      "samples": 100
+    },
+    {
+      "metric": "concurrent-ttfs",
+      "scenario": "100 concurrent x 50 steps",
+      "unit": "ms",
+      "best": 86,
+      "avg": 1971.8,
+      "p75": 2589,
+      "p90": 3360,
+      "p99": 4166,
+      "samples": 100
+    },
+    {
+      "metric": "concurrent-steps-per-second",
+      "scenario": "100 concurrent x 50 steps",
+      "unit": "steps/s",
+      "best": 38.5,
+      "avg": 38.5,
+      "p75": 38.5,
+      "p90": 38.5,
+      "p99": 38.5,
+      "samples": 1
+    },
+    {
+      "metric": "stso",
+      "scenario": "1020 steps (1-20)",
+      "unit": "ms",
+      "targets": {
+        "p75": 20,
+        "p90": 30,
+        "p99": 60
+      },
+      "best": 34,
+      "avg": 37.5,
+      "p75": 39,
+      "p90": 44,
+      "p99": 47,
+      "samples": 19
+    },
+    {
+      "metric": "stso",
+      "scenario": "1020 steps (101-120)",
+      "unit": "ms",
+      "targets": {
+        "p75": 30,
+        "p90": 45,
+        "p99": 90
+      },
+      "best": 35,
+      "avg": 58.1,
+      "p75": 43,
+      "p90": 102,
+      "p99": 297,
+      "samples": 19
+    },
+    {
+      "metric": "stso",
+      "scenario": "1020 steps (1001-1020)",
+      "unit": "ms",
+      "targets": {
+        "p75": 40,
+        "p90": 60,
+        "p99": 120
+      },
+      "best": 68,
+      "avg": 94.7,
+      "p75": 81,
+      "p90": 243,
+      "p99": 280,
+      "samples": 19
+    },
+    {
+      "metric": "wo",
+      "scenario": "1020 steps",
+      "unit": "ms",
+      "best": 78302,
+      "avg": 78302,
+      "p75": 78302,
+      "p90": 78302,
+      "p99": 78302,
+      "samples": 1
+    }
+  ],
+  "backendUsage": {
+    "before": {
+      "kind": "postgres",
+      "capturedAt": "2026-07-25T18:39:53.553Z",
+      "counters": {
+        "database_bytes": 8804019,
+        "xact_commit": 18320,
+        "xact_rollback": 4,
+        "blks_read": 19,
+        "blks_hit": 320450,
+        "tup_returned": 403240,
+        "tup_fetched": 208347,
+        "tup_inserted": 1489,
+        "tup_updated": 320,
+        "tup_deleted": 591,
+        "temp_files": 0,
+        "temp_bytes": 0
+      },
+      "targets": 1
+    },
+    "after": {
+      "kind": "postgres",
+      "capturedAt": "2026-07-25T18:47:46.084Z",
+      "counters": {
+        "database_bytes": 34158259,
+        "xact_commit": 361487,
+        "xact_rollback": 4,
+        "blks_read": 30,
+        "blks_hit": 3671761,
+        "tup_returned": 4155986,
+        "tup_fetched": 1746895,
+        "tup_inserted": 62820,
+        "tup_updated": 14844,
+        "tup_deleted": 1440,
+        "temp_files": 0,
+        "temp_bytes": 0
+      },
+      "targets": 1
+    },
+    "delta": {
+      "database_bytes": 25354240,
+      "xact_commit": 343167,
+      "xact_rollback": 0,
+      "blks_read": 11,
+      "blks_hit": 3351311,
+      "tup_returned": 3752746,
+      "tup_fetched": 1538548,
+      "tup_inserted": 61331,
+      "tup_updated": 14524,
+      "tup_deleted": 849,
+      "temp_files": 0,
+      "temp_bytes": 0
+    },
+    "derived": {
+      "gatewayLeaderCacheHitRatio": 0
+    }
+  }
+}
