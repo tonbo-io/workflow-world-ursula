@@ -261,6 +261,7 @@ describe('QueueJournal', () => {
       if (!lease) throw new Error('expected checkpoint test lease');
       await journal.ack(queueName, lease);
     }
+    await journal.flushCheckpoints();
     expect(memory.retainedRecords).toContain(256);
 
     memory.readAllStarts.length = 0;
@@ -320,6 +321,7 @@ describe('QueueJournal', () => {
       if (!lease) throw new Error('expected initial queue lease');
       await writer.ack(queueName, lease);
     }
+    await writer.flushCheckpoints();
 
     memory.beforeNextSourceReadAll = async () => {
       for (let index = 0; index < 85; index += 1) {
@@ -330,6 +332,7 @@ describe('QueueJournal', () => {
         if (!lease) throw new Error('expected advancing queue lease');
         await writer.ack(queueName, lease);
       }
+      await writer.flushCheckpoints();
     };
 
     const coldReader = new QueueJournal(memory as unknown as UrsulaClient);

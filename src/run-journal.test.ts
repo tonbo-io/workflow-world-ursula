@@ -13,6 +13,7 @@ function response(body: BodyInit | null, init: ResponseInit = {}): Response {
 }
 
 class MemoryClient {
+  checkpointGate?: Promise<void>;
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly tailReads: string[] = [];
   readonly retainedRecords: Array<{ stream: string; record: number }> = [];
@@ -38,6 +39,9 @@ class MemoryClient {
     values: T | readonly T[],
     options: UrsulaAppendOptions
   ): Promise<{ startRecord: number; nextRecord: number }> {
+    if (stream.startsWith('run-checkpoint-') && this.checkpointGate) {
+      await this.checkpointGate;
+    }
     const current = this.streams.get(stream) ?? [];
     if (
       options.expectedRecord !== undefined &&
@@ -232,6 +236,7 @@ describe('RunJournal', () => {
         events: [],
       });
     }
+    await journal.flushCheckpoints();
 
     client.readAllStarts.length = 0;
     const restarted = new RunJournal(client as unknown as UrsulaClient);
@@ -263,6 +268,39 @@ describe('RunJournal', () => {
           start === 0
       )
     ).toBe(false);
+  });
+
+  it('does not block the source mutation on checkpoint persistence', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.load('wrun_async_checkpoint');
+    for (let index = 0; index < 127; index += 1) {
+      await journal.append(state, {
+        operationId: `async-commit-${index}`,
+        events: [],
+      });
+    }
+    let releaseCheckpoint: () => void = () => {};
+    client.checkpointGate = new Promise<void>((resolve) => {
+      releaseCheckpoint = resolve;
+    });
+
+    await expect(
+      Promise.race([
+        journal
+          .append(state, {
+            operationId: 'async-commit-127',
+            events: [],
+          })
+          .then(() => 'committed'),
+        new Promise<string>((resolve) => {
+          setTimeout(() => resolve('blocked'), 50);
+        }),
+      ])
+    ).resolves.toBe('committed');
+
+    releaseCheckpoint();
+    await journal.flushCheckpoints();
   });
 
   it('rebuilds a stale hot cache when its cursor is beyond the stream tail', async () => {

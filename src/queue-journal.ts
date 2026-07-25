@@ -224,6 +224,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
+  private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(private readonly client: UrsulaClient) {}
 
@@ -334,18 +335,11 @@ export class QueueJournal {
 
   private async writeCheckpoint(
     queueName: ValidQueueName,
-    state: QueueState
+    checkpoint: QueueCheckpoint
   ): Promise<void> {
-    if (
-      state.nextRecord === 0 ||
-      state.nextRecord % CHECKPOINT_INTERVAL_RECORDS !== 0
-    ) {
-      return;
-    }
-    const checkpoint = this.checkpointFromState(queueName, state);
     const checkpointStreamId = checkpointStream(queueName);
     const receipt = await this.client.append(checkpointStreamId, checkpoint, {
-      operationId: `queue-checkpoint:${queueName}:${state.nextRecord}`,
+      operationId: `queue-checkpoint:${queueName}:${checkpoint.sourceNextRecord}`,
       createIfMissing: true,
     });
     await this.client.publishSnapshotAtRecord(
@@ -363,13 +357,50 @@ export class QueueJournal {
     // the safety proof that authorizes Ursula to discard the journal prefix.
     await this.client.publishSnapshotAtRecord(
       queueStream(queueName),
-      state.nextRecord,
+      checkpoint.sourceNextRecord,
       checkpoint
     );
     await this.client.advanceRetentionAtRecord(
       queueStream(queueName),
-      state.nextRecord
+      checkpoint.sourceNextRecord
     );
+  }
+
+  private scheduleCheckpoint(
+    queueName: ValidQueueName,
+    state: QueueState
+  ): void {
+    if (
+      state.nextRecord === 0 ||
+      state.nextRecord % CHECKPOINT_INTERVAL_RECORDS !== 0
+    ) {
+      return;
+    }
+    const checkpoint = this.checkpointFromState(queueName, state);
+    const previous =
+      this.checkpointTasks.get(queueName) ?? Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(() => this.writeCheckpoint(queueName, checkpoint))
+      .catch((error: unknown) => {
+        console.error('Ursula World queue checkpoint failed', {
+          queueName,
+          sourceNextRecord: checkpoint.sourceNextRecord,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    this.checkpointTasks.set(queueName, task);
+    void task.then(() => {
+      if (this.checkpointTasks.get(queueName) === task) {
+        this.checkpointTasks.delete(queueName);
+      }
+    });
+  }
+
+  async flushCheckpoints(): Promise<void> {
+    while (this.checkpointTasks.size > 0) {
+      await Promise.all(this.checkpointTasks.values());
+    }
   }
 
   private async appendTransition(
@@ -390,15 +421,7 @@ export class QueueJournal {
       applyTransition(state, transition);
       state.nextRecord = expectedRecord + 1;
     }
-    try {
-      await this.writeCheckpoint(queueName, state);
-    } catch (error) {
-      console.error('Ursula World queue checkpoint failed', {
-        queueName,
-        sourceNextRecord: state.nextRecord,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    this.scheduleCheckpoint(queueName, state);
   }
 
   private applyRecords(
