@@ -176,7 +176,7 @@ interface BenchStepTiming {
 
 interface BenchStreamLatency {
   writtenAt: number;
-  writeSettledAt: number;
+  producerAcceptedAt: number;
   readAt: number;
 }
 
@@ -399,7 +399,7 @@ async function runSlIteration(): Promise<SlIterationResult> {
     if (
       !sl ||
       typeof sl.writtenAt !== 'number' ||
-      typeof sl.writeSettledAt !== 'number' ||
+      typeof sl.producerAcceptedAt !== 'number' ||
       typeof sl.readAt !== 'number'
     ) {
       throw new Error(
