@@ -2,6 +2,14 @@ name: Benchmark image
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - benchmark/**
+      - src/**
+      - Dockerfile.benchmark
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
   push:
     branches:
       - main
@@ -35,5 +43,5 @@ jobs:
           context: .
           file: Dockerfile.benchmark
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main
