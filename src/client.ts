@@ -75,8 +75,17 @@ export function isUrsulaRequestError(
     error instanceof UrsulaRequestError ||
     (candidate?.name === 'UrsulaRequestError' &&
       typeof candidate.status === 'number' &&
-      typeof candidate.operation === 'string');
-  return recognized && (status === undefined || candidate?.status === status);
+      typeof candidate.operation === 'string') ||
+    (status !== undefined &&
+      typeof candidate?.message === 'string' &&
+      candidate.message.startsWith('Ursula ') &&
+      candidate.message.includes(` failed: HTTP ${status}`));
+  return (
+    recognized &&
+    (status === undefined ||
+      candidate?.status === status ||
+      candidate?.message?.includes(` failed: HTTP ${status}`) === true)
+  );
 }
 
 function nonNegativeInteger(
@@ -261,7 +270,7 @@ export class UrsulaClient {
       headers.set('stream-record-match', String(options.expectedRecord));
     }
     const response = await this.success(
-      'append records',
+      `append records to "${stream}"`,
       await this.fetchImpl(this.streamUrl(stream), {
         method: 'POST',
         headers,

@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { type UrsulaClient, UrsulaRequestError } from './client.js';
+import {
+  isUrsulaRequestError,
+  type UrsulaClient,
+} from './client.js';
 
 type HookClaimTransition =
   | {
@@ -100,7 +103,7 @@ export class HookClaims {
           },
         };
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           continue;
         }
         throw error;
@@ -138,7 +141,7 @@ export class HookClaims {
         );
         return;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           continue;
         }
         throw error;
@@ -178,7 +181,7 @@ export class HookClaims {
         );
         return;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           continue;
         }
         throw error;
@@ -195,7 +198,7 @@ export class HookClaims {
         claimStream(token)
       );
     } catch (error) {
-      if (error instanceof UrsulaRequestError && error.status === 404) {
+      if (isUrsulaRequestError(error, 404)) {
         return { nextRecord: 0 };
       }
       throw error;
