@@ -466,11 +466,16 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         }, longPollTimeoutMs + LONG_POLL_CLIENT_HEADROOM_MS)
       : undefined;
     let response: Response;
+    let body: string;
     try {
       response = await fetchImpl(url, {
         headers: headers(),
         signal: requestController?.signal ?? args.signal,
       });
+      if (response.status !== 204) {
+        await expectSuccess('read stream', response);
+      }
+      body = response.status === 204 ? '' : await response.text();
     } catch (error) {
       if (requestTimedOut && !args.signal?.aborted) {
         return {
@@ -485,10 +490,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       if (requestDeadline !== undefined) clearTimeout(requestDeadline);
       args.signal?.removeEventListener('abort', abortRequest);
     }
-    if (response.status !== 204) {
-      await expectSuccess('read stream', response);
-    }
-    const body = response.status === 204 ? '' : await response.text();
     return {
       records: parseEnvelopeLines(body),
       nextRecord: parseNonNegativeInteger(
