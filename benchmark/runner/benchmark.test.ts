@@ -87,7 +87,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, test } from 'vitest';
-import { getRun } from 'workflow/api';
 
 const deploymentUrl = process.env.DEPLOYMENT_URL;
 if (!deploymentUrl) {
@@ -265,10 +264,29 @@ async function triggerBenchRun(
   return { runId: data.runId, clientStart: data.clientStart };
 }
 
-/** Poll a run's return value to completion (the handle polls internally). */
+/**
+ * Poll a run's return value through the deployment.
+ *
+ * The Workflow builder statically injects the selected World into the app
+ * bundle. Keeping reads in that same bundle avoids requiring the standalone
+ * benchmark process to duplicate framework-specific module aliasing.
+ */
 async function getReturnValue(runId: string): Promise<unknown> {
-  const run = await getRun(runId);
-  return run.returnValue;
+  for (;;) {
+    const response = await fetch(`${deploymentUrl}/api/bench/${runId}`);
+    if (response.status === 202) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(
+        `bench read for ${runId} failed: ${response.status} ${body.slice(0, 300)}`
+      );
+    }
+    const body = (await response.json()) as { returnValue?: unknown };
+    return body.returnValue;
+  }
 }
 
 function timingsFromReturnValue(
