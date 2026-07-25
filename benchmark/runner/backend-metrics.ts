@@ -92,6 +92,17 @@ async function captureUrsula(
   }
   if (gatewayMetricsUrl) {
     const response = await fetch(gatewayMetricsUrl);
+    // Pre-metrics Ursula releases do not expose this optional diagnostic
+    // endpoint. Keeping 404 backward-compatible lets one benchmark image run
+    // a clean old/new server A/B.
+    if (response.status === 404) {
+      return {
+        kind: 'ursula',
+        capturedAt: new Date().toISOString(),
+        counters,
+        targets: urls.length,
+      };
+    }
     if (!response.ok) {
       throw new Error(
         `Ursula gateway metrics request failed: ${gatewayMetricsUrl} returned HTTP ${response.status}`
