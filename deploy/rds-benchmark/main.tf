@@ -111,7 +111,7 @@ resource "kubernetes_secret_v1" "postgres" {
   }
 
   data = {
-    url = "postgresql://${aws_db_instance.benchmark.username}:${random_password.postgres.result}@${aws_db_instance.benchmark.address}:${aws_db_instance.benchmark.port}/${aws_db_instance.benchmark.db_name}"
+    url = "postgresql://${aws_db_instance.benchmark.username}:${random_password.postgres.result}@${aws_db_instance.benchmark.address}:${aws_db_instance.benchmark.port}/${aws_db_instance.benchmark.db_name}?sslmode=verify-full&sslrootcert=%2Fetc%2Fssl%2Frds%2Fglobal-bundle.pem"
   }
 
   type = "Opaque"
