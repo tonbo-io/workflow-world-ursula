@@ -49,15 +49,16 @@ Pricing inputs come from the official [Vercel limits and pricing table](https://
 | Backend | Fixed backend cost/month | Sustained benchmark capacity | Fixed cost / 100k steps |
 | --- | ---: | ---: | ---: |
 | Ursula, measured x86 topology | $505.48 | 47.0 steps/s | $0.409 |
+| Ursula, if the EKS control plane is already shared | $432.48 | 47.0 steps/s | $0.350 |
 | Ursula, equivalent three-node Graviton estimate | $442.41 | not measured | — |
 | RDS PostgreSQL comparator | $269.01 | 38.5 steps/s | $0.266 |
 | Managed World | usage-priced | n/a | $2.50 |
 
-Ursula fixed cost includes three `m6i.xlarge` instances ($420.48), one EKS control plane ($73), and 150 GiB gp3 ($12). It excludes S3, cross-AZ transfer, backups, and operations. At this workload's observed cold-upload ratio, S3 PUT requests add approximately 34,200 PUTs or $0.171 per 100,000 logical steps, before compaction; payload storage itself is negligible at current volume. Cross-AZ Raft traffic was not measured and must not be represented as zero.
+Ursula fixed cost includes three `m6i.xlarge` instances ($420.48), one EKS control plane ($73), and 150 GiB gp3 ($12). If Ursula shares an EKS cluster that the application already requires, the $73 control plane is common cost rather than Ursula incremental cost; both views are shown. The estimate excludes S3, cross-AZ transfer, backups, and operations. At this workload's observed cold-upload ratio, S3 PUT requests add approximately 34,200 PUTs or $0.171 per 100,000 logical steps, before compaction; payload storage itself is negligible at current volume. Cross-AZ Raft traffic was not measured and must not be represented as zero.
 
 The RDS estimate includes Multi-AZ `db.m7g.large` compute ($246.01) and 100 GiB Multi-AZ gp3 ($23). The managed estimate includes Workflow step charges only; function duration, observability, and retained World storage are additional.
 
-At zero variable cost, managed step pricing crosses the measured Ursula fixed topology at about 20.2 million steps/month and the RDS comparator at about 10.8 million steps/month. Under continuous saturation, Ursula is cheaper than managed on step charges but remains about 2.18× the PostgreSQL backend cost per delivered 100,000 steps after adding observed S3 PUTs. Ursula's current advantage is capacity and long-history behavior, not lowest cost at this small three-node topology. Larger sustained concurrency, Graviton voters, cross-stream cold packing, and fewer adapter appends are the direct levers for changing that result.
+At zero variable cost, managed step pricing crosses the measured Ursula fixed topology at about 20.2 million steps/month (17.3 million when the EKS control plane is shared) and the RDS comparator at about 10.8 million steps/month. Under continuous saturation, Ursula is cheaper than managed on step charges but remains about 2.18× the PostgreSQL backend cost per delivered 100,000 steps after adding observed S3 PUTs (about 1.96× with a shared EKS control plane). Ursula's current advantage is capacity and long-history behavior, not lowest cost at this small three-node topology. Larger sustained concurrency, Graviton voters, cross-stream cold packing, and fewer adapter appends are the direct levers for changing that result.
 
 ## Interpretation limits
 
