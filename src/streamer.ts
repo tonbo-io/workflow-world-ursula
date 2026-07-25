@@ -9,7 +9,11 @@ import type {
 const DEFAULT_BUCKET = 'workflow';
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 1000;
-const DEFAULT_LONG_POLL_TIMEOUT_MS = 30_000;
+// Leave enough headroom for gateways whose response-header timeout is 30s.
+// New Ursula gateways extend their timeout for long-poll requests, but this
+// default also keeps the adapter reliable with older releases and other
+// reverse proxies.
+const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
 const RECORD_CONTENT_TYPE = 'application/json';
 type HeaderSource = ConstructorParameters<typeof Headers>[0];
 
@@ -188,6 +192,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     config.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
   const producerByStream = new Map<string, Producer>();
   const registeredStreams = new Set<string>();
+  const registeringStreams = new Map<string, Promise<void>>();
   const ensuredStreams = new Set<string>();
   const ensuringStreams = new Map<string, Promise<void>>();
 
@@ -259,18 +264,25 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (name === '__workflow_streams') return;
     const cacheKey = `${runId}\0${name}`;
     if (registeredStreams.has(cacheKey)) return;
-
-    const url = registryUrl(runId);
-    await ensureStream(url);
-    await expectSuccess(
-      'register stream',
-      await fetchImpl(url, {
-        method: 'POST',
-        headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
-        body: JSON.stringify({ name }),
-      })
-    );
-    registeredStreams.add(cacheKey);
+    const pending = registeringStreams.get(cacheKey);
+    if (pending) return pending;
+    const registering = (async () => {
+      const url = registryUrl(runId);
+      await ensureStream(url);
+      await expectSuccess(
+        'register stream',
+        await fetchImpl(url, {
+          method: 'POST',
+          headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
+          body: JSON.stringify({ name }),
+        })
+      );
+      registeredStreams.add(cacheKey);
+    })().finally(() => {
+      registeringStreams.delete(cacheKey);
+    });
+    registeringStreams.set(cacheKey, registering);
+    return registering;
   }
 
   function producerFor(key: string): Producer {
@@ -313,8 +325,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (records.length === 0) return;
     const url = streamUrl(runId, name);
     await serializeStream(url, async (producer) => {
-      await ensureStream(url);
-      await registerStream(runId, name);
+      await Promise.all([ensureStream(url), registerStream(runId, name)]);
       const sequence = producer.nextSequence;
       await expectSuccess(
         'append stream',
@@ -501,8 +512,12 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       async get(runId, name, startIndex = 0) {
         // Workflow can open a readable output stream before the first
         // invocation writes a chunk. Ursula reads require the stream to
-        // exist, so create the empty stream before starting long polling.
-        await ensureStream(streamUrl(runId, name));
+        // exist. Register it at the same time so a later first write only pays
+        // for the append in its latency-sensitive path.
+        await Promise.all([
+          ensureStream(streamUrl(runId, name)),
+          registerStream(runId, name),
+        ]);
         let cursor =
           startIndex < 0
             ? Math.max(0, (await head(runId, name)).nextRecord + startIndex)

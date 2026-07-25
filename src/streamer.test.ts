@@ -236,6 +236,8 @@ describe('Ursula Workflow streamer', () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 204 }))
       .mockResolvedValueOnce(
         response(null, {
           status: 204,
@@ -268,7 +270,38 @@ describe('Ursula Workflow streamer', () => {
       done: true,
       value: undefined,
     });
-    expect(fetch.mock.calls[2]?.[0]?.toString()).toContain('record=0');
-    expect(fetch.mock.calls[2]?.[0]?.toString()).toContain('timeout_ms=30000');
+    expect(fetch.mock.calls[4]?.[0]?.toString()).toContain('record=0');
+    expect(fetch.mock.calls[4]?.[0]?.toString()).toContain('timeout_ms=25000');
+  });
+
+  it('registers a live-read stream before its first latency-sensitive write', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>((input, init) => {
+      if (input.toString().includes('live=long-poll')) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true }
+          );
+        });
+      }
+      return Promise.resolve(response(null, { status: 201 }));
+    });
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    const readable = await streamer.streams.get('wrun_1', 'output');
+    const reader = readable.getReader();
+    await streamer.streams.write('wrun_1', 'output', 'hello');
+    await reader.cancel();
+
+    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(fetch.mock.calls[0]?.[1]?.method).toBe('PUT');
+    expect(fetch.mock.calls[1]?.[1]?.method).toBe('PUT');
+    expect(fetch.mock.calls[2]?.[1]?.method).toBe('POST');
+    expect(fetch.mock.calls[3]?.[0]?.toString()).toContain('live=long-poll');
+    expect(fetch.mock.calls[4]?.[1]?.method).toBe('POST');
   });
 });

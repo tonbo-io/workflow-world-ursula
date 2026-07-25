@@ -9,6 +9,7 @@ import { createQueue } from './queue.js';
 
 class MemoryClient {
   readonly waitedStreams: string[] = [];
+  readonly waitTimeouts: number[] = [];
   private readonly streams = new Map<string, unknown[]>();
 
   async ensureJsonStream(stream: string): Promise<void> {
@@ -85,7 +86,7 @@ class MemoryClient {
   async waitForRecords<T>(
     stream: string,
     start: number,
-    _timeoutMs: number,
+    timeoutMs: number,
     signal?: AbortSignal
   ): Promise<{
     records: UrsulaRecord<T>[];
@@ -94,6 +95,7 @@ class MemoryClient {
     upToDate: boolean;
   }> {
     this.waitedStreams.push(stream);
+    this.waitTimeouts.push(timeoutMs);
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(resolve, 5);
       signal?.addEventListener(
@@ -229,6 +231,31 @@ describe('Ursula queue runtime', () => {
       timeout: 500,
     });
     await queue.close();
+  });
+
+  it('wakes a separate dispatcher instance through Ursula long polling', async () => {
+    const memory = new MemoryClient();
+    const client = memory as unknown as UrsulaClient;
+    const worker = createQueue(client, {
+      pollIntervalMs: 10_000,
+      leaseDurationMs: 1_000,
+    });
+    const producer = createQueue(client, { pollIntervalMs: 10_000 });
+    const handler = vi.fn().mockResolvedValue(undefined);
+    worker.createQueueHandler('__wkf_workflow_', handler);
+    await worker.start();
+
+    await producer.queue('__wkf_workflow_remote' as ValidQueueName, {
+      runId: 'run-remote',
+    });
+
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce(), {
+      timeout: 500,
+    });
+    await Promise.all([producer.close(), worker.close()]);
+
+    expect(memory.waitedStreams).toContain('registry-queues');
+    expect(memory.waitTimeouts).toContain(25_000);
   });
 
   it('does not watch or spin on queues this process cannot deliver', async () => {

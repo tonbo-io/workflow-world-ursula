@@ -20,7 +20,7 @@ const DEFAULT_LEASE_DURATION_MS = 60_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_CONCURRENCY = 64;
 const DEFAULT_SHUTDOWN_GRACE_MS = 30_000;
-const CROSS_INSTANCE_WAKE_TIMEOUT_MS = 30_000;
+const DEFAULT_CROSS_INSTANCE_WAKE_TIMEOUT_MS = 25_000;
 
 type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
@@ -36,6 +36,8 @@ export interface UrsulaQueueConfig {
   retryDelayMs?: number;
   concurrency?: number;
   shutdownGraceMs?: number;
+  /** Long-poll duration for cross-instance registry and queue wakeups. */
+  longPollTimeoutMs?: number;
 }
 
 export interface UrsulaQueue extends Queue {
@@ -90,6 +92,11 @@ export function createQueue(
     config.shutdownGraceMs,
     DEFAULT_SHUTDOWN_GRACE_MS,
     'Ursula queue shutdownGraceMs'
+  );
+  const longPollTimeoutMs = positiveInteger(
+    config.longPollTimeoutMs,
+    DEFAULT_CROSS_INSTANCE_WAKE_TIMEOUT_MS,
+    'Ursula queue longPollTimeoutMs'
   );
   const journal = new QueueJournal(client);
   const registry = new QueueRegistry(client);
@@ -161,7 +168,7 @@ export function createQueue(
         try {
           const changed = await journal.waitForChange(
             queueName,
-            CROSS_INSTANCE_WAKE_TIMEOUT_MS,
+            longPollTimeoutMs,
             shutdown.signal
           );
           if (changed) wake();
@@ -183,7 +190,7 @@ export function createQueue(
     while (!shutdown.signal.aborted) {
       try {
         const changed = await registry.waitForChange(
-          CROSS_INSTANCE_WAKE_TIMEOUT_MS,
+          longPollTimeoutMs,
           shutdown.signal
         );
         if (changed) wake();
