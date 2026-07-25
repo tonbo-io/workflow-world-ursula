@@ -383,15 +383,25 @@ export function createStorage(
           data.eventData?.deploymentId !== undefined &&
           data.eventData.workflowName !== undefined &&
           data.eventData.input !== undefined;
-        if (data.eventType === 'run_created' || lazyRunStart) {
-          await registry.register(effectiveRunId, new Date());
-        }
+        const createsRun = data.eventType === 'run_created' || lazyRunStart;
+        const initialState = createsRun
+          ? Promise.all([
+              registry.register(effectiveRunId, new Date()),
+              journal.loadForMutation(effectiveRunId, {
+                assumeEmpty: data.eventType === 'run_created',
+                createIfMissing: true,
+              }),
+            ]).then(([, state]) => state)
+          : undefined;
         let assumeEmpty = data.eventType === 'run_created';
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
-          const state = await journal.loadForMutation(effectiveRunId, {
-            assumeEmpty,
-            createIfMissing: data.eventType === 'run_created' || lazyRunStart,
-          });
+          const state =
+            attempt === 0 && initialState
+              ? await initialState
+              : await journal.loadForMutation(effectiveRunId, {
+                  assumeEmpty,
+                  createIfMissing: createsRun,
+                });
           const op = mutationOperationId(
             state,
             data,

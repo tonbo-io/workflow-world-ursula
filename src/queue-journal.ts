@@ -346,6 +346,7 @@ export class QueueJournal {
     const checkpointStreamId = checkpointStream(queueName);
     const receipt = await this.client.append(checkpointStreamId, checkpoint, {
       operationId: `queue-checkpoint:${queueName}:${state.nextRecord}`,
+      createIfMissing: true,
     });
     await this.client.publishSnapshotAtRecord(
       checkpointStreamId,

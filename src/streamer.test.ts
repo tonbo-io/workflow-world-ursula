@@ -19,11 +19,9 @@ describe('Ursula Workflow streamer', () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 204 }))
       .mockResolvedValueOnce(
         response(null, {
-          status: 200,
+          status: 201,
           headers: {
             'stream-record-start': '0',
             'stream-record-next': '2',
@@ -40,13 +38,13 @@ describe('Ursula Workflow streamer', () => {
       Uint8Array.from([0, 255]),
     ]);
 
-    expect(fetch).toHaveBeenCalledTimes(4);
-    const append = fetch.mock.calls[3];
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const append = fetch.mock.calls[1];
     const request = append?.[1] as RequestInit;
     expect(append?.[0]?.toString()).toMatch(
       /^https:\/\/ursula\.test\/workflow\/wrun_1-[A-Za-z0-9_-]{32}$/
     );
-    expect(request.method).toBe('POST');
+    expect(request.method).toBe('PUT');
     expect(JSON.parse(request.body as string)).toEqual([
       { v: 1, data: 'aGVsbG8=' },
       { v: 1, data: 'AP8=' },
@@ -60,9 +58,8 @@ describe('Ursula Workflow streamer', () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 204 }))
       .mockRejectedValueOnce(new Error('connection reset'))
+      .mockResolvedValueOnce(response(null, { status: 200 }))
       .mockResolvedValueOnce(response(null, { status: 200 }));
     const streamer = createStreamer({
       baseUrl: 'https://ursula.test',
@@ -74,9 +71,9 @@ describe('Ursula Workflow streamer', () => {
     ).rejects.toThrow('connection reset');
     await streamer.streams.write('wrun_1', 'output', 'hello');
 
-    const firstAppendHeaders = new Headers(fetch.mock.calls[3]?.[1]?.headers);
-    const retriedAppendHeaders = new Headers(fetch.mock.calls[4]?.[1]?.headers);
-    expect(fetch).toHaveBeenCalledTimes(5);
+    const firstAppendHeaders = new Headers(fetch.mock.calls[1]?.[1]?.headers);
+    const retriedAppendHeaders = new Headers(fetch.mock.calls[2]?.[1]?.headers);
+    expect(fetch).toHaveBeenCalledTimes(4);
     expect(firstAppendHeaders.get('producer-id')).toBe(
       retriedAppendHeaders.get('producer-id')
     );
@@ -87,7 +84,7 @@ describe('Ursula Workflow streamer', () => {
   it('reuses producer identity when a closed stream is retried elsewhere', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
-      .mockResolvedValue(response(null, { status: 200 }));
+      .mockResolvedValue(response(null, { status: 201 }));
     const first = createStreamer({
       baseUrl: 'https://ursula.test',
       fetch,
@@ -102,8 +99,8 @@ describe('Ursula Workflow streamer', () => {
     });
     await retry.streams.write('wrun_1', 'output', 'hello');
 
-    const firstAppendHeaders = new Headers(fetch.mock.calls[3]?.[1]?.headers);
-    const retriedAppendHeaders = new Headers(fetch.mock.calls[8]?.[1]?.headers);
+    const firstAppendHeaders = new Headers(fetch.mock.calls[1]?.[1]?.headers);
+    const retriedAppendHeaders = new Headers(fetch.mock.calls[4]?.[1]?.headers);
     expect(firstAppendHeaders.get('producer-id')).toBe(
       retriedAppendHeaders.get('producer-id')
     );
@@ -142,8 +139,6 @@ describe('Ursula Workflow streamer', () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 204 }))
       .mockImplementationOnce(() => appendResponse)
       .mockResolvedValueOnce(response(null, { status: 200 }));
     const streamer = createStreamer({
@@ -153,17 +148,17 @@ describe('Ursula Workflow streamer', () => {
 
     const write = streamer.streams.write('wrun_1', 'output', 'hello');
     await vi.waitFor(() => {
-      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(fetch).toHaveBeenCalledTimes(2);
     });
     const close = streamer.streams.close('wrun_1', 'output');
     await Promise.resolve();
-    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(fetch).toHaveBeenCalledTimes(2);
 
-    finishAppend?.(response(null, { status: 200 }));
+    finishAppend?.(response(null, { status: 201 }));
     await Promise.all([write, close]);
 
-    expect(fetch).toHaveBeenCalledTimes(5);
-    const closeHeaders = new Headers(fetch.mock.calls[4]?.[1]?.headers);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const closeHeaders = new Headers(fetch.mock.calls[2]?.[1]?.headers);
     expect(closeHeaders.get('stream-closed')).toBe('true');
   });
 
@@ -287,7 +282,6 @@ describe('Ursula Workflow streamer', () => {
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 204 }))
       .mockResolvedValueOnce(
         response(null, {
           status: 204,
@@ -320,8 +314,8 @@ describe('Ursula Workflow streamer', () => {
       done: true,
       value: undefined,
     });
-    expect(fetch.mock.calls[4]?.[0]?.toString()).toContain('record=0');
-    expect(fetch.mock.calls[4]?.[0]?.toString()).toContain('timeout_ms=25000');
+    expect(fetch.mock.calls[3]?.[0]?.toString()).toContain('record=0');
+    expect(fetch.mock.calls[3]?.[0]?.toString()).toContain('timeout_ms=25000');
   });
 
   it('registers a live-read stream before its first latency-sensitive write', async () => {
@@ -347,11 +341,10 @@ describe('Ursula Workflow streamer', () => {
     await streamer.streams.write('wrun_1', 'output', 'hello');
     await reader.cancel();
 
-    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(fetch).toHaveBeenCalledTimes(4);
     expect(fetch.mock.calls[0]?.[1]?.method).toBe('PUT');
     expect(fetch.mock.calls[1]?.[1]?.method).toBe('PUT');
-    expect(fetch.mock.calls[2]?.[1]?.method).toBe('POST');
-    expect(fetch.mock.calls[3]?.[0]?.toString()).toContain('live=long-poll');
-    expect(fetch.mock.calls[4]?.[1]?.method).toBe('POST');
+    expect(fetch.mock.calls[2]?.[0]?.toString()).toContain('live=long-poll');
+    expect(fetch.mock.calls[3]?.[1]?.method).toBe('POST');
   });
 });

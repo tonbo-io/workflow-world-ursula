@@ -36,6 +36,13 @@ export interface UrsulaAppendOptions {
   operationId: string;
   /** Current JSON-record tail observed by the reducer. */
   expectedRecord?: number;
+  /**
+   * Create a missing stream with these records as its initial payload.
+   *
+   * An existing stream falls back to the guarded POST path, preserving CAS
+   * and producer-dedup semantics across retries.
+   */
+  createIfMissing?: boolean;
 }
 
 export class UrsulaRequestError extends Error {
@@ -259,7 +266,6 @@ export class UrsulaClient {
     if (records.length === 0) {
       throw new Error('Ursula append requires at least one record');
     }
-    await this.ensureJsonStream(stream);
     const headers = this.headers({
       'content-type': JSON_CONTENT_TYPE,
       'producer-id': producerId(options.operationId),
@@ -269,12 +275,50 @@ export class UrsulaClient {
     if (options.expectedRecord !== undefined) {
       headers.set('stream-record-match', String(options.expectedRecord));
     }
+    const body = stringifyUrsulaJson(
+      records.length === 1 ? records[0] : records
+    );
+    if (options.createIfMissing && !this.ensuredStreams.has(stream)) {
+      const createHeaders = new Headers(headers);
+      createHeaders.delete('stream-record-match');
+      const created = await this.fetchImpl(this.streamUrl(stream), {
+        method: 'PUT',
+        headers: createHeaders,
+        body,
+      });
+      if (created.status === 201) {
+        this.ensuredStreams.add(stream);
+        return {
+          startRecord: nonNegativeInteger(
+            created.headers,
+            'stream-record-start',
+            0
+          ),
+          nextRecord: nonNegativeInteger(
+            created.headers,
+            'stream-record-next',
+            records.length
+          ),
+        };
+      }
+      if (
+        created.status === 200 ||
+        (created.status === 409 &&
+          created.headers.get('stream-closed') === 'true')
+      ) {
+        this.ensuredStreams.add(stream);
+      } else {
+        await this.success(`create stream "${stream}" with records`, created);
+      }
+    } else {
+      await this.ensureJsonStream(stream);
+    }
     const response = await this.success(
       `append records to "${stream}"`,
       await this.fetchImpl(this.streamUrl(stream), {
         method: 'POST',
         headers,
-        body: stringifyUrsulaJson(records.length === 1 ? records[0] : records),
+        body,
       })
     );
     return {

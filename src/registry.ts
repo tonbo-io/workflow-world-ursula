@@ -74,7 +74,10 @@ export class RunRegistry {
       await this.client.append(
         RUN_REGISTRY_DIRECTORY,
         { version: 1, shard } satisfies ShardRegistration,
-        { operationId: `register-run-shard:${shard}` }
+        {
+          operationId: `register-run-shard:${shard}`,
+          createIfMissing: true,
+        }
       );
       this.shards.add(shard);
     }
@@ -86,7 +89,7 @@ export class RunRegistry {
     await this.client.append(
       registryStream(shard),
       registration,
-      { operationId: `register-run:${runId}` }
+      { operationId: `register-run:${runId}`, createIfMissing: true }
     );
     this.registrations.set(runId, registration);
   }

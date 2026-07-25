@@ -66,6 +66,78 @@ describe('UrsulaClient', () => {
     expect(appendHeaders.get('producer-seq')).toBe('0');
   });
 
+  it('creates a missing stream with its first records in one request', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(
+      response(null, {
+        status: 201,
+        headers: {
+          'stream-record-start': '0',
+          'stream-record-next': '1',
+        },
+      })
+    );
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await expect(
+      client.append(
+        'run-1',
+        { event: 'created' },
+        {
+          operationId: 'event-1',
+          expectedRecord: 0,
+          createIfMissing: true,
+        }
+      )
+    ).resolves.toEqual({ startRecord: 0, nextRecord: 1 });
+
+    expect(fetch).toHaveBeenCalledOnce();
+    const request = fetch.mock.calls[0]?.[1];
+    expect(request?.method).toBe('PUT');
+    expect(new Headers(request?.headers).has('stream-record-match')).toBe(
+      false
+    );
+    expect(request?.body).toBe('{"event":"created"}');
+  });
+
+  it('falls back to guarded append when create finds an existing stream', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        response(null, {
+          status: 200,
+          headers: {
+            'stream-record-start': '0',
+            'stream-record-next': '1',
+          },
+        })
+      );
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await client.append(
+      'run-1',
+      { event: 'created' },
+      {
+        operationId: 'event-1',
+        expectedRecord: 0,
+        createIfMissing: true,
+      }
+    );
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[0]?.[1]?.method).toBe('PUT');
+    expect(fetch.mock.calls[1]?.[1]?.method).toBe('POST');
+    expect(
+      new Headers(fetch.mock.calls[1]?.[1]?.headers).get('stream-record-match')
+    ).toBe('0');
+  });
+
   it('surfaces the current record tail on a precondition failure', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
