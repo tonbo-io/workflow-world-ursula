@@ -45,8 +45,11 @@ export interface BenchStreamChunk {
 export interface BenchStreamLatency {
   /** Date.now() in the writer step when the first chunk was written */
   writtenAt: number;
-  /** Date.now() when the durable write call settled in the writer step */
-  writeSettledAt: number;
+  /**
+   * Date.now() when the user-facing TransformStream accepted the chunk.
+   * This is not a durability boundary; the background pipe writes it later.
+   */
+  producerAcceptedAt: number;
   /** Date.now() in the reader step when the first chunk was received */
   readAt: number;
 }
@@ -210,7 +213,7 @@ export async function benchHookStreamWorkflow(): Promise<{
  * establishes the server-side stream connection), signals readiness on the
  * ready stream, then awaits the first chunk and stamps `readAt`. */
 async function slReaderStep(): Promise<
-  Omit<BenchStreamLatency, 'writeSettledAt'>
+  Omit<BenchStreamLatency, 'producerAcceptedAt'>
 > {
   'use step';
   const { workflowRunId } = getWorkflowMetadata();
@@ -251,7 +254,7 @@ async function slReaderStep(): Promise<
  * its own attach timing doesn't matter — it just gates the SL write. */
 async function slWriterStep(): Promise<{
   writtenAt: number;
-  writeSettledAt: number;
+  producerAcceptedAt: number;
 }> {
   'use step';
   const { workflowRunId } = getWorkflowMetadata();
@@ -270,10 +273,10 @@ async function slWriterStep(): Promise<{
   const writer = writable.getWriter();
   const writtenAt = Date.now();
   await writer.write({ seq: 0, writtenAt });
-  const writeSettledAt = Date.now();
+  const producerAcceptedAt = Date.now();
   writer.releaseLock();
   await writable.close();
-  return { writtenAt, writeSettledAt };
+  return { writtenAt, producerAcceptedAt };
 }
 
 /**
@@ -297,7 +300,7 @@ export async function benchSlWorkflow(): Promise<{ sl: BenchStreamLatency }> {
   return {
     sl: {
       ...reader,
-      writeSettledAt: writer.writeSettledAt,
+      producerAcceptedAt: writer.producerAcceptedAt,
     },
   };
 }
