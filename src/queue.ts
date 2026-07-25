@@ -286,7 +286,7 @@ export function createQueue(
     queueName: ValidQueueName,
     lease: QueueLease,
     handler: QueueHandler | undefined
-  ): Promise<void> {
+  ): Promise<QueueLease | null> {
     const heartbeatController = new AbortController();
     const heartbeatTask = heartbeat(
       queueName,
@@ -298,8 +298,14 @@ export function createQueue(
       if (typeof result?.timeoutSeconds === 'number') {
         const timeoutMs = Math.max(0, result.timeoutSeconds) * 1000;
         await journal.retry(queueName, lease, new Date(Date.now() + timeoutMs));
+        return null;
       } else {
-        await journal.ack(queueName, lease);
+        return journal.ackAndClaimNext(
+          queueName,
+          lease,
+          new Date(),
+          leaseDurationMs
+        );
       }
     } catch (error) {
       console.error('Ursula queue delivery failed; scheduling redelivery', {
@@ -313,9 +319,21 @@ export function createQueue(
         lease,
         new Date(Date.now() + retryDelayMs)
       );
+      return null;
     } finally {
       heartbeatController.abort();
       await heartbeatTask;
+    }
+  }
+
+  async function deliverChain(
+    queueName: ValidQueueName,
+    firstLease: QueueLease,
+    handler: QueueHandler | undefined
+  ): Promise<void> {
+    let lease: QueueLease | null = firstLease;
+    while (lease && !shutdown.signal.aborted) {
+      lease = await deliver(queueName, lease, handler);
     }
   }
 
@@ -344,7 +362,7 @@ export function createQueue(
           leaseDurationMs
         );
         if (!lease) break;
-        const task = deliver(queueName, lease, handler)
+        const task = deliverChain(queueName, lease, handler)
           .catch(() => {
             // Delivery already persisted a retry when possible. A lost lease
             // is safely recovered by expiry on another dispatcher.

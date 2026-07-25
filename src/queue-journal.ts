@@ -368,11 +368,13 @@ export class QueueJournal {
 
   private scheduleCheckpoint(
     queueName: ValidQueueName,
-    state: QueueState
+    state: QueueState,
+    previousNextRecord = state.nextRecord - 1
   ): void {
     if (
       state.nextRecord === 0 ||
-      state.nextRecord % CHECKPOINT_INTERVAL_RECORDS !== 0
+      Math.floor(previousNextRecord / CHECKPOINT_INTERVAL_RECORDS) ===
+        Math.floor(state.nextRecord / CHECKPOINT_INTERVAL_RECORDS)
     ) {
       return;
     }
@@ -409,19 +411,30 @@ export class QueueJournal {
     transition: QueueTransition,
     operationId: string
   ): Promise<void> {
+    await this.appendTransitions(queueName, state, [transition], operationId);
+  }
+
+  private async appendTransitions(
+    queueName: ValidQueueName,
+    state: QueueState,
+    transitions: readonly QueueTransition[],
+    operationId: string
+  ): Promise<void> {
     const expectedRecord = state.nextRecord;
-    await this.client.append(queueStream(queueName), transition, {
+    await this.client.append(queueStream(queueName), transitions, {
       operationId,
       expectedRecord,
     });
-    // A concurrent long-poll waiter may have observed and applied our record
-    // before the append response arrived. Never replay the same transition
+    // A concurrent long-poll waiter may have observed and applied our records
+    // before the append response arrived. Never replay the same transitions
     // twice into the shared cache.
     if (state.nextRecord === expectedRecord) {
-      applyTransition(state, transition);
-      state.nextRecord = expectedRecord + 1;
+      for (const transition of transitions) {
+        applyTransition(state, transition);
+        state.nextRecord += 1;
+      }
     }
-    this.scheduleCheckpoint(queueName, state);
+    this.scheduleCheckpoint(queueName, state, expectedRecord);
   }
 
   private applyRecords(
@@ -515,12 +528,15 @@ export class QueueJournal {
 
   private claimCandidate(
     state: QueueState,
-    now: Date
+    now: Date,
+    ignoredMessageId?: MessageId,
+    requiredConcurrencyKey?: string
   ): QueueMessageState | undefined {
     const activeLeaseKeys = new Set(
       [...state.messages.values()]
         .filter(
           (candidate) =>
+            candidate.messageId !== ignoredMessageId &&
             candidate.status === 'leased' &&
             (candidate.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
         )
@@ -528,6 +544,13 @@ export class QueueJournal {
     );
     let message: QueueMessageState | undefined;
     for (const candidate of state.messages.values()) {
+      if (candidate.messageId === ignoredMessageId) continue;
+      if (
+        requiredConcurrencyKey &&
+        concurrencyKey(candidate.message) !== requiredConcurrencyKey
+      ) {
+        continue;
+      }
       if (candidate.status === 'acked') continue;
       if (candidate.availableAt.getTime() > now.getTime()) continue;
       if (activeLeaseKeys.has(concurrencyKey(candidate.message))) continue;
@@ -675,6 +698,100 @@ export class QueueJournal {
       leaseId: lease.leaseId,
       createdAt: new Date().toISOString(),
     });
+  }
+
+  /**
+   * Completes one delivery and, when work is immediately available, leases
+   * its successor in the same durable append. This preserves the queue state
+   * machine while removing one Raft round trip from suspension-heavy runs.
+   */
+  async ackAndClaimNext(
+    queueName: ValidQueueName,
+    lease: QueueLease,
+    now: Date,
+    leaseDurationMs: number
+  ): Promise<QueueLease | null> {
+    const nextLeaseId = randomUUID();
+    for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
+      let state = await this.loadForMutation(queueName);
+      let current = state.messages.get(lease.message.messageId);
+      if (current?.status !== 'leased' || current.leaseId !== lease.leaseId) {
+        state = await this.load(queueName);
+        current = state.messages.get(lease.message.messageId);
+        const committed = [...state.messages.values()].find(
+          (message) =>
+            message.status === 'leased' && message.leaseId === nextLeaseId
+        );
+        if (committed) {
+          return { leaseId: nextLeaseId, message: { ...committed } };
+        }
+        if (!current) return null;
+        if (current.status !== 'leased' || current.leaseId !== lease.leaseId) {
+          return null;
+        }
+      }
+
+      const acked = {
+        version: 1,
+        type: 'acked',
+        messageId: lease.message.messageId,
+        leaseId: lease.leaseId,
+        createdAt: now.toISOString(),
+      } satisfies QueueTransition;
+      const candidate = this.claimCandidate(
+        state,
+        now,
+        lease.message.messageId,
+        concurrencyKey(lease.message.message)
+      );
+      const leased = candidate
+        ? ({
+            version: 1,
+            type: 'leased',
+            messageId: candidate.messageId,
+            leaseId: nextLeaseId,
+            attempt: candidate.attempt + 1,
+            expiresAt: new Date(
+              now.getTime() + leaseDurationMs
+            ).toISOString(),
+            createdAt: now.toISOString(),
+          } satisfies QueueTransition)
+        : undefined;
+      const transitions = leased ? [acked, leased] : [acked];
+      try {
+        await this.appendTransitions(
+          queueName,
+          state,
+          transitions,
+          leased
+            ? `queue-ack-lease:${lease.leaseId}:${candidate?.messageId}:${nextLeaseId}`
+            : `queue-acked:${lease.leaseId}`
+        );
+        if (!candidate || !leased) return null;
+        return {
+          leaseId: nextLeaseId,
+          message: {
+            ...candidate,
+            status: 'leased',
+            attempt: leased.attempt,
+            leaseId: nextLeaseId,
+            leaseExpiresAt: new Date(leased.expiresAt),
+          },
+        };
+      } catch (error) {
+        this.invalidate(queueName);
+        if (
+          isUrsulaRequestError(error, 412) ||
+          error instanceof TypeError
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error(
+      `Queue "${queueName}" remained contended during ack-and-claim`
+    );
   }
 
   async retry(
