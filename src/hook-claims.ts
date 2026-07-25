@@ -44,12 +44,39 @@ interface ClaimState {
   active?: ActiveHookClaim;
 }
 
+const MAX_CACHED_CLAIMS = 4096;
+const MAX_RETRY_DELAY_MS = 50;
+
+function cloneState(state: ClaimState): ClaimState {
+  return {
+    nextRecord: state.nextRecord,
+    ...(state.active
+      ? {
+          active: {
+            ...state.active,
+            ...(state.active.retentionUntil
+              ? { retentionUntil: new Date(state.active.retentionUntil) }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+async function contentionBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(MAX_RETRY_DELAY_MS, 2 ** Math.min(attempt, 6));
+  const delayMs = Math.max(1, Math.floor(Math.random() * ceiling));
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
 function claimStream(token: string): string {
   const digest = createHash('sha256').update(token).digest('base64url');
   return `hook-${digest}`;
 }
 
 export class HookClaims {
+  private readonly cache = new Map<string, ClaimState>();
+
   constructor(private readonly client: UrsulaClient) {}
 
   async get(token: string): Promise<ActiveHookClaim | undefined> {
@@ -97,18 +124,25 @@ export class HookClaims {
           expectedRecord: state.nextRecord,
           createIfMissing: state.nextRecord === 0,
         });
+        const claim: ActiveHookClaim = {
+          operationId: args.operationId,
+          token: args.token,
+          runId: args.runId,
+          hookId: args.hookId,
+          retentionUntil: args.retentionUntil,
+        };
+        this.cacheState(args.token, {
+          nextRecord: state.nextRecord + 1,
+          active: claim,
+        });
         return {
           acquired: true,
-          claim: {
-            operationId: args.operationId,
-            token: args.token,
-            runId: args.runId,
-            hookId: args.hookId,
-            retentionUntil: args.retentionUntil,
-          },
+          claim,
         };
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
+          this.cache.delete(args.token);
+          await contentionBackoff(attempt);
           continue;
         }
         throw error;
@@ -144,9 +178,15 @@ export class HookClaims {
             expectedRecord: state.nextRecord,
           }
         );
+        this.cacheState(claim.token, {
+          nextRecord: state.nextRecord + 1,
+          active: { ...state.active, committedRunRecord: runRecord },
+        });
         return;
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
+          this.cache.delete(claim.token);
+          await contentionBackoff(attempt);
           continue;
         }
         throw error;
@@ -184,9 +224,12 @@ export class HookClaims {
             expectedRecord: state.nextRecord,
           }
         );
+        this.cacheState(token, { nextRecord: state.nextRecord + 1 });
         return;
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
+          this.cache.delete(token);
+          await contentionBackoff(attempt);
           continue;
         }
         throw error;
@@ -197,6 +240,12 @@ export class HookClaims {
 
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: replaying the three-transition claim state machine is intentionally kept in one audit-friendly function.
   private async load(token: string): Promise<ClaimState> {
+    const cached = this.cache.get(token);
+    if (cached) {
+      this.cache.delete(token);
+      this.cache.set(token, cached);
+      return cloneState(cached);
+    }
     let records: { record: number; value: HookClaimTransition }[];
     try {
       records = await this.client.readAll<HookClaimTransition>(
@@ -204,7 +253,9 @@ export class HookClaims {
       );
     } catch (error) {
       if (isUrsulaRequestError(error, 404)) {
-        return { nextRecord: 0 };
+        const empty = { nextRecord: 0 };
+        this.cacheState(token, empty);
+        return empty;
       }
       throw error;
     }
@@ -235,6 +286,16 @@ export class HookClaims {
         active = undefined;
       }
     }
-    return { nextRecord: records.length, active };
+    const state = { nextRecord: records.length, active };
+    this.cacheState(token, state);
+    return cloneState(state);
+  }
+
+  private cacheState(token: string, state: ClaimState): void {
+    this.cache.delete(token);
+    this.cache.set(token, cloneState(state));
+    if (this.cache.size <= MAX_CACHED_CLAIMS) return;
+    const oldest = this.cache.keys().next().value;
+    if (oldest !== undefined) this.cache.delete(oldest);
   }
 }

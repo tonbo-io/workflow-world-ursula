@@ -68,6 +68,8 @@
  * 5. benchSlWorkflow              — parallel reader/writer steps → SL
  * 6. benchSoWorkflow              — paced LLM-shaped stream, drained → SO
  *                                   (run in text and structured payload modes)
+ * 7. benchStreamCatchupWorkflow   — closed retained stream, full and suffix
+ *                                   replay → first-chunk and drain latency
  *
  * Each scenario runs many iterations (env-tunable, see BENCH_* below) so the
  * percentiles are computed from real samples.
@@ -90,6 +92,7 @@ import { afterAll, beforeAll, describe, test } from 'vitest';
 import {
   type BackendMetricsSnapshot,
   captureBackendMetrics,
+  deriveBackendMetrics,
   diffBackendMetrics,
 } from './backend-metrics.js';
 
@@ -116,7 +119,22 @@ const SL_ITERATIONS = envInt('BENCH_SL_ITERATIONS', STREAM_ITERATIONS);
 const SO_ITERATIONS = envInt('BENCH_SO_ITERATIONS', STREAM_ITERATIONS);
 const SEQUENTIAL_ITERATIONS = envInt('BENCH_SEQUENTIAL_ITERATIONS', 1);
 const SEQUENTIAL_STEP_COUNT = envInt('BENCH_SEQUENTIAL_STEP_COUNT', 1020);
+const CATCHUP_ITERATIONS = envInt('BENCH_CATCHUP_ITERATIONS', 5);
+const CATCHUP_CHUNK_COUNT = envInt('BENCH_CATCHUP_CHUNK_COUNT', 1000);
+const CATCHUP_RESUME_START_INDEX = envInt(
+  'BENCH_CATCHUP_RESUME_START_INDEX',
+  900,
+  0
+);
+const CONCURRENT_ITERATIONS = envInt('BENCH_CONCURRENT_ITERATIONS', 1);
+const CONCURRENT_RUN_COUNT = envInt('BENCH_CONCURRENT_RUN_COUNT', 100);
+const CONCURRENT_STEP_COUNT = envInt('BENCH_CONCURRENT_STEP_COUNT', 50);
 const WARMUP_ITERATIONS = envInt('BENCH_WARMUP_ITERATIONS', 2, 0);
+if (CATCHUP_RESUME_START_INDEX >= CATCHUP_CHUNK_COUNT) {
+  throw new Error(
+    'BENCH_CATCHUP_RESUME_START_INDEX must be smaller than BENCH_CATCHUP_CHUNK_COUNT'
+  );
+}
 
 // Methodology version — bump whenever the measurement window changes in a way
 // that makes numbers incomparable across runs (e.g. the switch from a
@@ -186,6 +204,13 @@ interface BenchStreamOverhead {
   received: number;
 }
 
+interface BenchStreamCatchup {
+  startedAt: number;
+  firstAt: number;
+  doneAt: number;
+  received: number;
+}
+
 interface StreamIterationResult {
   runId: string;
   /** `steps[0].start - clientStart`, both deployment-side clocks. */
@@ -204,12 +229,30 @@ interface SlIterationResult {
   runId: string;
   /** `readAt - writtenAt`, both deployment-side step-body clocks. */
   slMs: number;
+  /** User-facing writer acceptance; not a durability boundary. */
+  producerAcceptMs: number;
+  /** Reader delivery after user-facing writer acceptance. */
+  deliveryAfterAcceptMs: number;
 }
 
 interface SoIterationResult {
   runId: string;
   /** `(doneAt - writtenAt) - SO_NOMINAL_DURATION_MS`, deployment-side clocks. */
   soMs: number;
+}
+
+interface CatchupIterationResult {
+  runId: string;
+  firstChunkMs: number;
+  drainMs: number;
+}
+
+interface ConcurrentIterationResult {
+  runIds: string[];
+  makespanMs: number;
+  runDurationMs: number[];
+  ttfsMs: number[];
+  stepsPerSecond: number;
 }
 
 /** Response shape of the in-deployment `POST /api/bench` trigger route. */
@@ -406,7 +449,15 @@ async function runSlIteration(): Promise<SlIterationResult> {
         `Run ${runId} returned no stream-latency sample: ${JSON.stringify(returnValue)?.slice(0, 200)}`
       );
     }
-    return { runId, slMs: Math.max(0, sl.readAt - sl.writtenAt) };
+    return {
+      runId,
+      slMs: Math.max(0, sl.readAt - sl.writtenAt),
+      producerAcceptMs: Math.max(0, sl.producerAcceptedAt - sl.writtenAt),
+      deliveryAfterAcceptMs: Math.max(
+        0,
+        sl.readAt - sl.producerAcceptedAt
+      ),
+    };
   } catch (error) {
     (error as Error).message += ` (run ${runId})`;
     throw error;
@@ -454,6 +505,90 @@ async function runSoIteration(
     (error as Error).message += ` (run ${runId})`;
     throw error;
   }
+}
+
+async function runCatchupIteration(
+  startIndex: number
+): Promise<CatchupIterationResult> {
+  const { runId } = await triggerBenchRun('benchStreamCatchupWorkflow', [
+    CATCHUP_CHUNK_COUNT,
+    startIndex,
+  ]);
+  try {
+    const returnValue = await withTimeout(
+      getReturnValue(runId),
+      RUN_TIMEOUT_MS,
+      `benchStreamCatchupWorkflow (${startIndex}) returnValue (run ${runId})`
+    );
+    const catchup = (
+      returnValue as { catchup?: BenchStreamCatchup } | undefined
+    )?.catchup;
+    if (
+      !catchup ||
+      typeof catchup.startedAt !== 'number' ||
+      typeof catchup.firstAt !== 'number' ||
+      typeof catchup.doneAt !== 'number'
+    ) {
+      throw new Error(
+        `Run ${runId} returned no stream-catchup sample: ${JSON.stringify(returnValue)?.slice(0, 200)}`
+      );
+    }
+    const expected = CATCHUP_CHUNK_COUNT - startIndex;
+    if (catchup.received !== expected) {
+      throw new Error(
+        `Run ${runId} replayed ${catchup.received} chunks, expected ${expected}`
+      );
+    }
+    return {
+      runId,
+      firstChunkMs: Math.max(0, catchup.firstAt - catchup.startedAt),
+      drainMs: Math.max(0, catchup.doneAt - catchup.startedAt),
+    };
+  } catch (error) {
+    (error as Error).message += ` (run ${runId})`;
+    throw error;
+  }
+}
+
+async function runConcurrentIteration(): Promise<ConcurrentIterationResult> {
+  const triggers = await Promise.all(
+    Array.from({ length: CONCURRENT_RUN_COUNT }, () =>
+      triggerBenchRun('benchSequentialStepsWorkflow', [CONCURRENT_STEP_COUNT])
+    )
+  );
+  const completed = await Promise.all(
+    triggers.map(async ({ runId, clientStart }) => {
+      const returnValue = await withTimeout(
+        getReturnValue(runId),
+        RUN_TIMEOUT_MS + CONCURRENT_STEP_COUNT * 5_000,
+        `concurrent workflow returnValue (run ${runId})`
+      );
+      const steps = timingsFromReturnValue(returnValue, runId);
+      if (steps.length !== CONCURRENT_STEP_COUNT) {
+        throw new Error(
+          `Run ${runId} returned ${steps.length} step timings, expected ${CONCURRENT_STEP_COUNT}`
+        );
+      }
+      return { runId, clientStart, steps };
+    })
+  );
+  const firstStart = Math.min(...completed.map((run) => run.clientStart));
+  const lastEnd = Math.max(
+    ...completed.map((run) => run.steps[run.steps.length - 1].end)
+  );
+  const makespanMs = Math.max(1, lastEnd - firstStart);
+  return {
+    runIds: completed.map((run) => run.runId),
+    makespanMs,
+    runDurationMs: completed.map(
+      (run) => run.steps[run.steps.length - 1].end - run.clientStart
+    ),
+    ttfsMs: completed.map(
+      (run) => run.steps[0].start - run.clientStart
+    ),
+    stepsPerSecond:
+      (CONCURRENT_RUN_COUNT * CONCURRENT_STEP_COUNT * 1000) / makespanMs,
+  };
 }
 
 /**
@@ -561,7 +696,7 @@ interface MetricRow extends MetricStats {
   metric: string;
   /** Short scenario label; explained via scenario descriptions in the output */
   scenario: string;
-  unit: 'ms';
+  unit: 'ms' | 'steps/s';
   /** Latency targets rendered as pass/fail marks in the PR comment */
   targets?: MetricTargets;
 }
@@ -573,13 +708,14 @@ function recordMetric(
   metric: string,
   scenario: string,
   samples: number[],
-  targets?: MetricTargets
+  targets?: MetricTargets,
+  unit: MetricRow['unit'] = 'ms'
 ) {
   if (samples.length === 0) return;
   metricRows.push({
     metric,
     scenario,
-    unit: 'ms',
+    unit,
     targets,
     ...computeStats(samples),
   });
@@ -609,6 +745,10 @@ const SCENARIO_STREAM_LATENCY = 'stream latency';
 // and re-baseline on the next `main` run.
 const SCENARIO_STREAM_OVERHEAD_TEXT = 'stream overhead (text)';
 const SCENARIO_STREAM_OVERHEAD_STRUCTURED = 'stream overhead (structured)';
+const SCENARIO_CATCHUP_FULL = 'retained stream (full)';
+const SCENARIO_CATCHUP_RESUME = 'retained stream (resume)';
+const SCENARIO_CONCURRENT =
+  `${CONCURRENT_RUN_COUNT} concurrent x ${CONCURRENT_STEP_COUNT} steps`;
 const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STEP,
@@ -641,6 +781,18 @@ const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STREAM_OVERHEAD_STRUCTURED,
     description: `same workload as ${SCENARIO_STREAM_OVERHEAD_TEXT}, but each delta is an AI-SDK-style structured object ({ type: 'text-delta', id, text }) instead of a raw string, so the SO gap vs the text scenario is the added serialization cost`,
+  },
+  {
+    name: SCENARIO_CATCHUP_FULL,
+    description: `fresh reader replays all ${CATCHUP_CHUNK_COUNT} chunks from a closed retained stream; reports first retained chunk and full drain latency`,
+  },
+  {
+    name: SCENARIO_CATCHUP_RESUME,
+    description: `fresh reader resumes at chunk ${CATCHUP_RESUME_START_INDEX} of a closed ${CATCHUP_CHUNK_COUNT}-chunk stream; reports first retained chunk and suffix drain latency`,
+  },
+  {
+    name: SCENARIO_CONCURRENT,
+    description: `${CONCURRENT_RUN_COUNT} workflows execute ${CONCURRENT_STEP_COUNT} sequential no-op steps each; reports makespan, per-run TTFS/duration, and aggregate logical step throughput`,
   },
 ];
 
@@ -732,6 +884,16 @@ describe('workflow benchmarks', () => {
       results.map((r) => r.slMs),
       SL_TARGETS
     );
+    recordMetric(
+      'producer-accept',
+      SCENARIO_STREAM_LATENCY,
+      results.map((r) => r.producerAcceptMs)
+    );
+    recordMetric(
+      'delivery-after-accept',
+      SCENARIO_STREAM_LATENCY,
+      results.map((r) => r.deliveryAfterAcceptMs)
+    );
   });
 
   test(
@@ -766,6 +928,88 @@ describe('workflow benchmarks', () => {
         SCENARIO_STREAM_OVERHEAD_STRUCTURED,
         results.map((r) => r.soMs),
         SO_TARGETS
+      );
+    }
+  );
+
+  test(
+    'scenario: retained stream full catch-up',
+    { timeout: 30 * 60_000 },
+    async () => {
+      const results = await runScenario(
+        SCENARIO_CATCHUP_FULL,
+        CATCHUP_ITERATIONS,
+        () => runCatchupIteration(0)
+      );
+      recordMetric(
+        'retained-first',
+        SCENARIO_CATCHUP_FULL,
+        results.map((result) => result.firstChunkMs)
+      );
+      recordMetric(
+        'retained-drain',
+        SCENARIO_CATCHUP_FULL,
+        results.map((result) => result.drainMs)
+      );
+    }
+  );
+
+  test(
+    'scenario: retained stream resume',
+    { timeout: 30 * 60_000 },
+    async () => {
+      const results = await runScenario(
+        SCENARIO_CATCHUP_RESUME,
+        CATCHUP_ITERATIONS,
+        () => runCatchupIteration(CATCHUP_RESUME_START_INDEX)
+      );
+      recordMetric(
+        'retained-first',
+        SCENARIO_CATCHUP_RESUME,
+        results.map((result) => result.firstChunkMs)
+      );
+      recordMetric(
+        'retained-drain',
+        SCENARIO_CATCHUP_RESUME,
+        results.map((result) => result.drainMs)
+      );
+    }
+  );
+
+  test(
+    'scenario: concurrent workflows',
+    { timeout: 60 * 60_000 },
+    async () => {
+      const results = await runScenario(
+        SCENARIO_CONCURRENT,
+        CONCURRENT_ITERATIONS,
+        runConcurrentIteration,
+        {
+          warmupIterations: 0,
+          extraAttempts: Math.max(1, Math.ceil(CONCURRENT_ITERATIONS * 0.5)),
+        }
+      );
+      recordMetric(
+        'concurrent-makespan',
+        SCENARIO_CONCURRENT,
+        results.map((result) => result.makespanMs)
+      );
+      recordMetric(
+        'concurrent-run-duration',
+        SCENARIO_CONCURRENT,
+        results.flatMap((result) => result.runDurationMs)
+      );
+      recordMetric(
+        'concurrent-ttfs',
+        SCENARIO_CONCURRENT,
+        results.flatMap((result) => result.ttfsMs)
+      );
+      recordMetric(
+        'concurrent-steps-per-second',
+        SCENARIO_CONCURRENT,
+        results.map((result) => result.stepsPerSecond),
+        undefined,
+        'steps/s'
       );
     }
   );
@@ -838,6 +1082,12 @@ describe('workflow benchmarks', () => {
         soDurationSeconds: SO_DURATION_SECONDS,
         sequentialIterations: SEQUENTIAL_ITERATIONS,
         sequentialStepCount: SEQUENTIAL_STEP_COUNT,
+        catchupIterations: CATCHUP_ITERATIONS,
+        catchupChunkCount: CATCHUP_CHUNK_COUNT,
+        catchupResumeStartIndex: CATCHUP_RESUME_START_INDEX,
+        concurrentIterations: CONCURRENT_ITERATIONS,
+        concurrentRunCount: CONCURRENT_RUN_COUNT,
+        concurrentStepCount: CONCURRENT_STEP_COUNT,
         warmupIterations: WARMUP_ITERATIONS,
       },
       scenarios: SCENARIO_DESCRIPTIONS,
@@ -848,6 +1098,9 @@ describe('workflow benchmarks', () => {
         delta: diffBackendMetrics(
           backendMetricsBefore,
           backendMetricsAfter
+        ),
+        derived: deriveBackendMetrics(
+          diffBackendMetrics(backendMetricsBefore, backendMetricsAfter)
         ),
       },
     };

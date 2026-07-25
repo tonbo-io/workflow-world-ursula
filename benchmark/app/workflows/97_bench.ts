@@ -25,6 +25,8 @@
 //   overhead/backpressure. Two payload shapes are supported so the runner can
 //   isolate serialization cost: `'text'` (raw string fragments) and
 //   `'structured'` (AI-SDK-style `{ type: 'text-delta', id, text }` objects).
+// - `benchStreamCatchupWorkflow` closes a retained stream before opening a
+//   fresh reader, then measures full-history or suffix replay.
 
 import { createHook, getWorkflowMetadata, getWritable } from 'workflow';
 import { getRun } from 'workflow/api';
@@ -60,6 +62,17 @@ export interface BenchStreamOverhead {
   /** Date.now() in the reader step when the whole stream had been consumed */
   doneAt: number;
   /** Number of chunks the reader received (validated against the request) */
+  received: number;
+}
+
+export interface BenchStreamCatchup {
+  /** Date.now() immediately before opening the retained stream reader. */
+  startedAt: number;
+  /** Date.now() after the first retained chunk is decoded. */
+  firstAt: number;
+  /** Date.now() after the closed stream has been drained. */
+  doneAt: number;
+  /** Number of chunks received from `startIndex` through stream close. */
   received: number;
 }
 
@@ -112,6 +125,7 @@ const SO_TEXT_FRAGMENTS = [
 // AI-SDK text-delta events for a single text block share one id, so the
 // structured variant keeps `id` constant and only varies `text`.
 const SO_STRUCTURED_DELTA_ID = '0';
+const CATCHUP_STREAM_NAMESPACE = 'bench-catchup';
 
 /** Builds the `index`-th SO chunk in the requested shape. Both shapes cycle the
  * same fragment list, so `'text'` vs `'structured'` isolates serialization
@@ -414,4 +428,71 @@ export async function benchSoWorkflow(
       received: reader.received,
     },
   };
+}
+
+async function writeCatchupStream(chunkCount: number): Promise<void> {
+  'use step';
+  const writable = getWritable<string>({
+    namespace: CATCHUP_STREAM_NAMESPACE,
+  });
+  const writer = writable.getWriter();
+  const writes: Promise<void>[] = [];
+  for (let i = 0; i < chunkCount; i++) {
+    // Fixed-width deterministic payloads keep backend runs byte-comparable.
+    writes.push(
+      writer.write(`${i.toString().padStart(8, '0')}:${'x'.repeat(55)}`)
+    );
+  }
+  await Promise.all(writes);
+  writer.releaseLock();
+  await writable.close();
+}
+
+async function readCatchupStream(
+  startIndex: number
+): Promise<BenchStreamCatchup> {
+  'use step';
+  const { workflowRunId } = getWorkflowMetadata();
+  const startedAt = Date.now();
+  const reader = getRun<string>(workflowRunId)
+    .getReadable<string>({
+      namespace: CATCHUP_STREAM_NAMESPACE,
+      startIndex,
+    })
+    .getReader();
+  let firstAt: number | undefined;
+  let received = 0;
+  try {
+    let result = await reader.read();
+    while (!result.done) {
+      firstAt ??= Date.now();
+      received++;
+      result = await reader.read();
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  const doneAt = Date.now();
+  return {
+    startedAt,
+    firstAt: firstAt ?? doneAt,
+    doneAt,
+    received,
+  };
+}
+
+/**
+ * Measures retained stream catch-up independently of stream production.
+ *
+ * The writer step completes and closes the stream before the reader step
+ * starts, so `firstAt - startedAt` measures time to the first retained chunk
+ * and `doneAt - startedAt` measures full suffix replay.
+ */
+export async function benchStreamCatchupWorkflow(
+  chunkCount: number,
+  startIndex: number
+): Promise<{ catchup: BenchStreamCatchup }> {
+  'use workflow';
+  await writeCatchupStream(chunkCount);
+  return { catchup: await readCatchupStream(startIndex) };
 }

@@ -11,6 +11,7 @@ class MemoryClient {
   private readonly streams = new Map<string, unknown[]>();
   private failCommitOnce = true;
   private failReleaseOnce = true;
+  readCalls = 0;
 
   async append<T>(
     stream: string,
@@ -51,6 +52,7 @@ class MemoryClient {
   }
 
   async readAll<T>(stream: string): Promise<UrsulaRecord<T>[]> {
+    this.readCalls += 1;
     return (this.streams.get(stream) ?? []).map((value, record) => ({
       record,
       value: value as T,
@@ -60,9 +62,8 @@ class MemoryClient {
 
 describe('HookClaims', () => {
   it('retries commit and release CAS conflicts without losing ownership', async () => {
-    const claims = new HookClaims(
-      new MemoryClient() as unknown as UrsulaClient
-    );
+    const client = new MemoryClient();
+    const claims = new HookClaims(client as unknown as UrsulaClient);
     const reserved = await claims.reserve({
       operationId: 'create-hook-1',
       token: 'token-1',
@@ -83,6 +84,9 @@ describe('HookClaims', () => {
       )
     ).resolves.toBeUndefined();
     expect(await claims.get('token-1')).toBeUndefined();
+    // Only conflicts go back to Ursula. Successful reserve/commit/release and
+    // the two reads above are served from the bounded claim cache.
+    expect(client.readCalls).toBe(2);
   });
 
   it('cannot release a claim owned by a different run or hook', async () => {

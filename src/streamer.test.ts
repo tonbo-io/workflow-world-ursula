@@ -489,6 +489,33 @@ describe('Ursula Workflow streamer', () => {
     expect(fetch.mock.calls[3]?.[1]?.method).toBe('POST');
   });
 
+  it('does not hold a data write behind registry durability', async () => {
+    let finishRegistration: ((value: Response) => void) | undefined;
+    const registration = new Promise<Response>((resolve) => {
+      finishRegistration = resolve;
+    });
+    const fetch = vi.fn<typeof globalThis.fetch>((_input, init) => {
+      if (
+        init?.method === 'PUT' &&
+        typeof init.body === 'string' &&
+        init.body.includes('"name":"output"')
+      ) {
+        return registration;
+      }
+      return Promise.resolve(response(null, { status: 201 }));
+    });
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await expect(
+      streamer.streams.write('wrun_1', 'output', 'hello')
+    ).resolves.toBeUndefined();
+    finishRegistration?.(response(null, { status: 201 }));
+    await streamer.streams.list('wrun_1');
+  });
+
   it('attaches a live read without waiting for serialized registry metadata', async () => {
     let finishRegistration: ((value: Response) => void) | undefined;
     const registration = new Promise<Response>((resolve) => {

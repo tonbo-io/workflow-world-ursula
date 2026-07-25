@@ -31,7 +31,7 @@
     "build": "tsc",
     "clean": "tsc --build --clean && rm -rf dist",
     "test": "vitest run src",
-    "test:e2e": "vitest run test",
+    "test:e2e": "vitest run test/world.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

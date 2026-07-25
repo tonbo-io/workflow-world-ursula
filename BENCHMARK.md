@@ -59,6 +59,12 @@ The Ursula extension adds:
 - **retained-drain**: draining a closed stream from either record zero or a
   resume index.
 
+The shared retained-stream scenarios write, close, and immediately replay the
+stream, so they measure **hot retained replay** consistently across all
+backends. A separate cold-replay scenario must verify that Ursula has flushed
+the payload below the hot tier and use a fresh reader process before claiming
+S3 replay performance.
+
 Every run must also report correctness and operations metrics:
 
 - completed, retried, duplicate, and failed steps;
@@ -105,6 +111,7 @@ validation separately so provider variance does not dominate storage results.
 | 300 chunks at 100 chunks/s | interactive agent streaming |
 | 1,000 retained chunks from record 0 | full chat/history reconstruction |
 | 1,000 retained chunks from record 900 | reconnect/resume behavior |
+| 1,000 cold retained chunks from record 0/900 | S3 replay after a verified flush and fresh reader |
 | 100 concurrent 50-step runs | queue fairness and backend contention |
 | 10K completed runs plus active runs | observability/list projection cost |
 | worker restart during write and claim | idempotency and redelivery correctness |
