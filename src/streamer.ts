@@ -617,36 +617,35 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         let cancelled = false;
 
         return new ReadableStream<Uint8Array>({
-          start(controller) {
-            const poll = async (): Promise<boolean> => {
-              const result = await readRecords({
-                runId,
-                name,
-                start: cursor,
-                limit: MAX_PAGE_SIZE,
-                live: true,
-                signal: abortController.signal,
-              });
-              cursor = enqueueChunkRecords(controller, result.records, cursor);
-              if (result.closed && result.upToDate) {
-                controller.close();
-                return false;
+          async pull(controller) {
+            try {
+              // Keep an empty long-poll timeout inside this consumer-owned
+              // promise. Workflow runtimes track reader.read()/pull promises;
+              // a detached background pump can lose that invocation context
+              // and leave the consumer pending forever.
+              while (!cancelled) {
+                const result = await readRecords({
+                  runId,
+                  name,
+                  start: cursor,
+                  limit: MAX_PAGE_SIZE,
+                  live: true,
+                  signal: abortController.signal,
+                });
+                cursor = enqueueChunkRecords(
+                  controller,
+                  result.records,
+                  cursor
+                );
+                if (result.closed && result.upToDate) {
+                  controller.close();
+                  return;
+                }
+                if (result.records.length > 0) return;
               }
-              // A long-poll timeout may report the current stream tail even
-              // though it returned no record bodies. Advancing to that header
-              // would skip the records on the next poll. Only delivered
-              // envelopes are allowed to move a live reader's cursor.
-              return true;
-            };
-
-            const pump = async () => {
-              try {
-                while (!cancelled && (await poll())) {}
-              } catch (error) {
-                if (!cancelled) controller.error(error);
-              }
-            };
-            void pump();
+            } catch (error) {
+              if (!cancelled) controller.error(error);
+            }
           },
           cancel() {
             cancelled = true;
