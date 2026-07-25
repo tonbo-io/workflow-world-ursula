@@ -6,12 +6,13 @@ This run compares `@tonbo-io/world-ursula` with `@workflow/world-postgres` from 
 
 | Backend | Configuration |
 | --- | --- |
-| Ursula | Three `m6i.xlarge` voter nodes across three availability zones, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.7 plus adapter commit `03597af` |
+| Ursula | Three `m6i.xlarge` voter nodes across three availability zones, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.8 plus adapter commit `53401a5` |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
 | Managed World | Public Vercel Workflow benchmark baseline; not rerun inside this VPC and no public 100 × 50 concurrency result |
 
 Raw results:
 
+- [`ursula-v038-final.json`](./ursula-v038-final.json)
 - [`ursula-v037-final.json`](./ursula-v037-final.json)
 - [`postgres-rds-multi-az.json`](./postgres-rds-multi-az.json)
 - [`ursula-v036.json`](./ursula-v036.json)
@@ -22,21 +23,23 @@ All latency values are milliseconds.
 
 | Scenario | Ursula avg / p90 / p99 | PostgreSQL avg / p90 / p99 | Public Managed avg |
 | --- | ---: | ---: | ---: |
-| No-op TTFS | 48.0 / 59 / 93 | 50.9 / 58 / 181 | 995.9 |
-| Streaming TTFS | 45.2 / 49 / 79 | 46.5 / 47 / 208 | 1061.6 |
-| Hook + stream TTFS | 76.7 / 83 / 134 | 54.5 / 60 / 91 | 1383.6 |
-| Live stream latency | 14.4 / 15 / 97 | 5.5 / 8 / 10 | 128.2 |
-| Text stream overhead | 7.8 / 10 / 11 | 8.6 / 10 / 14 | 195.8 |
-| Structured stream overhead | 8.4 / 10 / 11 | 7.9 / 9 / 11 | 202.4 |
-| 1020-step workflow | 76,371 total | 78,302 total | 412,515 total |
+| No-op TTFS | 55.5 / 66 / 112 | 50.9 / 58 / 181 | 995.9 |
+| Streaming TTFS | 50.7 / 56 / 130 | 46.5 / 47 / 208 | 1061.6 |
+| Hook + stream TTFS | 91.0 / 94 / 245 | 54.5 / 60 / 91 | 1383.6 |
+| Live stream latency | 16.2 / 12 / 175 | 5.5 / 8 / 10 | 128.2 |
+| Text stream overhead | 8.2 / 10 / 11 | 8.6 / 10 / 14 | 195.8 |
+| Structured stream overhead | 8.1 / 10 / 13 | 7.9 / 9 / 11 | 202.4 |
+| 1020-step workflow | 74,525 total | 78,302 total | 412,515 total |
 
-The concurrent workload completed 5,000 logical steps in 106.4 seconds on Ursula and 129.9 seconds on PostgreSQL: 47.0 versus 38.5 steps/s, a 22.1% Ursula throughput advantage. Compared with the previous Ursula build, throughput rose from 41.3 to 47.0 steps/s (+13.8%), no-op TTFS fell from 165.5 to 48.0 ms, streaming TTFS from 83.2 to 45.2 ms, hook TTFS from 163.4 to 76.7 ms, and live stream latency from 38.3 to 14.4 ms.
+The concurrent workload completed 5,000 logical steps in 107.0 seconds on Ursula and 129.9 seconds on PostgreSQL: 46.7 versus 38.5 steps/s, a 21.3% Ursula throughput advantage. Compared with the previous Ursula build, throughput rose from 41.3 to 46.7 steps/s (+13.1%), no-op TTFS fell from 165.5 to 55.5 ms, streaming TTFS from 83.2 to 50.7 ms, hook TTFS from 163.4 to 91.0 ms, and live stream latency from 38.3 to 16.2 ms.
 
-The Ursula run was not failure-free: two of the parallel reader/writer runs required a retry after a queue delivery observed a just-committed step as missing. PostgreSQL completed every recorded scenario without a retry. The successful-sample latency distributions therefore describe steady-state performance, while the retry count remains a production-readiness defect.
+The final Ursula and PostgreSQL runs completed every recorded scenario without a retry. An intermediate Ursula run exposed two separate production defects—transient cross-replica step visibility and run-wide queue leases that could deadlock parallel steps—which were fixed in PRs #34 and #35 before the final run.
 
 ## Backend work
 
-The Ursula run accepted 34,008 appends, applied 37,305 mutations, and uploaded 2,158 cold objects containing 27,831,017 bytes. Average uploaded object size was only 12.9 KiB. Gateway leader affinity hit 23,836 times, missed 2,137 times, and learned from 471 redirects, for a 91.8% cache hit ratio. Standard single-record POSTs did not exercise `raft_write_many`; its counters remained zero.
+The final Ursula run accepted 34,047 appends and applied 35,145 mutations. Gateway leader affinity hit 39,530 times, missed 1,902 times, and learned from 545 redirects, for a 95.4% cache hit ratio. Standard single-record POSTs did not exercise `raft_write_many`; its counters remained zero.
+
+The fresh final cluster did not flush cold objects during its 7.4-minute observation window, so it cannot establish steady-state S3 request cost. The immediately preceding run on the warm cluster uploaded 2,158 objects containing 27,831,017 bytes—only 12.9 KiB per object—so the cost model below conservatively retains that observed PUT ratio rather than treating the final run's zero as a durable steady state.
 
 PostgreSQL committed 343,167 transactions and grew the database by 25,354,240 bytes during the run. Its buffer cache served nearly all blocks (`3,351,311` hits and `11` reads).
 
@@ -48,8 +51,8 @@ Pricing inputs come from the official [Vercel limits and pricing table](https://
 
 | Backend | Fixed backend cost/month | Sustained benchmark capacity | Fixed cost / 100k steps |
 | --- | ---: | ---: | ---: |
-| Ursula, measured x86 topology | $505.48 | 47.0 steps/s | $0.409 |
-| Ursula, if the EKS control plane is already shared | $432.48 | 47.0 steps/s | $0.350 |
+| Ursula, measured x86 topology | $505.48 | 46.7 steps/s | $0.412 |
+| Ursula, if the EKS control plane is already shared | $432.48 | 46.7 steps/s | $0.352 |
 | Ursula, equivalent three-node Graviton estimate | $442.41 | not measured | — |
 | RDS PostgreSQL comparator | $269.01 | 38.5 steps/s | $0.266 |
 | Managed World | usage-priced | n/a | $2.50 |
