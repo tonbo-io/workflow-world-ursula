@@ -75,9 +75,12 @@ Every adapter process keeps an incremental materialization cache. Periodic
 full-state checkpoint records bound cold-start replay to at most 127 subsequent
 run commits; old event payloads remain authoritative and are read through a
 separate incremental event cache. A failed checkpoint never changes the result
-of an already-committed source mutation. Both caches are LRU-bounded, terminal
-run state is not retained in the materialization cache, and registry-wide query
-scans bypass the caches.
+of an already-committed source mutation. Checkpoints run on an ordered
+per-run background chain, so snapshot publication and retention never extend
+the source mutation's response latency; a process crash merely leaves more
+authoritative tail to replay. Both caches are LRU-bounded, terminal run state
+is not retained in the materialization cache, and registry-wide query scans
+bypass the caches.
 
 ## Global indexes
 
@@ -150,19 +153,20 @@ backoff.
 Every 256 transitions, the adapter writes a checkpoint containing active
 messages and the live 24-hour idempotency window, publishes it as the queue
 stream's Ursula snapshot, then advances source retention to that record
-boundary. The source snapshot is required by Ursula as the safety proof for
-retention; adapter recovery reads the derived checkpoint stream instead. Only
-the latest derived checkpoint record is retained, so checkpoint schema changes
-MUST remain backward-readable by every adapter version that can overlap during
-a rolling deployment. Writers must not publish an incompatible checkpoint
-until older readers have been removed. A dispatcher whose cursor falls behind
-retention discards its cache and rebuilds from that checkpoint after Ursula
-returns `410 Gone`; if retention moves again between reading the checkpoint and
-its source tail, it reloads the checkpoint and retries once. Acknowledged
-messages are removed from the active map immediately, so claim scans are
-bounded by live queue depth rather than lifetime traffic. Handler delivery
-remains an adapter/runtime responsibility; Ursula owns every durable queue
-transition.
+boundary. This derived work runs on an ordered per-queue background chain and
+does not delay enqueue, lease, ack, or retry responses. The source snapshot is
+required by Ursula as the safety proof for retention; adapter recovery reads
+the derived checkpoint stream instead. Only the latest derived checkpoint
+record is retained, so checkpoint schema changes MUST remain backward-readable
+by every adapter version that can overlap during a rolling deployment. Writers
+must not publish an incompatible checkpoint until older readers have been
+removed. A dispatcher whose cursor falls behind retention discards its cache
+and rebuilds from that checkpoint after Ursula returns `410 Gone`; if retention
+moves again between reading the checkpoint and its source tail, it reloads the
+checkpoint and retries once. Acknowledged messages are removed from the active
+map immediately, so claim scans are bounded by live queue depth rather than
+lifetime traffic. Handler delivery remains an adapter/runtime responsibility;
+Ursula owns every durable queue transition.
 
 ## Time and delivery semantics
 

@@ -285,6 +285,7 @@ function applyCommit(
  * single-stream consensus boundary.
  */
 export class RunJournal {
+  private readonly checkpointTasks = new Map<string, Promise<void>>();
   private readonly cache = new Map<string, RunJournalState>();
   private readonly eventCache = new Map<string, EventCache>();
 
@@ -360,17 +361,13 @@ export class RunJournal {
     throw new Error(`Run "${runId}" has an invalid latest checkpoint`);
   }
 
-  private async writeCheckpoint(state: RunJournalState): Promise<void> {
-    if (
-      state.nextRecord === 0 ||
-      state.nextRecord % CHECKPOINT_INTERVAL_RECORDS !== 0
-    ) {
-      return;
-    }
-    const stream = checkpointStreamId(state.runId);
-    const checkpoint = checkpointFromState(state);
+  private async writeCheckpoint(
+    runId: string,
+    checkpoint: RunCheckpoint
+  ): Promise<void> {
+    const stream = checkpointStreamId(runId);
     const receipt = await this.client.append(stream, checkpoint, {
-      operationId: `run-checkpoint:${state.runId}:${state.nextRecord}`,
+      operationId: `run-checkpoint:${runId}:${checkpoint.sourceNextRecord}`,
       createIfMissing: true,
     });
     await this.client.publishSnapshotAtRecord(
@@ -379,6 +376,44 @@ export class RunJournal {
       checkpoint
     );
     await this.client.advanceRetentionAtRecord(stream, receipt.startRecord);
+  }
+
+  private scheduleCheckpoint(state: RunJournalState): void {
+    if (
+      state.nextRecord === 0 ||
+      state.nextRecord % CHECKPOINT_INTERVAL_RECORDS !== 0
+    ) {
+      return;
+    }
+    const runId = state.runId;
+    // Capture the exact boundary before later commits mutate the shared entity
+    // maps. Checkpoint persistence is derived work and must not extend the
+    // latency of the already-authoritative source append.
+    const checkpoint = checkpointFromState(state);
+    const previous =
+      this.checkpointTasks.get(runId) ?? Promise.resolve();
+    const task = previous
+      .catch(() => undefined)
+      .then(() => this.writeCheckpoint(runId, checkpoint))
+      .catch((error: unknown) => {
+        console.error('Ursula World run checkpoint failed', {
+          runId,
+          sourceNextRecord: checkpoint.sourceNextRecord,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    this.checkpointTasks.set(runId, task);
+    void task.then(() => {
+      if (this.checkpointTasks.get(runId) === task) {
+        this.checkpointTasks.delete(runId);
+      }
+    });
+  }
+
+  async flushCheckpoints(): Promise<void> {
+    while (this.checkpointTasks.size > 0) {
+      await Promise.all(this.checkpointTasks.values());
+    }
   }
 
   private applyRecords(
@@ -529,18 +564,7 @@ export class RunJournal {
         this.rememberEvents(state.runId, events);
       }
     }
-    try {
-      await this.writeCheckpoint(state);
-    } catch (error) {
-      // The source commit is already authoritative. A failed derived
-      // checkpoint must never turn that successful mutation into an apparent
-      // failure; a later checkpoint or full replay repairs it.
-      console.error('Ursula World run checkpoint failed', {
-        runId: state.runId,
-        sourceNextRecord: state.nextRecord,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    this.scheduleCheckpoint(state);
     return state;
   }
 }
