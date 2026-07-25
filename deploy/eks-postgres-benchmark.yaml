@@ -9,7 +9,7 @@ metadata:
   name: workflow-benchmark-app
   namespace: workflow-benchmark-postgres
 spec:
-  replicas: 1
+  replicas: 4
   selector:
     matchLabels:
       app: workflow-benchmark-app
@@ -18,6 +18,8 @@ spec:
       labels:
         app: workflow-benchmark-app
     spec:
+      nodeSelector:
+        workflow-benchmark-role: app
       initContainers:
         - name: fetch-rds-ca
           image: public.ecr.aws/docker/library/alpine:3.22
@@ -74,11 +76,11 @@ spec:
             periodSeconds: 5
           resources:
             requests:
-              cpu: "3"
-              memory: 2Gi
+              cpu: "600m"
+              memory: 768Mi
             limits:
-              cpu: "4"
-              memory: 4Gi
+              cpu: "1"
+              memory: 2Gi
           volumeMounts:
             - name: rds-ca
               mountPath: /etc/ssl/rds
@@ -113,6 +115,8 @@ spec:
         app: workflow-benchmark-runner
     spec:
       restartPolicy: Never
+      nodeSelector:
+        workflow-benchmark-role: app
       initContainers:
         - name: fetch-rds-ca
           image: public.ecr.aws/docker/library/alpine:3.22

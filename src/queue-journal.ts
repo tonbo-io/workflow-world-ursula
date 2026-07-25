@@ -17,6 +17,7 @@ import {
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
+const MAX_RETRY_DELAY_MS = 50;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
@@ -64,6 +65,12 @@ type QueueTransition =
       availableAt: string;
       createdAt: string;
     };
+
+async function contentionBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(MAX_RETRY_DELAY_MS, 2 ** Math.min(attempt, 6));
+  const delayMs = Math.max(1, Math.floor(Math.random() * ceiling));
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
 
 export interface QueueMessageState {
   messageId: MessageId;
@@ -224,6 +231,8 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
+  private readonly appendTurns = new Map<ValidQueueName, Promise<void>>();
+  private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(private readonly client: UrsulaClient) {}
@@ -420,21 +429,35 @@ export class QueueJournal {
     transitions: readonly QueueTransition[],
     operationId: string
   ): Promise<void> {
-    const expectedRecord = state.nextRecord;
-    await this.client.append(queueStream(queueName), transitions, {
-      operationId,
-      expectedRecord,
+    const previousTurn = this.appendTurns.get(queueName);
+    let releaseTurn = () => {};
+    const currentTurn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
     });
-    // A concurrent long-poll waiter may have observed and applied our records
-    // before the append response arrived. Never replay the same transitions
-    // twice into the shared cache.
-    if (state.nextRecord === expectedRecord) {
-      for (const transition of transitions) {
-        applyTransition(state, transition);
-        state.nextRecord += 1;
+    this.appendTurns.set(queueName, currentTurn);
+    if (previousTurn) await previousTurn;
+    try {
+      const expectedRecord = state.nextRecord;
+      await this.client.append(queueStream(queueName), transitions, {
+        operationId,
+        expectedRecord,
+      });
+      // A concurrent long-poll waiter may have observed and applied our
+      // records before the append response arrived. Never replay the same
+      // transitions twice into the shared cache.
+      if (state.nextRecord === expectedRecord) {
+        for (const transition of transitions) {
+          applyTransition(state, transition);
+          state.nextRecord += 1;
+        }
+      }
+      this.scheduleCheckpoint(queueName, state, expectedRecord);
+    } finally {
+      releaseTurn();
+      if (this.appendTurns.get(queueName) === currentTurn) {
+        this.appendTurns.delete(queueName);
       }
     }
-    this.scheduleCheckpoint(queueName, state, expectedRecord);
   }
 
   private applyRecords(
@@ -481,6 +504,28 @@ export class QueueJournal {
     message: QueuePayload,
     options: QueueOptions = {}
   ): Promise<MessageId> {
+    const previousTurn = this.enqueueTurns.get(queueName);
+    let releaseTurn = () => {};
+    const currentTurn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    this.enqueueTurns.set(queueName, currentTurn);
+    if (previousTurn) await previousTurn;
+    try {
+      return await this.enqueueUnlocked(queueName, message, options);
+    } finally {
+      releaseTurn();
+      if (this.enqueueTurns.get(queueName) === currentTurn) {
+        this.enqueueTurns.delete(queueName);
+      }
+    }
+  }
+
+  private async enqueueUnlocked(
+    queueName: ValidQueueName,
+    message: QueuePayload,
+    options: QueueOptions
+  ): Promise<MessageId> {
     QueuePayloadSchema.parse(message);
     const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
     for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
@@ -518,6 +563,7 @@ export class QueueJournal {
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
           this.invalidate(queueName);
+          await contentionBackoff(attempt);
           continue;
         }
         throw error;
