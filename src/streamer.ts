@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type {
   GetChunksOptions,
   StreamChunksResponse,
@@ -289,7 +289,13 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     let producer = producerByStream.get(key);
     if (!producer) {
       producer = {
-        id: `workflow-${randomUUID()}`,
+        // A Workflow step may be retried in another invocation after its
+        // first attempt wrote and closed the stream. Reusing the producer
+        // identity and sequence lets Ursula resolve those writes through its
+        // dedup table before evaluating the closed-stream check.
+        id: `workflow-${createHash('sha256')
+          .update(`${bucket}\0${key}`)
+          .digest('base64url')}`,
         epoch: 0,
         nextSequence: 0,
         pending: Promise.resolve(),
