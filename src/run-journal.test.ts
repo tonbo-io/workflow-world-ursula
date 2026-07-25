@@ -213,9 +213,10 @@ describe('RunJournal', () => {
     expect(await journal.events('wrun_1')).toEqual([event]);
     expect(state.run).toEqual(run);
     expect(state.nextRecord).toBe(1);
-    const append = fetch.mock.calls[3];
+    const append = fetch.mock.calls[2];
     const headers = new Headers(append?.[1]?.headers);
-    expect(headers.get('stream-record-match')).toBe('0');
+    expect(append?.[1]?.method).toBe('PUT');
+    expect(headers.has('stream-record-match')).toBe(false);
     const body = JSON.parse(append?.[1]?.body as string);
     expect(body.events).toHaveLength(1);
     expect(body.run.status).toBe('pending');

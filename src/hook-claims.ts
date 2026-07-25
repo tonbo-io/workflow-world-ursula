@@ -67,7 +67,11 @@ export class HookClaims {
     | { acquired: false; claim: ActiveHookClaim }
   > {
     for (let attempt = 0; attempt < 16; attempt += 1) {
-      const state = await this.load(args.token);
+      // Hook tokens are normally unique. Optimistically create the first
+      // reservation in one request; an existing owner rejects expected tail
+      // zero and the next attempt loads the authoritative claim.
+      const state: ClaimState =
+        attempt === 0 ? { nextRecord: 0 } : await this.load(args.token);
       if (state.active) {
         const sameOwner =
           state.active.operationId === args.operationId ||
@@ -91,6 +95,7 @@ export class HookClaims {
         await this.client.append(claimStream(args.token), transition, {
           operationId: `hook-reserve:${args.operationId}`,
           expectedRecord: state.nextRecord,
+          createIfMissing: state.nextRecord === 0,
         });
         return {
           acquired: true,

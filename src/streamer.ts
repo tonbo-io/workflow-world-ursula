@@ -192,7 +192,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     config.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
   const producerByStream = new Map<string, Producer>();
   const registeredStreams = new Set<string>();
-  const registeringStreams = new Map<string, Promise<void>>();
+  const registryOperations = new Map<string, Promise<void>>();
   const ensuredStreams = new Set<string>();
   const ensuringStreams = new Map<string, Promise<void>>();
 
@@ -264,25 +264,53 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (name === '__workflow_streams') return;
     const cacheKey = `${runId}\0${name}`;
     if (registeredStreams.has(cacheKey)) return;
-    const pending = registeringStreams.get(cacheKey);
-    if (pending) return pending;
-    const registering = (async () => {
-      const url = registryUrl(runId);
-      await ensureStream(url);
+    const url = registryUrl(runId);
+    const registryKey = url.toString();
+    const previous = registryOperations.get(registryKey) ?? Promise.resolve();
+    const producerHeaders = headers({
+      'content-type': RECORD_CONTENT_TYPE,
+      'producer-id': `workflow-registry-${createHash('sha256')
+        .update(`${bucket}\0${runId}\0${name}`)
+        .digest('base64url')}`,
+      'producer-epoch': '0',
+      'producer-seq': '0',
+    });
+    const registering = previous.catch(() => undefined).then(async () => {
+      if (registeredStreams.has(cacheKey)) return;
+      if (!ensuredStreams.has(registryKey)) {
+        const created = await fetchImpl(url, {
+          method: 'PUT',
+          headers: producerHeaders,
+          body: JSON.stringify({ name }),
+        });
+        if (created.status === 201) {
+          ensuredStreams.add(registryKey);
+          registeredStreams.add(cacheKey);
+          return;
+        }
+        if (created.status === 200) {
+          ensuredStreams.add(registryKey);
+        } else {
+          await expectSuccess('create stream registry', created);
+        }
+      }
       await expectSuccess(
         'register stream',
         await fetchImpl(url, {
           method: 'POST',
-          headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
+          headers: producerHeaders,
           body: JSON.stringify({ name }),
         })
       );
       registeredStreams.add(cacheKey);
-    })().finally(() => {
-      registeringStreams.delete(cacheKey);
     });
-    registeringStreams.set(cacheKey, registering);
-    return registering;
+    const tracked = registering.finally(() => {
+      if (registryOperations.get(registryKey) === tracked) {
+        registryOperations.delete(registryKey);
+      }
+    });
+    registryOperations.set(registryKey, tracked);
+    return tracked;
   }
 
   function producerFor(key: string): Producer {
@@ -331,19 +359,43 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (records.length === 0) return;
     const url = streamUrl(runId, name);
     await serializeStream(url, async (producer) => {
-      await Promise.all([ensureStream(url), registerStream(runId, name)]);
+      await registerStream(runId, name);
       const sequence = producer.nextSequence;
+      const appendHeaders = headers({
+        'content-type': RECORD_CONTENT_TYPE,
+        'producer-id': producer.id,
+        'producer-epoch': String(producer.epoch),
+        'producer-seq': String(sequence),
+      });
+      const body = JSON.stringify(records.length === 1 ? records[0] : records);
+      const key = url.toString();
+      if (!ensuredStreams.has(key)) {
+        const created = await fetchImpl(url, {
+          method: 'PUT',
+          headers: appendHeaders,
+          body,
+        });
+        if (created.status === 201) {
+          ensuredStreams.add(key);
+          producer.nextSequence += 1;
+          return;
+        }
+        if (
+          created.status === 200 ||
+          (created.status === 409 &&
+            created.headers.get('stream-closed') === 'true')
+        ) {
+          ensuredStreams.add(key);
+        } else {
+          await expectSuccess('create stream with first chunks', created);
+        }
+      }
       await expectSuccess(
         'append stream',
         await fetchImpl(url, {
           method: 'POST',
-          headers: headers({
-            'content-type': RECORD_CONTENT_TYPE,
-            'producer-id': producer.id,
-            'producer-epoch': String(producer.epoch),
-            'producer-seq': String(sequence),
-          }),
-          body: JSON.stringify(records.length === 1 ? records[0] : records),
+          headers: appendHeaders,
+          body,
         })
       );
       producer.nextSequence += 1;

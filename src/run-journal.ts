@@ -326,7 +326,7 @@ export class RunJournal {
     runId: string,
     options: { assumeEmpty?: boolean; createIfMissing?: boolean } = {}
   ): Promise<RunJournalState> {
-    if (options.createIfMissing) {
+    if (options.createIfMissing && !options.assumeEmpty) {
       await this.client.ensureJsonStream(streamId(runId));
     }
     const cached = this.cache.get(runId);
@@ -371,6 +371,7 @@ export class RunJournal {
     const checkpoint = checkpointFromState(state);
     const receipt = await this.client.append(stream, checkpoint, {
       operationId: `run-checkpoint:${state.runId}:${state.nextRecord}`,
+      createIfMissing: true,
     });
     await this.client.publishSnapshotAtRecord(
       stream,
@@ -502,6 +503,7 @@ export class RunJournal {
     await this.client.append(streamId(state.runId), value, {
       operationId: commit.operationId,
       expectedRecord: state.nextRecord,
+      createIfMissing: state.nextRecord === 0,
     });
     applyCommit(state, parseCommit(value), state.nextRecord);
     if (useCache) {

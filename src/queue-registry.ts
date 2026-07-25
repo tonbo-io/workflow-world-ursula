@@ -38,7 +38,10 @@ export class QueueRegistry {
     await this.client.append(
       QUEUE_REGISTRY_STREAM,
       { version: 1, queueName } satisfies QueueRegistration,
-      { operationId: `register-queue:${queueName}` }
+      {
+        operationId: `register-queue:${queueName}`,
+        createIfMissing: true,
+      }
     );
     this.queueNames.add(queueName);
   }
