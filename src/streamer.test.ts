@@ -84,6 +84,33 @@ describe('Ursula Workflow streamer', () => {
     expect(retriedAppendHeaders.get('producer-seq')).toBe('0');
   });
 
+  it('reuses producer identity when a closed stream is retried elsewhere', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(response(null, { status: 200 }));
+    const first = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await first.streams.write('wrun_1', 'output', 'hello');
+    await first.streams.close('wrun_1', 'output');
+
+    const retry = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+    await retry.streams.write('wrun_1', 'output', 'hello');
+
+    const firstAppendHeaders = new Headers(fetch.mock.calls[3]?.[1]?.headers);
+    const retriedAppendHeaders = new Headers(fetch.mock.calls[8]?.[1]?.headers);
+    expect(firstAppendHeaders.get('producer-id')).toBe(
+      retriedAppendHeaders.get('producer-id')
+    );
+    expect(firstAppendHeaders.get('producer-seq')).toBe('0');
+    expect(retriedAppendHeaders.get('producer-seq')).toBe('0');
+  });
+
   it('waits for pending writes before closing a stream', async () => {
     let finishAppend: ((response: Response) => void) | undefined;
     const appendResponse = new Promise<Response>((resolve) => {
