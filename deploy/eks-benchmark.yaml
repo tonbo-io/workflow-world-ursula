@@ -24,7 +24,7 @@ spec:
           imagePullPolicy: Always
           env:
             - name: WORKFLOW_TARGET_WORLD
-              value: "@tonbo-io/world-ursula"
+              value: /workspace/dist/index.js
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
@@ -110,7 +110,7 @@ spec:
             - name: APP_NAME
               value: eks-nextjs
             - name: WORKFLOW_TARGET_WORLD
-              value: "@tonbo-io/world-ursula"
+              value: /workspace/dist/index.js
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
