@@ -168,6 +168,38 @@ describe('RunJournal', () => {
     expect(client.readAllStarts).toEqual([]);
   });
 
+  it('serves events through a known commit without an empty tail read', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.loadForMutation('wrun_events_hot', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    const createdAt = new Date('2026-07-25T00:00:00.000Z');
+    const event = {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_hot',
+        workflowName: 'workflow//test//hot',
+        input: Uint8Array.from([1]),
+      },
+      runId: 'wrun_events_hot',
+      eventId: 'evnt_01K00000000000000000000001',
+      createdAt,
+      specVersion: 5,
+    } satisfies Event;
+    await journal.append(state, {
+      operationId: 'hot-events-1',
+      events: [event],
+    });
+    client.failNextReadAt = 1;
+
+    await expect(journal.events('wrun_events_hot', 1)).resolves.toEqual([
+      event,
+    ]);
+    expect(client.failedReads).toBe(0);
+  });
+
   it('commits an event and its resulting run state in one guarded record', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
