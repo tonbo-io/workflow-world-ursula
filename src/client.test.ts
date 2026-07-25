@@ -128,6 +128,46 @@ describe('UrsulaClient', () => {
     expect(url.searchParams.get('record_view')).toBe('envelope');
   });
 
+  it('retries a snapshot until the preceding append is visible', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        response('InvalidRecordBoundaries', { status: 400 })
+      )
+      .mockResolvedValueOnce(
+        response('InvalidRecordBoundaries', { status: 400 })
+      )
+      .mockResolvedValueOnce(response(null, { status: 204 }));
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await expect(
+      client.publishSnapshotAtRecord('run-checkpoint-1', 1, {
+        sourceNextRecord: 128,
+      })
+    ).resolves.toBeUndefined();
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry a non-transient snapshot error', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(response('invalid snapshot', { status: 400 }));
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await expect(
+      client.publishSnapshotAtRecord('run-checkpoint-1', 99, {})
+    ).rejects.toMatchObject({ status: 400 });
+
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it('encodes Node Buffers as opaque binary instead of Buffer JSON', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

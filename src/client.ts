@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 const JSON_CONTENT_TYPE = 'application/json';
 const DEFAULT_PAGE_SIZE = 1000;
+const SNAPSHOT_VISIBILITY_RETRY_DELAYS_MS = [10, 25, 50] as const;
 type HeaderSource = ConstructorParameters<typeof Headers>[0];
 
 export interface UrsulaClientConfig {
@@ -346,14 +347,36 @@ export class UrsulaClient {
     const url = this.streamUrl(stream);
     url.pathname += '/snapshot';
     url.searchParams.set('record', String(record));
-    await this.success(
-      'publish snapshot',
-      await this.fetchImpl(url, {
-        method: 'PUT',
-        headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
-        body: stringifyUrsulaJson(snapshot),
-      })
-    );
+    for (
+      let attempt = 0;
+      attempt <= SNAPSHOT_VISIBILITY_RETRY_DELAYS_MS.length;
+      attempt += 1
+    ) {
+      try {
+        await this.success(
+          'publish snapshot',
+          await this.fetchImpl(url, {
+            method: 'PUT',
+            headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
+            body: stringifyUrsulaJson(snapshot),
+          })
+        );
+        return;
+      } catch (error) {
+        const delayMs = SNAPSHOT_VISIBILITY_RETRY_DELAYS_MS[attempt];
+        if (
+          !(error instanceof UrsulaRequestError) ||
+          error.status !== 400 ||
+          !error.message.includes('InvalidRecordBoundaries') ||
+          delayMs === undefined
+        ) {
+          throw error;
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, delayMs);
+        });
+      }
+    }
   }
 
   async advanceRetentionAtRecord(
