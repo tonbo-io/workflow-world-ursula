@@ -152,11 +152,16 @@ const payload = {
 } satisfies QueuePayload;
 
 describe('QueueJournal', () => {
-  it('uses the cached record tail for uncontended enqueue, claim, and ack', async () => {
+  it('uses the cached record tail after initial queue discovery', async () => {
     const memory = new MemoryClient();
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
 
     await journal.enqueue(queueName, payload);
+    memory.reads = 0;
+    await journal.enqueue(queueName, {
+      ...payload,
+      correlationId: 'health-2',
+    });
     const lease = await journal.claim(queueName, new Date(), 1000);
     if (!lease) throw new Error('expected hot-path lease');
     await journal.ack(queueName, lease);

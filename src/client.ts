@@ -57,6 +57,28 @@ export class UrsulaRequestError extends Error {
   }
 }
 
+/**
+ * Recognizes request errors across framework bundles and JavaScript realms.
+ *
+ * Next.js may evaluate the adapter in more than one server bundle, making
+ * `instanceof` false even though both copies represent the same error class.
+ */
+export function isUrsulaRequestError(
+  error: unknown,
+  status?: number
+): error is UrsulaRequestError {
+  const candidate =
+    typeof error === 'object' && error !== null
+      ? (error as Partial<UrsulaRequestError>)
+      : undefined;
+  const recognized =
+    error instanceof UrsulaRequestError ||
+    (candidate?.name === 'UrsulaRequestError' &&
+      typeof candidate.status === 'number' &&
+      typeof candidate.operation === 'string');
+  return recognized && (status === undefined || candidate?.status === status);
+}
+
 function nonNegativeInteger(
   headers: Headers,
   name: string,

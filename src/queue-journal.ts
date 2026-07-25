@@ -11,6 +11,7 @@ import {
 } from '@workflow/world';
 import { ulid } from 'ulid';
 import {
+  isUrsulaRequestError,
   type UrsulaClient,
   type UrsulaRecord,
   UrsulaRequestError,
@@ -434,12 +435,8 @@ export class QueueJournal {
       pruneIdempotency(cached, new Date());
       return cached;
     }
-    if (options.createIfMissing) {
+    if (options.createIfMissing)
       await this.client.ensureJsonStream(queueStream(queueName));
-      const state = replay([]);
-      this.cache.set(queueName, state);
-      return state;
-    }
     return this.load(queueName);
   }
 
@@ -483,7 +480,7 @@ export class QueueJournal {
         );
         return messageId;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           this.invalidate(queueName);
           continue;
         }
@@ -570,7 +567,7 @@ export class QueueJournal {
           },
         };
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           this.invalidate(queueName);
           continue;
         }
@@ -637,7 +634,7 @@ export class QueueJournal {
         );
         return true;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           this.invalidate(queueName);
           continue;
         }
@@ -703,7 +700,7 @@ export class QueueJournal {
         );
         return true;
       } catch (error) {
-        if (error instanceof UrsulaRequestError && error.status === 412) {
+        if (isUrsulaRequestError(error, 412)) {
           this.invalidate(queueName);
           continue;
         }
