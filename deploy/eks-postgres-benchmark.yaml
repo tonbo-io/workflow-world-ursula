@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: workflow-benchmark
+  name: workflow-benchmark-postgres
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: workflow-benchmark-app
-  namespace: workflow-benchmark
+  namespace: workflow-benchmark-postgres
 spec:
   replicas: 1
   selector:
@@ -20,19 +20,22 @@ spec:
     spec:
       containers:
         - name: app
-          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-postgres
           imagePullPolicy: Always
           env:
             - name: WORKFLOW_TARGET_WORLD
-              value: "@tonbo-io/world-ursula"
-            - name: WORKFLOW_URSULA_URL
-              value: http://ursula-gateway.ursula.svc.cluster.local:4437
-            - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-official-20260725-v4
-            - name: WORKFLOW_URSULA_DEPLOYMENT_ID
-              value: eks-us-east-1
-            - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
-              value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
+              value: "@workflow/world-postgres"
+            - name: WORKFLOW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
+            - name: WORKFLOW_POSTGRES_JOB_PREFIX
+              value: eks-benchmark
+            - name: WORKFLOW_POSTGRES_WORKER_CONCURRENCY
+              value: "64"
+            - name: WORKFLOW_POSTGRES_MAX_POOL_SIZE
+              value: "66"
             - name: PORT
               value: "3000"
           ports:
@@ -55,7 +58,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: workflow-benchmark-app
-  namespace: workflow-benchmark
+  namespace: workflow-benchmark-postgres
 spec:
   selector:
     app: workflow-benchmark-app
@@ -68,7 +71,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: workflow-benchmark-runner
-  namespace: workflow-benchmark
+  namespace: workflow-benchmark-postgres
 spec:
   backoffLimit: 0
   template:
@@ -79,14 +82,14 @@ spec:
       restartPolicy: Never
       initContainers:
         - name: wait-for-app
-          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-postgres
           imagePullPolicy: Always
           command:
             - node
             - --input-type=module
             - -e
             - |
-              const url = "http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000/api/health";
+              const url = "http://workflow-benchmark-app.workflow-benchmark-postgres.svc.cluster.local:3000/api/health";
               const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
               for (;;) {
                 try {
@@ -97,7 +100,7 @@ spec:
               }
       containers:
         - name: runner
-          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-postgres
           imagePullPolicy: Always
           command:
             - /bin/sh
@@ -114,28 +117,20 @@ spec:
               exit "$status"
           env:
             - name: DEPLOYMENT_URL
-              value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
+              value: http://workflow-benchmark-app.workflow-benchmark-postgres.svc.cluster.local:3000
             - name: APP_NAME
               value: eks-nextjs
             - name: WORKFLOW_TARGET_WORLD
-              value: "@tonbo-io/world-ursula"
-            - name: WORKFLOW_URSULA_URL
-              value: http://ursula-gateway.ursula.svc.cluster.local:4437
-            - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-official-20260725-v4
-            - name: WORKFLOW_URSULA_DEPLOYMENT_ID
-              value: eks-us-east-1-runner
-            - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
-              value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
-            - name: WORKFLOW_URSULA_METRICS_URLS
-              value: >-
-                http://ursula-0.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
-                http://ursula-1.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
-                http://ursula-2.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics
+              value: "@workflow/world-postgres"
+            - name: WORKFLOW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
             - name: WORKFLOW_BENCH_BACKEND
-              value: ursula-eks
+              value: postgres-rds-multi-az
             - name: BENCH_OUTPUT_FILE
-              value: /results/bench-results-eks-nextjs-ursula.json
+              value: /results/bench-results-eks-nextjs-postgres.json
           resources:
             requests:
               cpu: "1"

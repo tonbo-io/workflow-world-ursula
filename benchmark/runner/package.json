@@ -8,10 +8,12 @@
   },
   "dependencies": {
     "@tonbo-io/world-ursula": "workspace:*",
+    "pg": "8.20.0",
     "workflow": "5.0.0-beta.36"
   },
   "devDependencies": {
     "@types/node": "22.19.0",
+    "@types/pg": "8.16.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
   }
