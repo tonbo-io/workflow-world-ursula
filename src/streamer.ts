@@ -14,6 +14,7 @@ const MAX_PAGE_SIZE = 1000;
 // default also keeps the adapter reliable with older releases and other
 // reverse proxies.
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
+const LONG_POLL_CLIENT_HEADROOM_MS = 5_000;
 const RECORD_CONTENT_TYPE = 'application/json';
 type HeaderSource = ConstructorParameters<typeof Headers>[0];
 
@@ -439,10 +440,36 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       url.searchParams.set('timeout_ms', String(longPollTimeoutMs));
     }
 
-    const response = await fetchImpl(url, {
-      headers: headers(),
-      signal: args.signal,
-    });
+    const requestController = args.live ? new AbortController() : undefined;
+    let requestTimedOut = false;
+    const abortRequest = () => requestController?.abort(args.signal?.reason);
+    args.signal?.addEventListener('abort', abortRequest, { once: true });
+    const requestDeadline = args.live
+      ? setTimeout(() => {
+          requestTimedOut = true;
+          requestController?.abort();
+        }, longPollTimeoutMs + LONG_POLL_CLIENT_HEADROOM_MS)
+      : undefined;
+    let response: Response;
+    try {
+      response = await fetchImpl(url, {
+        headers: headers(),
+        signal: requestController?.signal ?? args.signal,
+      });
+    } catch (error) {
+      if (requestTimedOut && !args.signal?.aborted) {
+        return {
+          records: [],
+          nextRecord: args.start,
+          closed: false,
+          upToDate: false,
+        };
+      }
+      throw error;
+    } finally {
+      if (requestDeadline !== undefined) clearTimeout(requestDeadline);
+      args.signal?.removeEventListener('abort', abortRequest);
+    }
     if (response.status !== 204) {
       await expectSuccess('read stream', response);
     }
