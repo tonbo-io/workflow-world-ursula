@@ -9,6 +9,7 @@ export interface BackendMetricsSnapshot {
 
 const URSULA_COUNTERS = [
   'accepted_appends',
+  'append_post_commit_ns',
   'applied_mutations',
   'cold_flush_publish_bytes',
   'cold_flush_publishes',
@@ -20,7 +21,35 @@ const URSULA_COUNTERS = [
   'cold_store_read_bytes',
   'cold_store_reads',
   'live_read_backpressure_events',
+  'mailbox_send_wait_ns',
+  'mutation_apply_ns',
+  'group_engine_exec_ns',
+  'group_lock_wait_ns',
   'raft_apply_entries',
+  'raft_apply_ns',
+  'raft_write_many_batches',
+  'raft_write_many_commands',
+  'raft_write_many_logical_commands',
+  'raft_write_many_response_ns',
+  'raft_write_many_responses',
+  'raft_write_many_submit_ns',
+  'read_watcher_notify_calls',
+  'read_watcher_notify_ns',
+  'read_watcher_replans',
+  'routed_requests',
+  'wal_batches',
+  'wal_records',
+  'wal_sync_ns',
+  'wal_write_ns',
+] as const;
+
+const URSULA_GATEWAY_COUNTERS = [
+  'leader_cache_hits',
+  'leader_cache_misses',
+  'leader_cache_updates',
+  'leader_redirect_ns',
+  'leader_redirects',
+  'requests',
 ] as const;
 
 function finiteNumber(value: unknown): number {
@@ -37,7 +66,8 @@ function addCounter(
 }
 
 async function captureUrsula(
-  rawUrls: string
+  rawUrls: string,
+  gatewayMetricsUrl?: string
 ): Promise<BackendMetricsSnapshot> {
   const urls = rawUrls
     .split(',')
@@ -58,6 +88,18 @@ async function captureUrsula(
   for (const payload of payloads) {
     for (const name of URSULA_COUNTERS) {
       addCounter(counters, name, payload[name]);
+    }
+  }
+  if (gatewayMetricsUrl) {
+    const response = await fetch(gatewayMetricsUrl);
+    if (!response.ok) {
+      throw new Error(
+        `Ursula gateway metrics request failed: ${gatewayMetricsUrl} returned HTTP ${response.status}`
+      );
+    }
+    const payload = (await response.json()) as Record<string, unknown>;
+    for (const name of URSULA_GATEWAY_COUNTERS) {
+      addCounter(counters, `gateway_${name}`, payload[name]);
     }
   }
   return {
@@ -126,7 +168,12 @@ export async function captureBackendMetrics(): Promise<
   BackendMetricsSnapshot | undefined
 > {
   const ursulaUrls = process.env.WORKFLOW_URSULA_METRICS_URLS;
-  if (ursulaUrls) return captureUrsula(ursulaUrls);
+  if (ursulaUrls) {
+    return captureUrsula(
+      ursulaUrls,
+      process.env.WORKFLOW_URSULA_GATEWAY_METRICS_URL
+    );
+  }
   const postgresUrl =
     process.env.WORKFLOW_POSTGRES_URL ?? process.env.DATABASE_URL;
   if (postgresUrl) return capturePostgres(postgresUrl);
@@ -143,5 +190,92 @@ export function diffBackendMetrics(
       name,
       value - (before.counters[name] ?? 0),
     ])
+  );
+}
+
+function per(
+  counters: Record<string, number>,
+  numerator: string,
+  denominator: string
+): number | undefined {
+  const count = counters[denominator] ?? 0;
+  if (count <= 0) return undefined;
+  return (counters[numerator] ?? 0) / count;
+}
+
+/** Derived averages are diagnostic only. The source metrics are cumulative
+ * sums rather than per-request histograms, so these values cannot represent
+ * p95/p99 or reconstruct one particular client request. */
+export function deriveBackendMetrics(
+  counters: Record<string, number> | undefined
+): Record<string, number> | undefined {
+  if (!counters) return undefined;
+  return Object.fromEntries(
+    Object.entries({
+      mutationApplyNsPerMutation: per(
+        counters,
+        'mutation_apply_ns',
+        'applied_mutations'
+      ),
+      groupEngineExecNsPerMutation: per(
+        counters,
+        'group_engine_exec_ns',
+        'applied_mutations'
+      ),
+      groupLockWaitNsPerMutation: per(
+        counters,
+        'group_lock_wait_ns',
+        'applied_mutations'
+      ),
+      appendPostCommitNsPerAppend: per(
+        counters,
+        'append_post_commit_ns',
+        'accepted_appends'
+      ),
+      readWatcherNotifyNsPerCall: per(
+        counters,
+        'read_watcher_notify_ns',
+        'read_watcher_notify_calls'
+      ),
+      readWatcherReplansPerCall: per(
+        counters,
+        'read_watcher_replans',
+        'read_watcher_notify_calls'
+      ),
+      mailboxSendWaitNsPerRequest: per(
+        counters,
+        'mailbox_send_wait_ns',
+        'routed_requests'
+      ),
+      raftApplyNsPerEntry: per(
+        counters,
+        'raft_apply_ns',
+        'raft_apply_entries'
+      ),
+      raftWriteManySubmitNsPerBatch: per(
+        counters,
+        'raft_write_many_submit_ns',
+        'raft_write_many_batches'
+      ),
+      raftWriteManyResponseNsPerBatch: per(
+        counters,
+        'raft_write_many_response_ns',
+        'raft_write_many_batches'
+      ),
+      walWriteNsPerBatch: per(counters, 'wal_write_ns', 'wal_batches'),
+      walSyncNsPerBatch: per(counters, 'wal_sync_ns', 'wal_batches'),
+      gatewayRedirectNsPerRedirect: per(
+        counters,
+        'gateway_leader_redirect_ns',
+        'gateway_leader_redirects'
+      ),
+      gatewayLeaderCacheHitRatio:
+        (counters.gateway_leader_cache_hits ?? 0) /
+        Math.max(
+          1,
+          (counters.gateway_leader_cache_hits ?? 0) +
+            (counters.gateway_leader_cache_misses ?? 0)
+        ),
+    }).filter((entry): entry is [string, number] => entry[1] !== undefined)
   );
 }

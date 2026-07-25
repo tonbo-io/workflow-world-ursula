@@ -366,10 +366,11 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     const url = streamUrl(runId, name);
     await serializeStream(url, async (producer) => {
       // Discovery metadata and the data append target different streams (and
-      // therefore potentially different Raft groups). Start registration
-      // first, but do not serialize the latency-sensitive append behind it.
-      // The write still settles only after both operations are durable.
+      // therefore potentially different Raft groups). Registration is a
+      // rebuildable projection, so keep it off the latency-sensitive write
+      // path. Discovery operations and close() join the retained promise.
       const registration = registerStream(runId, name);
+      void registration.catch(() => undefined);
       // Let an uncontended registry operation issue its request before the
       // data request so existing request-order assertions and traces remain
       // intuitive; neither response is awaited here.
@@ -391,7 +392,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         });
         if (created.status === 201) {
           ensuredStreams.add(key);
-          await registration;
           producer.nextSequence += 1;
           return;
         }
@@ -413,7 +413,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
           body,
         })
       );
-      await registration;
       producer.nextSequence += 1;
     });
   }
