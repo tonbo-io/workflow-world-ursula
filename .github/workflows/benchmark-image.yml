@@ -29,6 +29,13 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: ursula
+            world: "@tonbo-io/world-ursula"
+          - name: postgres
+            world: "@workflow/world-postgres"
     steps:
       - uses: actions/checkout@v4
       - uses: depot/setup-action@v1
@@ -42,6 +49,8 @@ jobs:
           project: ls2d88cjpz
           context: .
           file: Dockerfile.benchmark
+          build-args: |
+            BENCHMARK_WORLD=${{ matrix.world }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main
+          tags: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-${{ matrix.name }}

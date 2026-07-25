@@ -152,6 +152,22 @@ For Postgres, set `WORKFLOW_TARGET_WORLD=@workflow/world-postgres` and
 `WORKFLOW_POSTGRES_URL`. For managed Vercel, use the benchmark workflow's
 standard Vercel environment.
 
+The repository's EKS manifests implement this matrix directly:
+
+- `deploy/eks-benchmark.yaml` uses the Depot-built `main-ursula` image and
+  records aggregate counters from all three Ursula voters;
+- `deploy/rds-benchmark/` provisions a private PostgreSQL 17 Multi-AZ RDS
+  comparator in the canary VPC;
+- `deploy/eks-postgres-benchmark.yaml` uses the separately compiled
+  `main-postgres` image against that RDS instance.
+
+Both Jobs append their result JSON as `BENCH_RESULT_BASE64` in the final log,
+so Kubernetes log rotation or completed-Pod filesystem cleanup cannot discard
+the artifact. The JSON includes a `backendUsage` before/after/delta block:
+Ursula reports append, mutation, cold-upload, and GC counters; Postgres reports
+database bytes, transactions, block activity, tuple activity, and temporary
+I/O.
+
 ## Cost collection
 
 Take counters immediately before and after each isolated workload, then
@@ -171,6 +187,12 @@ growth, I/O, row growth, and WAL bytes. For Ursula, record:
 - S3 PUT/GET/LIST requests, object count, object-size histogram, live bytes,
   noncurrent-version bytes, and lifecycle deletions;
 - application-to-Ursula and Ursula-to-S3 network bytes.
+
+Run `benchmark/capture-cost-snapshot.sh` immediately before and after each
+backend. It records current/noncurrent S3 object counts and bytes, benchmark
+Pod resource shapes and restarts, plus the non-secret RDS topology and storage
+configuration. Keep these external snapshots beside the result JSON; the
+in-result counters provide the marginal workload delta between them.
 
 Fixed cluster cost and marginal workload cost must be shown separately.
 Amortize fixed cost only at explicitly stated utilization levels; do not compare

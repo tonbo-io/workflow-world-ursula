@@ -87,6 +87,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, test } from 'vitest';
+import {
+  type BackendMetricsSnapshot,
+  captureBackendMetrics,
+  diffBackendMetrics,
+} from './backend-metrics.js';
 
 const deploymentUrl = process.env.DEPLOYMENT_URL;
 if (!deploymentUrl) {
@@ -560,6 +565,7 @@ interface MetricRow extends MetricStats {
 }
 
 const metricRows: MetricRow[] = [];
+let backendMetricsBefore: BackendMetricsSnapshot | undefined;
 
 function recordMetric(
   metric: string,
@@ -644,6 +650,7 @@ describe('workflow benchmarks', () => {
   // out RUN_TIMEOUT_MS, and the job dies at its time limit without a useful
   // error.
   beforeAll(async () => {
+    backendMetricsBefore = await captureBackendMetrics();
     const { runId } = await triggerBenchRun(
       'benchSequentialStepsWorkflow',
       [1]
@@ -798,13 +805,14 @@ describe('workflow benchmarks', () => {
     );
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     if (metricRows.length === 0) {
       console.warn('[bench] No metrics collected; skipping results file');
       return;
     }
     const appName = process.env.APP_NAME || 'unknown';
     const backend = getBackend();
+    const backendMetricsAfter = await captureBackendMetrics();
     const outputPath = path.resolve(
       process.cwd(),
       process.env.BENCH_OUTPUT_FILE ??
@@ -832,6 +840,14 @@ describe('workflow benchmarks', () => {
       },
       scenarios: SCENARIO_DESCRIPTIONS,
       metrics: metricRows,
+      backendUsage: {
+        before: backendMetricsBefore,
+        after: backendMetricsAfter,
+        delta: diffBackendMetrics(
+          backendMetricsBefore,
+          backendMetricsAfter
+        ),
+      },
     };
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
     console.log(`[bench] Results written to ${outputPath}`);
