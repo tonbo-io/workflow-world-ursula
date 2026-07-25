@@ -30,7 +30,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-round2-v037-clean2
+              value: workflow-benchmark-round3-v037-final2
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
@@ -126,7 +126,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-round2-v037-clean2
+              value: workflow-benchmark-round3-v037-final2
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1-runner
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
