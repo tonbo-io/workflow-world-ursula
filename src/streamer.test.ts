@@ -400,6 +400,65 @@ describe('Ursula Workflow streamer', () => {
     }
   });
 
+  it('reconnects when a long-poll response body stalls', async () => {
+    vi.useFakeTimers();
+    try {
+      const chunk = JSON.stringify({
+        record: 0,
+        value: { v: 1, data: Buffer.from('reconnected').toString('base64') },
+      });
+      const fetch = vi
+        .fn<typeof globalThis.fetch>()
+        .mockResolvedValueOnce(response(null, { status: 201 }))
+        .mockResolvedValueOnce(response(null, { status: 201 }))
+        .mockImplementationOnce((_input, init) => {
+          const signal = init?.signal;
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            text: () =>
+              new Promise<string>((_resolve, reject) => {
+                signal?.addEventListener(
+                  'abort',
+                  () => reject(new DOMException('aborted', 'AbortError')),
+                  { once: true }
+                );
+              }),
+          } as Response);
+        })
+        .mockResolvedValueOnce(
+          response(chunk, {
+            status: 200,
+            headers: {
+              'stream-record-next': '1',
+              'stream-closed': 'true',
+              'stream-up-to-date': 'true',
+            },
+          })
+        );
+      const streamer = createStreamer({
+        baseUrl: 'https://ursula.test',
+        fetch,
+        longPollTimeoutMs: 10,
+      });
+      const stream = await streamer.streams.get('wrun_1', 'output');
+      const reader = stream.getReader();
+      const read = reader.read();
+
+      await vi.advanceTimersByTimeAsync(5_010);
+
+      await expect(read).resolves.toEqual({
+        done: false,
+        value: new TextEncoder().encode('reconnected'),
+      });
+      expect(fetch.mock.calls[2]?.[1]?.signal?.aborted).toBe(true);
+      expect(fetch.mock.calls[3]?.[0]?.toString()).toContain('record=0');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('registers a live-read stream before its first latency-sensitive write', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>((input, init) => {
       if (input.toString().includes('live=long-poll')) {
