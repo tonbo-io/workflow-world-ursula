@@ -84,6 +84,39 @@ describe('Ursula Workflow streamer', () => {
     expect(retriedAppendHeaders.get('producer-seq')).toBe('0');
   });
 
+  it('waits for pending writes before closing a stream', async () => {
+    let finishAppend: ((response: Response) => void) | undefined;
+    const appendResponse = new Promise<Response>((resolve) => {
+      finishAppend = resolve;
+    });
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 204 }))
+      .mockImplementationOnce(() => appendResponse)
+      .mockResolvedValueOnce(response(null, { status: 200 }));
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    const write = streamer.streams.write('wrun_1', 'output', 'hello');
+    await vi.waitFor(() => {
+      expect(fetch).toHaveBeenCalledTimes(4);
+    });
+    const close = streamer.streams.close('wrun_1', 'output');
+    await Promise.resolve();
+    expect(fetch).toHaveBeenCalledTimes(4);
+
+    finishAppend?.(response(null, { status: 200 }));
+    await Promise.all([write, close]);
+
+    expect(fetch).toHaveBeenCalledTimes(5);
+    const closeHeaders = new Headers(fetch.mock.calls[4]?.[1]?.headers);
+    expect(closeHeaders.get('stream-closed')).toBe('true');
+  });
+
   it('paginates by Ursula record ordinal and decodes binary chunks', async () => {
     const body = [
       JSON.stringify({
