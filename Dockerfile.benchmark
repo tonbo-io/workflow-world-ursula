@@ -6,7 +6,9 @@ ENV PATH="${PNPM_HOME}:${PATH}"
 ENV WORKFLOW_TARGET_WORLD=${BENCHMARK_WORLD}
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN corepack enable
+RUN corepack enable \
+    && corepack prepare pnpm@10.15.1 --activate \
+    && pnpm --version
 
 WORKDIR /workspace
 
@@ -36,7 +38,9 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV WORKFLOW_TARGET_WORLD=${BENCHMARK_WORLD}
 
-RUN corepack enable
+RUN corepack enable \
+    && corepack prepare pnpm@10.15.1 --activate \
+    && pnpm --version
 
 WORKDIR /workspace
 COPY --from=build /workspace /workspace
