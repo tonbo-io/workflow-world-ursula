@@ -108,19 +108,23 @@ These observations prove that neither backend was CPU-saturated at the measured 
 4. Ursula's useful capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate CPU saturation.
 5. The three-node availability floor makes a dedicated low-volume Ursula cluster look expensive; shared nodes, smaller Graviton voters, or multiple tenants amortizing the cluster could improve economics, but these are deployment alternatives and must not be presented as measured results.
 
-### First capacity probe
+### Single hot-queue capacity probe
 
-A first Ursula probe used eight application replicas on two isolated `m6i.xlarge` app nodes. These numbers are provisional because the app still pointed at the retained benchmark bucket from the previous round and the runner was stopped at the first failed 500-concurrency attempt:
+The clean probe used eight application replicas on two isolated `m6i.xlarge` app nodes and a fresh Ursula bucket. Every run used the same workflow name and therefore the same workflow queue. This is a useful hot-key/burst test, not a measurement of total Ursula Raft-group capacity.
 
-| Concurrent runs × steps | Throughput | Run duration p99 | Result |
-| --- | ---: | ---: | --- |
-| 25 × 20 | 63.6 steps/s | 7.776 s | completed |
-| 50 × 20 | 74.6 steps/s | 13.317 s | completed |
-| 100 × 20 | 59.3 steps/s | 33.444 s | completed |
-| 250 × 20 | 76.5 steps/s | 64.242 s | completed |
-| 500 × 20 | n/a | n/a | trigger failed with queue enqueue contention |
+| Concurrent runs × 20 steps | Ursula throughput / TTFS p99 / run p99 | PostgreSQL throughput / TTFS p99 / run p99 |
+| --- | ---: | ---: |
+| 25 | 50.3 steps/s / 1.724 s / 9.885 s | 56.4 steps/s / 1.495 s / 8.855 s |
+| 50 | 70.6 steps/s / 11.587 s / 13.895 s | 57.5 steps/s / 1.075 s / 17.247 s |
+| 100 | 78.2 steps/s / 21.601 s / 25.334 s | 35.9 steps/s / 6.520 s / 55.730 s |
+| 250 | enqueue contention, no clean result | 65.1 steps/s / 8.866 s / 74.318 s |
+| 500 | not reached | client `fetch failed`, no clean result |
 
-This already proves that the old 46.7 steps/s point was not Ursula's maximum throughput. It also identifies the first production-facing ceiling: at an instantaneous 500-run burst, `queue()` returned HTTP 500 because the shared workflow queue remained contended during enqueue. Some triggers had already succeeded before `Promise.all` rejected, so retrying that level would contaminate the measurement. The harness is being changed to record the failed level and stop without retrying; the clean run will use a fresh Ursula bucket.
+This proves that the old 46.7 steps/s point was not Ursula's maximum throughput. It also identifies a production-facing hot-key ceiling: at an instantaneous 250-run burst, Ursula's `queue()` returned HTTP 500 because the shared workflow queue remained contended during enqueue. PostgreSQL admitted 250 but the 500-run burst failed at the application/client boundary.
+
+The curves are non-monotonic because the application and queue scheduling layers are saturated before either backend. Cgroup samples show the eight application containers consuming 6.1–6.9 CPU cores during the Ursula run and 5.9–6.4 cores during the loaded PostgreSQL windows, with substantial CFS throttling. By contrast, all three Ursula voters together consumed only about 0.69–0.77 core during the useful loaded windows. RDS CPU was only 18–19%, while database connections rose to 514–544, almost exactly the eight application pools' configured total. These are application/adapter ceilings, not database CPU ceilings.
+
+The next probe therefore uses more app nodes and 16 app replicas, and distributes identical runs over eight distinct workflow names/queues. The one-queue numbers remain valuable as the user-visible hot-key test.
 
 ## Capacity sweep methodology
 

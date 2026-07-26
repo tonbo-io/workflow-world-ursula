@@ -192,15 +192,59 @@ export async function benchStreamWorkflow(): Promise<{
  * Scenario 2: N trivial sequential steps. Used to measure STSO (the gap
  * between consecutive step body executions), reported per step-index range.
  */
-export async function benchSequentialStepsWorkflow(count: number): Promise<{
+async function runSequentialSteps(count: number): Promise<{
   steps: BenchStepTiming[];
 }> {
-  'use workflow';
   const steps: BenchStepTiming[] = [];
   for (let i = 0; i < count; i++) {
     steps.push(await timedNoopStep(i));
   }
   return { steps };
+}
+
+export async function benchSequentialStepsWorkflow(count: number): Promise<{
+  steps: BenchStepTiming[];
+}> {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+// Capacity sweeps distribute runs over independent workflow queues. Keeping
+// these as distinct workflow exports is intentional: queue identity derives
+// from the workflow name, while all shards execute the exact same body.
+export async function benchSequentialStepsWorkflow1(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow2(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow3(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow4(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow5(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow6(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
+}
+
+export async function benchSequentialStepsWorkflow7(count: number) {
+  'use workflow';
+  return runSequentialSteps(count);
 }
 
 /**
