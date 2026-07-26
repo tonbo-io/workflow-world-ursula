@@ -416,6 +416,36 @@ describe('QueueJournal', () => {
     expect(memory.appendedBatchSizes).toHaveLength(100);
   });
 
+  it('refreshes only the missing suffix after cross-instance queue contention', async () => {
+    const memory = new MemoryClient();
+    const first = new QueueJournal(memory as unknown as UrsulaClient);
+    const second = new QueueJournal(memory as unknown as UrsulaClient);
+    await first.enqueue(queueName, { runId: 'warm-first', step: 0 });
+    await second.enqueue(queueName, { runId: 'warm-second', step: 0 });
+    memory.readAllStarts.length = 0;
+    memory.yieldBeforeAppend = true;
+
+    const messageIds = await Promise.all([
+      ...Array.from({ length: 20 }, (_, index) =>
+        first.enqueue(
+          queueName,
+          { runId: `first-${index}`, step: index },
+          { idempotencyKey: `first-${index}` }
+        )
+      ),
+      ...Array.from({ length: 20 }, (_, index) =>
+        second.enqueue(
+          queueName,
+          { runId: `second-${index}`, step: index },
+          { idempotencyKey: `second-${index}` }
+        )
+      ),
+    ]);
+
+    expect(new Set(messageIds)).toHaveLength(40);
+    expect(memory.readAllStarts).toEqual([]);
+  });
+
   it('retries a cold rebuild when retention advances after checkpoint read', async () => {
     const memory = new MemoryClient();
     const writer = new QueueJournal(memory as unknown as UrsulaClient);

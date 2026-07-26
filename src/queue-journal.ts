@@ -17,6 +17,7 @@ import {
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
+const MAX_ENQUEUE_CAS_RETRIES = 128;
 const MAX_RETRY_DELAY_MS = 50;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -482,14 +483,24 @@ export class QueueJournal {
     }
   }
 
-  private invalidate(queueName: ValidQueueName): void {
-    this.cache.delete(queueName);
+  private async refreshAfterContention(
+    queueName: ValidQueueName
+  ): Promise<void> {
+    // A 412 only proves that another writer advanced the record tail. Keep
+    // the materialized queue state and fetch that missing suffix instead of
+    // discarding it and rebuilding from the checkpoint on every collision.
+    // load() already handles a concurrent retention advance by falling back
+    // to the checkpoint cold path after Ursula returns 410.
+    if (this.cache.has(queueName)) {
+      await this.load(queueName);
+    }
   }
 
   /**
    * Uses the local state as an optimistic CAS base. A remote writer can only
    * make this state stale, never unsafe: every transition append carries the
-   * cached record tail and a 412 invalidates the cache before retry.
+   * cached record tail and a 412 incrementally refreshes the missing suffix
+   * before retry.
    */
   private async loadForMutation(
     queueName: ValidQueueName,
@@ -534,7 +545,11 @@ export class QueueJournal {
   ): Promise<MessageId> {
     QueuePayloadSchema.parse(message);
     const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
-    for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < MAX_ENQUEUE_CAS_RETRIES;
+      attempt += 1
+    ) {
       const state = await this.loadForMutation(queueName, {
         createIfMissing: true,
       });
@@ -568,7 +583,7 @@ export class QueueJournal {
         return messageId;
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
-          this.invalidate(queueName);
+          await this.refreshAfterContention(queueName);
           await contentionBackoff(attempt);
           continue;
         }
@@ -666,7 +681,8 @@ export class QueueJournal {
         };
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
-          this.invalidate(queueName);
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(retry);
           continue;
         }
         throw error;
@@ -733,7 +749,8 @@ export class QueueJournal {
         return true;
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
-          this.invalidate(queueName);
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(retry);
           continue;
         }
         throw error;
@@ -831,11 +848,12 @@ export class QueueJournal {
           },
         };
       } catch (error) {
-        this.invalidate(queueName);
         if (
           isUrsulaRequestError(error, 412) ||
           error instanceof TypeError
         ) {
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(retry);
           continue;
         }
         throw error;
@@ -893,7 +911,8 @@ export class QueueJournal {
         return true;
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
-          this.invalidate(queueName);
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(retry);
           continue;
         }
         throw error;
