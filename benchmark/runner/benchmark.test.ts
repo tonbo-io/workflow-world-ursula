@@ -1165,6 +1165,21 @@ interface CapacityLevelResult {
 }
 
 const capacityLevels: CapacityLevelResult[] = [];
+let capacityFailure:
+  | {
+      runCount: number;
+      stepCount: number;
+      startedAt: string;
+      failedAt: string;
+      error: string;
+      backendUsage: {
+        before: BackendMetricsSnapshot | undefined;
+        after: BackendMetricsSnapshot | undefined;
+        delta: Record<string, number> | undefined;
+        derived: Record<string, number> | undefined;
+      };
+    }
+  | undefined;
 
 describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
   beforeAll(async () => {
@@ -1183,15 +1198,34 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
       const before = await captureBackendMetrics();
       const startedAt = new Date().toISOString();
       const wallStart = performance.now();
-      const samples = await runScenario(
-        `${runCount} concurrent x ${CAPACITY_STEP_COUNT} steps`,
-        CAPACITY_ITERATIONS,
-        () => runConcurrentIteration(runCount, CAPACITY_STEP_COUNT),
-        {
-          warmupIterations: 0,
-          extraAttempts: Math.max(1, Math.ceil(CAPACITY_ITERATIONS * 0.5)),
+      const samples: ConcurrentIterationResult[] = [];
+      try {
+        for (let iteration = 0; iteration < CAPACITY_ITERATIONS; iteration++) {
+          samples.push(
+            await runConcurrentIteration(runCount, CAPACITY_STEP_COUNT)
+          );
         }
-      );
+      } catch (error) {
+        const after = await captureBackendMetrics();
+        const delta = diffBackendMetrics(before, after);
+        capacityFailure = {
+          runCount,
+          stepCount: CAPACITY_STEP_COUNT,
+          startedAt,
+          failedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+          backendUsage: {
+            before,
+            after,
+            delta,
+            derived: deriveBackendMetrics(delta),
+          },
+        };
+        console.warn(
+          `[bench] capacity ceiling reached at ${runCount}x${CAPACITY_STEP_COUNT}: ${capacityFailure.error}`
+        );
+        break;
+      }
       const wallClockMs = performance.now() - wallStart;
       const finishedAt = new Date().toISOString();
       const after = await captureBackendMetrics();
@@ -1229,7 +1263,7 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
   });
 
   afterAll(() => {
-    if (capacityLevels.length === 0) return;
+    if (capacityLevels.length === 0 && !capacityFailure) return;
     const appName = process.env.APP_NAME || 'unknown';
     const backend = getBackend();
     const outputPath = path.resolve(
@@ -1252,6 +1286,7 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
         runTimeoutMs: RUN_TIMEOUT_MS,
       },
       levels: capacityLevels,
+      failure: capacityFailure,
     };
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
     console.log(`[bench] Capacity results written to ${outputPath}`);
