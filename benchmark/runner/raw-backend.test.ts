@@ -68,6 +68,7 @@ interface RawResult {
   };
   phases: {
     createAndAppend: Record<string, PhaseResult>;
+    concurrentAppend: Record<string, PhaseResult>;
     sequentialAppend: PhaseResult;
     livePersistToRead: PhaseResult;
     retainedReplay: PhaseResult;
@@ -511,9 +512,14 @@ test(
     const liveSamples = envInt('RAW_LIVE_SAMPLES', 50);
     const replayRecords = envInt('RAW_REPLAY_RECORDS', 1000);
     const replayPayloadBytes = envInt('RAW_REPLAY_PAYLOAD_BYTES', 1024);
-    const coldReplayBytes = envInt('RAW_COLD_REPLAY_BYTES', 10 * 1024 * 1024);
+    const coldReplayBytes = envInt(
+      'RAW_COLD_REPLAY_BYTES',
+      10 * 1024 * 1024,
+      0
+    );
     const payload = repeatedPayload(envInt('RAW_APPEND_PAYLOAD_BYTES', 256));
     const createAndAppend: Record<string, PhaseResult> = {};
+    const concurrentAppend: Record<string, PhaseResult> = {};
     let metricsBefore: BackendMetricsSnapshot | undefined;
     let metricsAfter: BackendMetricsSnapshot | undefined;
 
@@ -536,6 +542,33 @@ test(
         );
         const elapsed = elapsedMs(phaseStart);
         createAndAppend[String(level)] = phase(
+          samples,
+          independentOperations,
+          elapsed,
+          independentOperations * payload.byteLength,
+          backend.transport().requestsOrQueries - transportBefore
+        );
+      }
+
+      for (const level of concurrency) {
+        const streams = Array.from(
+          { length: independentOperations },
+          (_, index) => `${prefix}-warm-append-${level}-${index}`
+        );
+        await runBounded(independentOperations, level, async (index) => {
+          await backend.create(streams[index] ?? '');
+        });
+        const transportBefore = backend.transport().requestsOrQueries;
+        const phaseStart = process.hrtime.bigint();
+        const samples = await runBounded(
+          independentOperations,
+          level,
+          async (index) => {
+            await backend.append(streams[index] ?? '', payload);
+          }
+        );
+        const elapsed = elapsedMs(phaseStart);
+        concurrentAppend[String(level)] = phase(
           samples,
           independentOperations,
           elapsed,
@@ -639,6 +672,7 @@ test(
         },
         phases: {
           createAndAppend,
+          concurrentAppend,
           sequentialAppend: phase(
             sequentialSamples,
             sequentialAppends,
