@@ -1,6 +1,6 @@
 # Workflow backend capacity and cost investigation
 
-Last updated: 2026-07-26 16:50 CST
+Last updated: 2026-07-26 18:10 CST
 
 Status: the Workflow-level capacity sweep and the raw-storage isolation benchmark are complete. The raw benchmark's temporary ARM application node and RDS comparator remain active while the first server-side follow-ups are selected. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
 
@@ -56,6 +56,38 @@ This changes the diagnosis:
 5. Gateway metrics captured through the three-replica ClusterIP are invalid for before/after subtraction because the two samples can hit different pods. Negative gateway deltas from this run are discarded; future automation must aggregate every gateway replica.
 
 At the measured peak and theoretical 100% occupancy, the shared-EKS ARM estimate normalizes to about `$0.025 / 1M` raw warm appends for Ursula, versus `$0.016 / 1M` for the RDS comparator. These are compute-only primitive costs, not Workflow step costs and not a low-volume tenant allocation.
+
+### Standard-append coalescing follow-up: Ursula 0.3.9
+
+Ursula 0.3.9 lets one Raft-group actor collect already-queued ordinary POST appends and commit them as one `GroupWriteCommand::Batch`. Each request keeps its own producer deduplication, CAS, close, and stream-sequence semantics; a single append stays on the original no-wait path. The release was deployed to the same three `m7g.large` ARM voters and rerun from the same isolated application worker. PostgreSQL was rerun immediately afterward, not concurrently.
+
+The first post-upgrade Ursula run was affected by cold gateway leader state. The table uses the second stable Ursula run and the new PostgreSQL run:
+
+| Primitive | Ursula 0.3.9 | PostgreSQL | Result |
+| --- | ---: | ---: | --- |
+| Sequential append p50 / p99 | 3.45 / 5.42 ms | 2.38 / 9.00 ms | PostgreSQL lower p50; Ursula lower p99 in this sample |
+| Warm append, 32 concurrency | 3,020 ops/s | 6,425 ops/s | PostgreSQL 2.13× throughput |
+| Warm append, 128 concurrency | 3,084 ops/s | 6,550 ops/s | PostgreSQL 2.12× throughput |
+| Warm append, 256 concurrency | 3,173 ops/s | 6,645 ops/s | PostgreSQL 2.09× throughput |
+| Live durable write-to-read p50 / p99 | 4.30 / 7.37 ms | 5.14 / 6.38 ms | Ursula lower p50; PostgreSQL lower p99 |
+| 1 MiB retained replay | 7.64 ms | 13.97 ms | Ursula 45.4% faster |
+
+Relative to the 0.3.8 sample, Ursula's warm throughput changed by +20.1% at concurrency 32, +6.6% at 128, and +26.1% at 256. This is a measured run-to-run improvement, but it is not evidence that coalescing caused the whole change:
+
+- only 9 `raft_write_many` calls carrying 21 logical commands appeared across 3,688 accepted appends, so only 0.57% of appends reached the new multi-command path;
+- the 21 logical commands saved only 12 Raft entries, far too little to explain the full throughput delta;
+- gateway leader state, cluster cache warmth, S3 flush overlap, and ordinary run variance remain confounders;
+- the stable result still gives PostgreSQL a consistent approximately 2.1× warm-write throughput advantage.
+
+The trigger rate is low for a structural reason. The benchmark spreads 512 independent requests over 256 Raft groups: at concurrency 128 there are only 0.5 in-flight requests per group on average. The actor drains a command immediately, so two requests rarely coexist in the same group mailbox. More code on the zero-wait drain path will not make batching common.
+
+The next server experiment must therefore be explicit and falsifiable:
+
+1. add an adaptive, bounded coalescing window only when a group/core mailbox already shows contention; do not add delay to the uncontended single-append path;
+2. sweep a small set of windows, such as 25, 50, 100, and 200 microseconds;
+3. report sequential p50/p99, warm c32/c128/c256 throughput, batch-size distribution, and logical-commands-per-Raft-entry;
+4. reject the change if it does not materially raise the batch ratio or if it harms sequential p99 beyond the stated budget;
+5. separately add a hot-group workload, because the current independent-stream test measures broad distribution rather than the queue/run-journal contention that Workflow can create.
 
 ### Raw cold-object evidence
 
@@ -225,15 +257,15 @@ The defensible conclusion is not that Ursula is already universally cheaper than
 - The previous `$0.412 per 100k steps` Ursula and `$0.266 per 100k steps` PostgreSQL figures assumed the single observed throughput point was continuous maximum capacity. That assumption is unproven, so those figures are withdrawn as capacity-normalized results.
 - Ursula already has a real throughput advantage at the tested point, but the very high concurrent TTFS shows that throughput alone hides a scheduling/fairness problem.
 - PostgreSQL's smaller provisioned topology is also lightly loaded. A fair conclusion cannot be “Ursula is expensive because it has three nodes” without measuring how much useful load those nodes sustain.
-- `raft_write_many=0` means the tested workload did not exercise Ursula's server-side mailbox batching path.
+- Ursula 0.3.8 recorded `raft_write_many=0`; Ursula 0.3.9 made the ordinary POST path reachable but batched only 21 of 3,688 appends in the stable raw run.
 - Raw primitive isolation shows that Ursula already beats PostgreSQL for live durable delivery p50 and retained replay, but loses sequential append latency and warm append throughput.
-- Ordinary POST appends cannot reach the current `AppendBatch` coalescing handler. This is an implementation/API gap, not evidence that Raft cannot batch.
+- Ordinary POST appends can now coalesce without weakening producer/CAS semantics, but the zero-wait mailbox drain yields a 0.57% trigger rate under the broad 256-group raw workload.
 - The cold request-cost model previously omitted the near-1:1 `.idx` PUT paired with each `.bin` PUT.
 - Same-stream cold compaction cannot solve the dominant short-stream object distribution.
 
 ### Working hypotheses, not yet proven
 
-1. Extending the batch endpoint with producer deduplication and per-entry CAS, then adopting it in the adapter, should close part of the 2.2–2.6× warm-write throughput gap.
+1. An adaptive, bounded server-side coalescing window may raise the batch ratio without changing the protocol, but it must beat the current approximately 2.1× PostgreSQL throughput gap without regressing uncontended latency.
 2. Deterministic gateway routing or a complete group-leader map should primarily improve new-stream and cold-route traffic; it cannot by itself explain the remaining warm-append gap.
 3. Ursula's useful Workflow capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate voter CPU saturation.
 4. A group-level packfile should reduce S3 PUT cost by orders of magnitude, but its read amplification, shared-object GC, and failure atomicity must be benchmarked rather than assumed.
@@ -318,6 +350,11 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Recover coarse CloudWatch CPU for both completed runs.
 - [x] Identify that the previous cost-per-throughput calculation used an unsaturated load point.
 - [x] Finish the capacity-only harness and type-check it.
+- [x] Run raw Ursula and PostgreSQL primitives from the same ARM EKS application worker.
+- [x] Make ordinary producer/CAS-safe POST appends eligible for same-group Raft batching and deploy Ursula 0.3.9.
+- [x] Rerun the raw comparison and measure the actual coalescing trigger rate.
+- [ ] Add an adaptive bounded coalescing-window experiment with batch-size distribution.
+- [ ] Add a hot-group raw workload that complements the 256-group independent-stream workload.
 - [x] Commit and merge the harness through GitHub; use Depot-published `main-ursula` and `main-postgres` images.
 - [x] Restore isolated application capacity and RDS Multi-AZ temporarily.
 - [x] Run identical Ursula and PostgreSQL sweeps with exact per-level time windows.
