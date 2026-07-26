@@ -98,15 +98,6 @@ spec:
       nodeSelector:
         kubernetes.io/arch: arm64
         workflow-benchmark-role: app
-      initContainers:
-        - name: fetch-rds-ca
-          image: public.ecr.aws/docker/library/alpine:3.22
-          command: [/bin/sh, -ec]
-          args:
-            - wget -qO /rds-ca/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-          volumeMounts:
-            - name: rds-ca
-              mountPath: /rds-ca
       containers:
         - name: runner
           image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
@@ -163,11 +154,6 @@ spec:
           volumeMounts:
             - name: results
               mountPath: /results
-            - name: rds-ca
-              mountPath: /etc/ssl/rds
-              readOnly: true
       volumes:
         - name: results
-          emptyDir: {}
-        - name: rds-ca
           emptyDir: {}
