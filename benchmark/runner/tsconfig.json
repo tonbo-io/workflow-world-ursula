@@ -5,6 +5,6 @@
     "rootDir": ".",
     "types": ["node", "vitest/globals"]
   },
-  "include": ["benchmark.test.ts"],
+  "include": ["benchmark.test.ts", "raw-backend.test.ts"],
   "exclude": []
 }
