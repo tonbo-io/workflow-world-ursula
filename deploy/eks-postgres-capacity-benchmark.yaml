@@ -72,6 +72,8 @@ spec:
               value: "20"
             - name: BENCH_CAPACITY_ITERATIONS
               value: "1"
+            - name: BENCH_CAPACITY_QUEUE_SHARDS
+              value: "8"
             - name: BENCH_RUN_TIMEOUT_MS
               value: "600000"
             - name: BENCH_OUTPUT_FILE

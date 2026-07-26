@@ -132,6 +132,10 @@ const CONCURRENT_STEP_COUNT = envInt('BENCH_CONCURRENT_STEP_COUNT', 50);
 const CAPACITY_ONLY = process.env.BENCH_CAPACITY_ONLY === '1';
 const CAPACITY_STEP_COUNT = envInt('BENCH_CAPACITY_STEP_COUNT', 20);
 const CAPACITY_ITERATIONS = envInt('BENCH_CAPACITY_ITERATIONS', 1);
+const CAPACITY_QUEUE_SHARDS = envInt('BENCH_CAPACITY_QUEUE_SHARDS', 1);
+if (CAPACITY_QUEUE_SHARDS > 8) {
+  throw new Error('BENCH_CAPACITY_QUEUE_SHARDS cannot exceed 8');
+}
 const CAPACITY_RUN_COUNTS = (
   process.env.BENCH_CAPACITY_RUN_COUNTS ?? '25,50,100,250,500'
 )
@@ -568,11 +572,22 @@ async function runCatchupIteration(
 
 async function runConcurrentIteration(
   runCount = CONCURRENT_RUN_COUNT,
-  stepCount = CONCURRENT_STEP_COUNT
+  stepCount = CONCURRENT_STEP_COUNT,
+  queueShards = 1
 ): Promise<ConcurrentIterationResult> {
+  const workflowNames = [
+    'benchSequentialStepsWorkflow',
+    'benchSequentialStepsWorkflow1',
+    'benchSequentialStepsWorkflow2',
+    'benchSequentialStepsWorkflow3',
+    'benchSequentialStepsWorkflow4',
+    'benchSequentialStepsWorkflow5',
+    'benchSequentialStepsWorkflow6',
+    'benchSequentialStepsWorkflow7',
+  ].slice(0, queueShards);
   const triggers = await Promise.all(
-    Array.from({ length: runCount }, () =>
-      triggerBenchRun('benchSequentialStepsWorkflow', [stepCount])
+    Array.from({ length: runCount }, (_, index) =>
+      triggerBenchRun(workflowNames[index % workflowNames.length], [stepCount])
     )
   );
   const completed = await Promise.all(
@@ -1202,7 +1217,11 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
       try {
         for (let iteration = 0; iteration < CAPACITY_ITERATIONS; iteration++) {
           samples.push(
-            await runConcurrentIteration(runCount, CAPACITY_STEP_COUNT)
+            await runConcurrentIteration(
+              runCount,
+              CAPACITY_STEP_COUNT,
+              CAPACITY_QUEUE_SHARDS
+            )
           );
         }
       } catch (error) {
@@ -1283,6 +1302,7 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
         runCounts: CAPACITY_RUN_COUNTS,
         stepCount: CAPACITY_STEP_COUNT,
         iterations: CAPACITY_ITERATIONS,
+        queueShards: CAPACITY_QUEUE_SHARDS,
         runTimeoutMs: RUN_TIMEOUT_MS,
       },
       levels: capacityLevels,
