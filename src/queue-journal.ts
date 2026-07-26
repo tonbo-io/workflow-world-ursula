@@ -436,6 +436,14 @@ export class QueueJournal {
     transitions: readonly QueueTransition[],
     operationId: string
   ): Promise<void> {
+    // Freeze the optimistic base before joining the local append queue.
+    // Another mutation may have derived a conflicting transition from this
+    // same state and commit while we wait. Reusing its newer tail here would
+    // make our stale transition look valid to Ursula and could persist a
+    // lease/ack for a message that the earlier transition already removed.
+    // Keeping the original tail forces a 412 so the caller reloads and
+    // re-evaluates the transition against the committed state.
+    const expectedRecord = state.nextRecord;
     const previousTurn = this.appendTurns.get(queueName);
     let releaseTurn = () => {};
     const currentTurn = new Promise<void>((resolve) => {
@@ -444,7 +452,6 @@ export class QueueJournal {
     this.appendTurns.set(queueName, currentTurn);
     if (previousTurn) await previousTurn;
     try {
-      const expectedRecord = state.nextRecord;
       await this.client.append(queueStream(queueName), transitions, {
         operationId,
         expectedRecord,
