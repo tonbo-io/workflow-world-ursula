@@ -446,6 +446,27 @@ describe('QueueJournal', () => {
     expect(memory.readAllStarts).toEqual([]);
   });
 
+  it('rejects a stale local transition after an earlier queued mutation commits', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(memory as unknown as UrsulaClient);
+    await journal.enqueue(queueName, { runId: 'same-run', step: 0 });
+    const lease = await journal.claim(queueName, new Date(), 10_000);
+    if (!lease) throw new Error('expected queue lease');
+    memory.yieldBeforeAppend = true;
+
+    const [acked, extended] = await Promise.all([
+      journal.ack(queueName, lease),
+      journal.extend(queueName, lease, new Date(Date.now() + 20_000)),
+    ]);
+
+    expect(acked).toBe(true);
+    expect(extended).toBe(false);
+    await journal.enqueue(queueName, { runId: 'next-run', step: 1 });
+    await expect(
+      journal.claim(queueName, new Date(), 10_000)
+    ).resolves.not.toBeNull();
+  });
+
   it('retries a cold rebuild when retention advances after checkpoint read', async () => {
     const memory = new MemoryClient();
     const writer = new QueueJournal(memory as unknown as UrsulaClient);
