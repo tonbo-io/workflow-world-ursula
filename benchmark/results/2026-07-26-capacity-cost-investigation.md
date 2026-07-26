@@ -1,6 +1,6 @@
 # Workflow backend capacity and cost investigation
 
-Last updated: 2026-07-26 18:10 CST
+Last updated: 2026-07-26 23:53 CST
 
 Status: the Workflow-level capacity sweep and the raw-storage isolation benchmark are complete. The raw benchmark's temporary ARM application node and RDS comparator remain active while the first server-side follow-ups are selected. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
 
@@ -298,13 +298,25 @@ This table is backend-only: the two shared ARM application nodes are common to b
 
 | Backend | Fixed compute/storage per 1M steps | Request cost per 1M steps | First-month retained bytes | Measured first-month total |
 | --- | ---: | ---: | ---: | ---: |
-| Ursula, shared EKS, `3 × m7g.large` | $0.586 | $2.265 data/index PUTs + $0.046 snapshot PUTs | 3.91 GB, about $0.090 | **$2.986** |
+| Ursula 0.3.13, shared EKS, `3 × m7g.large` | $0.586 | $2.265 data/index PUTs + $0.046 snapshot PUTs | 3.91 GB, about $0.090 | **$2.986** |
+| Ursula 0.3.14/0.3.15 group packing, same topology | $0.581 | $0.062 all PUTs | 2.43 GB, about $0.056 | **$0.699** |
 | PostgreSQL Multi-AZ `db.m7g.large` + 100 GiB gp3 | $1.099 | Included in provisioned gp3 baseline | Included in the fixed 100 GiB allocation | **$1.099** plus backup/transfer |
 | Managed World public step charge | — | — | Storage and function charges excluded | **$25.00** |
 
-Ursula now beats PostgreSQL on the measured backend compute component by 46.7%, but still loses total cost by 2.7× because of S3 PUT amplification. The eight-queue sweep produced 38,500 logical steps and 17,440 versioned cold objects: 8,720 `.bin` PUTs and 8,720 `.idx` PUTs. Snapshot activity added 352 PUTs. The retained `.bin` objects averaged only 14.8 KiB (`p50 13.5 KiB`, `p90 31.5 KiB`, `p99 59.6 KiB`), so same-stream compaction is not solving the dominant short-stream distribution.
+The 0.3.13 baseline beat PostgreSQL on the measured backend compute component by 46.7%, but lost total cost by 2.7× because of S3 PUT amplification. Its eight-queue sweep produced 38,500 logical steps and 17,440 versioned cold objects: 8,720 `.bin` PUTs and 8,720 `.idx` PUTs. Snapshot activity added 352 PUTs. The retained `.bin` objects averaged only 14.8 KiB (`p50 13.5 KiB`, `p90 31.5 KiB`, `p99 59.6 KiB`), so same-stream compaction could not solve the dominant short-stream distribution.
 
-If cross-stream packing reduced data and index request volume from approximately 452,987 PUTs per million steps to roughly one 8 MiB pack PUT per 8 MiB of payload plus bounded metadata, the measured Ursula total would move close to its `$0.59/M` compute floor and become materially cheaper than this RDS comparator. That is now the highest-leverage cost optimization.
+Ursula 0.3.14 replaced the snapshot driver's forced partial cold flushes with group-scoped packing. The same 38,500-step workload ran at 117.1 steps/s with a 159.445-second 1,000-run p99, versus 116.1 steps/s and 160.959 seconds on 0.3.13. During the exact job window, S3 recorded no `.bin` or `.idx` versions: the 129 MB workload was spread over 256 groups and no group reached the 8 MiB pack threshold. The bounded hot tails were instead persisted in 239 group snapshots plus 239 reference updates:
+
+| 0.3.14 workload object class | Versions | Bytes | Average | p50 | p90 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Snapshot | 239 | 93,483,227 | 391.1 KiB | 354.9 KiB | 698.2 KiB | 1.03 MiB |
+| Reference | 239 | 38,843 | 163 B | 163 B | 163 B | 164 B |
+
+That is 478 PUTs rather than 17,792, a 97.3% reduction. At the same public S3 prices it is `$0.062/M` steps in PUTs and 2.43 GB, or about `$0.056/M` steps for the first retained month. Including measured ARM voter compute, the backend total is approximately `$0.699/M` steps, 36.4% below the `$1.099/M` RDS comparator before the exclusions shared by this table.
+
+A same-group canary then forced the actual pack path with 48 streams and 12 MiB of payload. Ursula 0.3.14 produced one 8 MiB pack but also 32 tiny `.idx` pages. The cause was a production-path mismatch: the in-memory engine skipped index pages for shared slices, while the OpenRaft engine wrote them unconditionally. Ursula 0.3.15 fixed that path and added a three-node regression test. The repeated canary, combined with the previous group's 4 MiB hot tail, produced exactly two 8 MiB packs, zero `.idx` objects, and successful readback from every sampled stream.
+
+This validates both intended regimes: sparse groups pay bounded snapshot writes instead of one PUT per tiny stream, while busy groups converge on 8 MiB cross-stream data objects without per-slice index PUTs. The remaining storage-cost question is whether long-running snapshot and reference version churn stays bounded under continuous mixed load; it needs a multi-hour soak rather than another short capacity run.
 
 ### Benchmark infrastructure caveats
 
@@ -325,13 +337,15 @@ The temporary managed node group also attached only the EKS cluster security gro
 - Ordinary POST appends can now coalesce without weakening producer/CAS semantics, but the zero-wait mailbox drain yields a 0.57% trigger rate under the broad 256-group raw workload.
 - The cold request-cost model previously omitted the near-1:1 `.idx` PUT paired with each `.bin` PUT.
 - Same-stream cold compaction cannot solve the dominant short-stream object distribution.
+- Group-scoped packing reduces the measured Workflow PUT count by 97.3% without regressing the saturated throughput point.
+- The production OpenRaft pack path now creates 8 MiB shared objects without per-stream `.idx` pages; a static three-node test protects this distinction.
 
 ### Working hypotheses, not yet proven
 
 1. An adaptive, bounded server-side coalescing window may raise the batch ratio without changing the protocol, but it must beat the current approximately 2.1× PostgreSQL throughput gap without regressing uncontended latency.
 2. Deterministic gateway routing or a complete group-leader map should primarily improve new-stream and cold-route traffic; it cannot by itself explain the remaining warm-append gap.
 3. Ursula's useful Workflow capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate voter CPU saturation.
-4. A group-level packfile should reduce S3 PUT cost by orders of magnitude, but its read amplification, shared-object GC, and failure atomicity must be benchmarked rather than assumed.
+4. Snapshot/reference version churn may become the next S3 cost floor during a continuous mixed workload even though short-run data/index PUT amplification is removed.
 
 ### Single hot-queue capacity probe
 
@@ -430,11 +444,12 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Isolate raw create, append, live-delivery, and replay primitives from the World adapter.
 - [x] Correct the S3 request model to include cold index-page PUTs.
 - [ ] Extend append-batch with producer deduplication and per-entry CAS, adopt it in the adapter, and rerun warm append.
-- [ ] Add a cross-stream group packfile targeting approximately 8 MiB objects, including safe shared-object GC.
+- [x] Add a cross-stream group packfile targeting approximately 8 MiB objects, including safe shared-object GC.
 - [ ] Aggregate gateway metrics replica-by-replica and rerun route attribution.
 - [ ] Force a cold-cache miss via leadership transfer and measure real S3 replay.
 - [x] Remove the queue enqueue-CAS admission ceiling and rerun the 1,000-run Ursula level.
-- [ ] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
+- [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
+- [ ] Run a multi-hour mixed-load soak and measure snapshot/reference version churn, pack fill ratio, and shared-pack GC.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.
 - [x] Publish the ARM comparison after the right-sized topology and queue fix are measured.
 - [ ] Destroy the current raw-benchmark RDS and temporary application node after the first optimization target is chosen; verify the canary returns to 3/3 ready Ursula voters.
@@ -452,6 +467,8 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`ursula-v0313-capacity-hot-queuefix.json`](./ursula-v0313-capacity-hot-queuefix.json)
 - [`ursula-v0313-capacity-hot-casfix.json`](./ursula-v0313-capacity-hot-casfix.json)
 - [`ursula-v0313-capacity-sharded-casfix.json`](./ursula-v0313-capacity-sharded-casfix.json)
+- [`ursula-v0314-capacity-pack.json`](./ursula-v0314-capacity-pack.json)
+- [`ursula-v0314-v0315-s3-inventory.json`](./ursula-v0314-v0315-s3-inventory.json)
 - [`postgres-rds-capacity-arm-pool66-failure.json`](./postgres-rds-capacity-arm-pool66-failure.json)
 - [`postgres-rds-capacity-arm-pool32.json`](./postgres-rds-capacity-arm-pool32.json)
 - [`2026-07-26-eks-comparison.md`](./2026-07-26-eks-comparison.md)
