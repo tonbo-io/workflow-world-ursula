@@ -22,6 +22,10 @@ import { randomUUID } from 'node:crypto';
 import { Client, type Notification, Pool } from 'pg';
 import { test } from 'vitest';
 import {
+  findStreamForGroup,
+  raftGroupForStream,
+} from './ursula-placement.js';
+import {
   type BackendMetricsSnapshot,
   captureBackendMetrics,
   deriveBackendMetrics,
@@ -65,6 +69,8 @@ interface RawResult {
     replayRecords: number;
     replayPayloadBytes: number;
     coldReplayBytes: number;
+    ursulaGroupCount?: number;
+    ursulaTargetGroup?: number;
   };
   phases: {
     createAndAppend: Record<string, PhaseResult>;
@@ -103,6 +109,16 @@ interface RawBackend {
 function envInt(name: string, fallback: number, min = 1): number {
   const raw = process.env[name];
   if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new Error(`Invalid ${name}: ${raw}`);
+  }
+  return value;
+}
+
+function optionalEnvInt(name: string, min: number): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
   const value = Number.parseInt(raw, 10);
   if (!Number.isSafeInteger(value) || value < min) {
     throw new Error(`Invalid ${name}: ${raw}`);
@@ -186,6 +202,61 @@ function repeatedPayload(bytes: number): Uint8Array {
     payload[index] = 32 + (index % 95);
   }
   return payload;
+}
+
+class StreamNameFactory {
+  readonly groupCount?: number;
+  readonly targetGroup?: number;
+  private nonce = 0;
+
+  constructor(
+    private readonly backend: BackendKind,
+    private readonly prefix: string
+  ) {
+    this.groupCount = optionalEnvInt('RAW_URSULA_GROUP_COUNT', 1);
+    this.targetGroup = optionalEnvInt('RAW_URSULA_TARGET_GROUP', 0);
+    if (this.groupCount === undefined && this.targetGroup !== undefined) {
+      throw new Error(
+        'RAW_URSULA_GROUP_COUNT is required with RAW_URSULA_TARGET_GROUP'
+      );
+    }
+    if (
+      this.groupCount !== undefined &&
+      this.targetGroup !== undefined &&
+      this.targetGroup >= this.groupCount
+    ) {
+      throw new Error(
+        `RAW_URSULA_TARGET_GROUP ${this.targetGroup} must be below RAW_URSULA_GROUP_COUNT ${this.groupCount}`
+      );
+    }
+  }
+
+  name(label: string, index = 0): string {
+    const base = `${this.prefix}-${label}-${index}`;
+    if (
+      this.backend !== 'ursula' ||
+      this.groupCount === undefined ||
+      this.targetGroup === undefined
+    ) {
+      return base;
+    }
+    const bucket = process.env.RAW_URSULA_BUCKET ?? 'workflow-raw-benchmark';
+    const placed = findStreamForGroup(
+      bucket,
+      base,
+      this.groupCount,
+      this.targetGroup,
+      this.nonce
+    );
+    this.nonce = placed.nextNonce;
+    if (
+      raftGroupForStream(bucket, placed.stream, this.groupCount) !==
+      this.targetGroup
+    ) {
+      throw new Error('Generated Ursula stream has the wrong placement');
+    }
+    return placed.stream;
+  }
 }
 
 class UrsulaRawBackend implements RawBackend {
@@ -498,6 +569,7 @@ test(
     const backend = backendFromEnvironment();
     const startedAt = new Date().toISOString();
     const prefix = `raw-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const streamNames = new StreamNameFactory(backend.kind, prefix);
     const sequentialAppends = envInt('RAW_SEQUENTIAL_APPENDS', 200);
     const independentOperations = envInt('RAW_INDEPENDENT_OPERATIONS', 256);
     const concurrency = (process.env.RAW_CONCURRENCY ?? '1,32,128')
@@ -535,7 +607,7 @@ test(
           level,
           async (index) => {
             await backend.createAndAppend(
-              `${prefix}-independent-${level}-${index}`,
+              streamNames.name(`independent-${level}`, index),
               payload
             );
           }
@@ -553,7 +625,7 @@ test(
       for (const level of concurrency) {
         const streams = Array.from(
           { length: independentOperations },
-          (_, index) => `${prefix}-warm-append-${level}-${index}`
+          (_, index) => streamNames.name(`warm-append-${level}`, index)
         );
         await runBounded(independentOperations, level, async (index) => {
           await backend.create(streams[index] ?? '');
@@ -577,7 +649,7 @@ test(
         );
       }
 
-      const sequentialStream = `${prefix}-sequential`;
+      const sequentialStream = streamNames.name('sequential');
       await backend.create(sequentialStream);
       const sequentialTransportBefore =
         backend.transport().requestsOrQueries;
@@ -596,14 +668,14 @@ test(
       const liveValues: number[] = [];
       for (let index = 0; index < liveSamples; index += 1) {
         liveValues.push(
-          await backend.measureLive(`${prefix}-live-${index}`, payload)
+          await backend.measureLive(streamNames.name('live', index), payload)
         );
       }
       const liveElapsed = elapsedMs(liveStart);
       const liveTransportOperations =
         backend.transport().requestsOrQueries - liveTransportBefore;
 
-      const replayStream = `${prefix}-replay`;
+      const replayStream = streamNames.name('replay');
       const replayPayload = repeatedPayload(replayPayloadBytes);
       await backend.create(replayStream);
       for (let index = 0; index < replayRecords; index += 1) {
@@ -619,7 +691,7 @@ test(
 
       let coldCandidateReplay: PhaseResult | undefined;
       if (backend.kind === 'ursula' && coldReplayBytes > 0) {
-        const coldStream = `${prefix}-cold`;
+        const coldStream = streamNames.name('cold');
         const coldChunk = repeatedPayload(
           Math.min(256 * 1024, coldReplayBytes)
         );
@@ -669,6 +741,12 @@ test(
           replayRecords,
           replayPayloadBytes,
           coldReplayBytes,
+          ...(streamNames.groupCount === undefined
+            ? {}
+            : {
+                ursulaGroupCount: streamNames.groupCount,
+                ursulaTargetGroup: streamNames.targetGroup,
+              }),
         },
         phases: {
           createAndAppend,

@@ -1,0 +1,78 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workflow-raw-ursula-group-density
+  namespace: workflow-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: workflow-raw-ursula-group-density
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        workflow-benchmark-role: app
+      containers:
+        - name: runner
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              node node_modules/vitest/vitest.mjs run \
+                benchmark/runner/raw-backend.test.ts \
+                --reporter=verbose
+              printf 'RAW_BENCH_RESULT_BASE64='
+              base64 -w 0 "$RAW_BENCH_OUTPUT_FILE"
+              printf '\n'
+          env:
+            - name: RAW_BENCH_BACKEND
+              value: ursula
+            - name: RAW_BENCH_LABEL
+              value: ursula-eks-arm64-memory-wal-groups-64
+            - name: RAW_URSULA_URL
+              value: http://ursula-perf-gateway.ursula-perf.svc.cluster.local:4437
+            - name: RAW_URSULA_BUCKET
+              value: workflow-raw-group-density
+            - name: RAW_URSULA_GROUP_COUNT
+              value: "64"
+            - name: RAW_BENCH_OUTPUT_FILE
+              value: /results/raw-ursula-group-density.json
+            - name: RAW_CONCURRENCY
+              value: "1,32,128,256"
+            - name: RAW_INDEPENDENT_OPERATIONS
+              value: "2048"
+            - name: RAW_SEQUENTIAL_APPENDS
+              value: "500"
+            - name: RAW_LIVE_SAMPLES
+              value: "100"
+            - name: RAW_REPLAY_RECORDS
+              value: "1000"
+            - name: RAW_REPLAY_PAYLOAD_BYTES
+              value: "1024"
+            - name: RAW_COLD_REPLAY_BYTES
+              value: "0"
+            - name: RAW_BENCH_TIMEOUT_MS
+              value: "1800000"
+            - name: WORKFLOW_URSULA_METRICS_URLS
+              value: >-
+                http://ursula-perf-0.ursula-perf-headless.ursula-perf.svc.cluster.local:4437/__ursula/metrics,
+                http://ursula-perf-1.ursula-perf-headless.ursula-perf.svc.cluster.local:4437/__ursula/metrics,
+                http://ursula-perf-2.ursula-perf-headless.ursula-perf.svc.cluster.local:4437/__ursula/metrics
+            - name: WORKFLOW_URSULA_GATEWAY_METRICS_URL
+              value: http://ursula-perf-gateway.ursula-perf.svc.cluster.local:4437/__ursula/gateway/metrics
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}

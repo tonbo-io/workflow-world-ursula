@@ -1,0 +1,59 @@
+global:
+  image:
+    repository: ghcr.io/tonbo-io/ursula
+    tag: 0.3.15
+    pullPolicy: IfNotPresent
+
+fullnameOverride: ursula-perf
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+
+server:
+  replicaCount: 3
+  podManagementPolicy: Parallel
+  coreCount: 2
+  resources:
+    requests:
+      cpu: 1500m
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+  podDisruptionBudget:
+    enabled: false
+  scheduling:
+    nodeSelector:
+      workflow-benchmark-role: app
+
+raft:
+  # The sweep overrides this with --set raft.groupCount=16|32|64|256.
+  groupCount: 64
+  initMembership: false
+  initMembershipPerGroup: true
+  storageMode: memory
+
+persistence:
+  enabled: false
+
+coldStorage:
+  enabled: false
+
+snapshotStore:
+  backend: inline
+
+gateway:
+  enabled: true
+  replicaCount: 1
+  podDisruptionBudget:
+    enabled: false
+  scheduling:
+    nodeSelector:
+      workflow-benchmark-role: app
+
+indexer:
+  enabled: false
+
+tests:
+  enabled: false
