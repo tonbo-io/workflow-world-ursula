@@ -26,7 +26,9 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
-              pnpm --filter workflow-benchmark-runner benchmark:raw
+              node node_modules/vitest/vitest.mjs run \
+                benchmark/runner/raw-backend.test.ts \
+                --reporter=verbose
               printf 'RAW_BENCH_RESULT_BASE64='
               base64 -w 0 "$RAW_BENCH_OUTPUT_FILE"
               printf '\n'
@@ -112,7 +114,9 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
-              pnpm --filter workflow-benchmark-runner benchmark:raw
+              node node_modules/vitest/vitest.mjs run \
+                benchmark/runner/raw-backend.test.ts \
+                --reporter=verbose
               printf 'RAW_BENCH_RESULT_BASE64='
               base64 -w 0 "$RAW_BENCH_OUTPUT_FILE"
               printf '\n'
