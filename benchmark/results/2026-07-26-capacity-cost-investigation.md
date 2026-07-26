@@ -1,6 +1,6 @@
 # Workflow backend capacity and cost investigation
 
-Last updated: 2026-07-26
+Last updated: 2026-07-26 13:10 CST
 
 Status: in progress. The existing `100 concurrent × 50 steps` result is a load point, not a measured saturation point. Any cost per 100,000 steps derived by dividing fixed monthly cost by that throughput is provisional and must not be used as a capacity-normalized conclusion.
 
@@ -108,6 +108,20 @@ These observations prove that neither backend was CPU-saturated at the measured 
 4. Ursula's useful capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate CPU saturation.
 5. The three-node availability floor makes a dedicated low-volume Ursula cluster look expensive; shared nodes, smaller Graviton voters, or multiple tenants amortizing the cluster could improve economics, but these are deployment alternatives and must not be presented as measured results.
 
+### First capacity probe
+
+A first Ursula probe used eight application replicas on two isolated `m6i.xlarge` app nodes. These numbers are provisional because the app still pointed at the retained benchmark bucket from the previous round and the runner was stopped at the first failed 500-concurrency attempt:
+
+| Concurrent runs × steps | Throughput | Run duration p99 | Result |
+| --- | ---: | ---: | --- |
+| 25 × 20 | 63.6 steps/s | 7.776 s | completed |
+| 50 × 20 | 74.6 steps/s | 13.317 s | completed |
+| 100 × 20 | 59.3 steps/s | 33.444 s | completed |
+| 250 × 20 | 76.5 steps/s | 64.242 s | completed |
+| 500 × 20 | n/a | n/a | trigger failed with queue enqueue contention |
+
+This already proves that the old 46.7 steps/s point was not Ursula's maximum throughput. It also identifies the first production-facing ceiling: at an instantaneous 500-run burst, `queue()` returned HTTP 500 because the shared workflow queue remained contended during enqueue. Some triggers had already succeeded before `Promise.all` rejected, so retrying that level would contaminate the measurement. The harness is being changed to record the failed level and stop without retrying; the clean run will use a fresh Ursula bucket.
+
 ## Capacity sweep methodology
 
 The benchmark harness is being extended with an isolated `BENCH_CAPACITY_ONLY=1` mode. It will run increasing concurrent workflow counts with a fixed step count and record an exact time window plus backend counters for every level.
@@ -169,7 +183,7 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Establish the same-EKS Ursula and PostgreSQL functional/latency baseline.
 - [x] Recover coarse CloudWatch CPU for both completed runs.
 - [x] Identify that the previous cost-per-throughput calculation used an unsaturated load point.
-- [ ] Finish the capacity-only harness and type-check it.
+- [x] Finish the capacity-only harness and type-check it.
 - [ ] Commit and merge the harness through GitHub; use Depot-published `main-ursula` and `main-postgres` images.
 - [ ] Restore isolated application capacity and RDS Multi-AZ temporarily.
 - [ ] Run identical Ursula and PostgreSQL sweeps with exact per-level time windows.
