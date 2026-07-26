@@ -1,8 +1,8 @@
 # Workflow backend capacity and cost investigation
 
-Last updated: 2026-07-26 14:05 CST
+Last updated: 2026-07-26 16:50 CST
 
-Status: measurement, first-pass analysis, publication, and temporary infrastructure cleanup are complete. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
+Status: the Workflow-level capacity sweep and the raw-storage isolation benchmark are complete. The raw benchmark's temporary ARM application node and RDS comparator remain active while the first server-side follow-ups are selected. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
 
 ## Goal
 
@@ -27,6 +27,51 @@ The comparison must answer three different questions:
 Application compute is common to both backends and is excluded from backend price comparisons, but its CPU and memory must still be sampled to prove it did not become the load generator bottleneck.
 
 ## Numbers obtained so far
+
+### Raw storage primitives: core versus adapter
+
+The raw runner bypasses Workflow and both World adapters. It ran from one isolated `m7g.xlarge` ARM EKS worker in the same VPC against:
+
+- Ursula 0.3.8 on three `m7g.large` ARM voters, 256 Raft groups, memory WAL, and S3 cold storage;
+- RDS PostgreSQL 17.9 Multi-AZ on `db.m7g.large`, 100 GiB gp3, using a fixed pool of 32 warm TLS connections.
+
+Every timed write is one request/query and one 256-byte payload. `create + first append` measures a new stream. `Warm append` pre-creates the streams outside the timed window and then issues ordinary POST/INSERT operations. PostgreSQL live delivery performs `INSERT + pg_notify` atomically and reads the committed row after the notification; the notification alone is not treated as durable data.
+
+| Primitive | Ursula | PostgreSQL | Result |
+| --- | ---: | ---: | --- |
+| Sequential append p50 / p99 | 3.41 / 4.50 ms | 2.52 / 2.91 ms | PostgreSQL lower latency |
+| New stream + first payload, 128 concurrency | 1,499 ops/s | 6,762 ops/s | PostgreSQL 4.5× throughput |
+| Warm append, 32 concurrency | 2,514 ops/s | 6,584 ops/s | PostgreSQL 2.6× throughput |
+| Warm append, 128 concurrency | 2,892 ops/s | 6,462 ops/s | PostgreSQL 2.2× throughput |
+| Warm append, 256 concurrency | 2,516 ops/s | 6,578 ops/s | PostgreSQL 2.6× throughput |
+| Live durable write-to-read p50 / p99 | 4.17 / 6.96 ms | 5.37 / 7.09 ms | Ursula lower p50, similar p99 |
+| 1 MiB retained replay | 7.81 ms | 12.55 ms | Ursula 37.8% faster |
+
+This changes the diagnosis:
+
+1. Ursula's streaming read path is not intrinsically slower. It wins the live-delivery p50 and retained replay comparison.
+2. PostgreSQL still wins the durable write path. Even after removing stream creation and warming routing, its steady 32-connection throughput is about 2.2–2.6× Ursula's.
+3. Warming Ursula streams raises peak throughput from about 1.5k to 2.9k appends/s, proving that first-write routing and stream creation explain roughly half the original gap.
+4. `raft_write_many_batches` remains zero under 128/256 concurrent ordinary POSTs. Code inspection confirms that the group actor coalesces only `AppendBatch` commands; standard POST uses the single-append handler. The server's main batching lever is therefore unreachable to correctness-sensitive adapter writes because the current batch endpoint lacks producer deduplication and CAS headers.
+5. Gateway metrics captured through the three-replica ClusterIP are invalid for before/after subtraction because the two samples can hit different pods. Negative gateway deltas from this run are discarded; future automation must aggregate every gateway replica.
+
+At the measured peak and theoretical 100% occupancy, the shared-EKS ARM estimate normalizes to about `$0.025 / 1M` raw warm appends for Ursula, versus `$0.016 / 1M` for the RDS comparator. These are compute-only primitive costs, not Workflow step costs and not a low-volume tenant allocation.
+
+### Raw cold-object evidence
+
+The Ursula run uploaded 12,187,648 data bytes through 2,152 cold flushes. S3 contained:
+
+| Object class | Count | Bytes | Average |
+| --- | ---: | ---: | ---: |
+| `.bin` payload | 2,152 | 12,187,648 | 5,663 B |
+| `.idx` cold-index page | 2,151 | 705,713 | 328 B |
+| Total | 4,303 | 12,893,361 | 2,996 B |
+
+Across all objects, p50 was 305 B, p99 was 331 B, and the maximum was 8 MiB. The configured `flush_min_hot_size` is already 8 MiB, but once a Raft group's aggregate hot bytes reaches the group threshold, the fallback planner drains individual streams with a one-byte minimum. The benchmark's many 256-byte streams therefore become individual S3 objects.
+
+Existing cold compaction cannot repair this distribution: it only combines two or more contiguous undersized chunks from the same stream. A short stream with one small chunk is never eligible. Reaching an approximately 8 MiB object target for Workflow requires a group-level cross-stream packfile (with per-stream segment offsets and shared-object GC), not another increase to the same-stream compaction target.
+
+The attempted 10 MiB cold replay completed in 502 ms, but `cold_store_reads=0`; it hit the cold read cache populated by the writer and is not reported as an S3 cold-read result.
 
 ### User-visible latency
 
@@ -152,23 +197,23 @@ The measured Ursula peak of 2.50 aggregate voter cores and 4.6 GiB does not just
 | RDS Multi-AZ `db.m7g.large` | $0.257 | $0.129 | $0.096 |
 | Managed World step charge | $2.500 | $2.500 | $2.500 |
 
-At Ursula's 100-run useful-capacity point, 347 cold uploads were issued for 2,000 logical steps: 17,350 PUTs per 100,000 steps, or about `$0.087 / 100k` at `$0.005 / 1,000 PUTs`. The uploaded objects averaged only 20.8 KiB, so request cost is material and the cold-object packing work remains economically important.
+At Ursula's 100-run useful-capacity point, 347 data uploads were issued for 2,000 logical steps. The earlier estimate treated each data-upload counter increment as the only PUT and reported `$0.087 / 100k` at `$0.005 / 1,000 PUTs`. The raw S3 inventory proves that nearly every `.bin` upload also rewrites one `.idx` page. The corrected request-cost lower bound is therefore approximately `$0.174 / 100k`, before snapshots, object versions, and other metadata writes. The uploaded data objects averaged only 20.8 KiB, so request cost is material and cross-stream packing is required.
 
 At 60% utilization, including that observed PUT ratio:
 
 | Backend/topology | Fixed | Observed PUT estimate | Current total |
 | --- | ---: | ---: | ---: |
-| Ursula current x86, shared EKS | $0.236 | $0.087 | $0.323 |
-| Ursula estimated 3 × `m7g.large`, shared EKS | $0.104 | $0.087 | $0.191 |
-| Ursula estimated 3 × `m7g.large`, dedicated EKS | $0.144 | $0.087 | $0.231 |
+| Ursula current x86, shared EKS | $0.236 | ≥$0.174 | ≥$0.410 |
+| Ursula estimated 3 × `m7g.large`, shared EKS | $0.104 | ≥$0.174 | ≥$0.278 |
+| Ursula estimated 3 × `m7g.large`, dedicated EKS | $0.144 | ≥$0.174 | ≥$0.318 |
 | RDS Multi-AZ | $0.129 | included in provisioned gp3 baseline for this run | $0.129 plus backups/transfer |
 | Managed World | $2.500 | storage/function charges excluded | at least $2.500 |
 
 The defensible conclusion is not that Ursula is already universally cheaper than PostgreSQL. It is:
 
 1. The earlier “three nodes make Ursula much more expensive” comparison materially overcharged unused x86 capacity.
-2. A plausible right-sized three-voter topology makes Ursula fixed cost competitive with RDS, especially on shared EKS.
-3. Today, small cold objects add roughly `$0.087 / 100k` and keep the total above this RDS comparator at the p99 TTFS ≤ 5 s capacity point.
+2. The three-voter ARM topology is now validated for raw primitives, but its Workflow capacity remains projected from the x86 sweep; the projection makes fixed cost competitive with RDS, especially on shared EKS.
+3. Today, data plus index-page PUTs add at least `$0.174 / 100k` and keep the total above this RDS comparator at the p99 TTFS ≤ 5 s capacity point.
 4. Ursula's strongest measured result is its stress throughput and long-history behavior; its most urgent production blockers are queue admission/fairness and cold-object packing.
 5. Managed World's `$2.50 / 100k` step charge remains an order of magnitude above either self-hosted backend before application compute and operations are considered.
 
@@ -181,14 +226,17 @@ The defensible conclusion is not that Ursula is already universally cheaper than
 - Ursula already has a real throughput advantage at the tested point, but the very high concurrent TTFS shows that throughput alone hides a scheduling/fairness problem.
 - PostgreSQL's smaller provisioned topology is also lightly loaded. A fair conclusion cannot be “Ursula is expensive because it has three nodes” without measuring how much useful load those nodes sustain.
 - `raft_write_many=0` means the tested workload did not exercise Ursula's server-side mailbox batching path.
+- Raw primitive isolation shows that Ursula already beats PostgreSQL for live durable delivery p50 and retained replay, but loses sequential append latency and warm append throughput.
+- Ordinary POST appends cannot reach the current `AppendBatch` coalescing handler. This is an implementation/API gap, not evidence that Raft cannot batch.
+- The cold request-cost model previously omitted the near-1:1 `.idx` PUT paired with each `.bin` PUT.
+- Same-stream cold compaction cannot solve the dominant short-stream object distribution.
 
 ### Working hypotheses, not yet proven
 
-1. Ursula has substantial unused throughput headroom because voter CPU remained near idle.
-2. The `100 × 50` result may be limited by workflow queue scheduling, application replicas, per-run serialization, or HTTP request amplification rather than Raft.
-3. Raising concurrency should eventually make group-actor mailbox batching visible, but only if the adapter/app tier can feed enough independent appends.
-4. Ursula's useful capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate CPU saturation.
-5. The three-node availability floor makes a dedicated low-volume Ursula cluster look expensive; shared nodes, smaller Graviton voters, or multiple tenants amortizing the cluster could improve economics, but these are deployment alternatives and must not be presented as measured results.
+1. Extending the batch endpoint with producer deduplication and per-entry CAS, then adopting it in the adapter, should close part of the 2.2–2.6× warm-write throughput gap.
+2. Deterministic gateway routing or a complete group-leader map should primarily improve new-stream and cold-route traffic; it cannot by itself explain the remaining warm-append gap.
+3. Ursula's useful Workflow capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate voter CPU saturation.
+4. A group-level packfile should reduce S3 PUT cost by orders of magnitude, but its read amplification, shared-object GC, and failure atomicity must be benchmarked rather than assumed.
 
 ### Single hot-queue capacity probe
 
@@ -278,12 +326,18 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Attribute the first limiting resource/path using backend counters and resource samples.
 - [x] Recalculate cost per 100,000 useful steps at 30%, 60%, and 80% utilization.
 - [x] Update this investigation report and keep raw JSON/resource samples beside it.
-- [ ] Benchmark the estimated 3 × `m7g.large` Ursula topology instead of treating it as a linear sizing estimate.
+- [ ] Benchmark Workflow capacity on the 3 × `m7g.large` Ursula topology instead of treating it as a linear sizing estimate.
+- [x] Isolate raw create, append, live-delivery, and replay primitives from the World adapter.
+- [x] Correct the S3 request model to include cold index-page PUTs.
+- [ ] Extend append-batch with producer deduplication and per-entry CAS, adopt it in the adapter, and rerun warm append.
+- [ ] Add a cross-stream group packfile targeting approximately 8 MiB objects, including safe shared-object GC.
+- [ ] Aggregate gateway metrics replica-by-replica and rerun route attribution.
+- [ ] Force a cold-cache miss via leadership transfer and measure real S3 replay.
 - [ ] Remove the queue enqueue-CAS admission ceiling and rerun the 1,000/2,000-run Ursula levels.
 - [ ] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.
 - [ ] Publish the final comparison after the right-sized topology and queue fix are measured.
-- [x] Destroy RDS and remove temporary application nodes after evidence is saved; verify the canary returns to 3/3 ready Ursula voters.
+- [ ] Destroy the current raw-benchmark RDS and temporary application node after the first optimization target is chosen; verify the canary returns to 3/3 ready Ursula voters.
 
 ## Evidence
 
