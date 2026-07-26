@@ -129,6 +129,22 @@ const CATCHUP_RESUME_START_INDEX = envInt(
 const CONCURRENT_ITERATIONS = envInt('BENCH_CONCURRENT_ITERATIONS', 1);
 const CONCURRENT_RUN_COUNT = envInt('BENCH_CONCURRENT_RUN_COUNT', 100);
 const CONCURRENT_STEP_COUNT = envInt('BENCH_CONCURRENT_STEP_COUNT', 50);
+const CAPACITY_ONLY = process.env.BENCH_CAPACITY_ONLY === '1';
+const CAPACITY_STEP_COUNT = envInt('BENCH_CAPACITY_STEP_COUNT', 20);
+const CAPACITY_ITERATIONS = envInt('BENCH_CAPACITY_ITERATIONS', 1);
+const CAPACITY_RUN_COUNTS = (
+  process.env.BENCH_CAPACITY_RUN_COUNTS ?? '25,50,100,250,500'
+)
+  .split(',')
+  .map((raw) => Number.parseInt(raw.trim(), 10));
+if (
+  CAPACITY_RUN_COUNTS.length === 0 ||
+  CAPACITY_RUN_COUNTS.some((value) => !Number.isFinite(value) || value < 1)
+) {
+  throw new Error(
+    `Invalid BENCH_CAPACITY_RUN_COUNTS: ${process.env.BENCH_CAPACITY_RUN_COUNTS}`
+  );
+}
 const WARMUP_ITERATIONS = envInt('BENCH_WARMUP_ITERATIONS', 2, 0);
 if (CATCHUP_RESUME_START_INDEX >= CATCHUP_CHUNK_COUNT) {
   throw new Error(
@@ -550,23 +566,26 @@ async function runCatchupIteration(
   }
 }
 
-async function runConcurrentIteration(): Promise<ConcurrentIterationResult> {
+async function runConcurrentIteration(
+  runCount = CONCURRENT_RUN_COUNT,
+  stepCount = CONCURRENT_STEP_COUNT
+): Promise<ConcurrentIterationResult> {
   const triggers = await Promise.all(
-    Array.from({ length: CONCURRENT_RUN_COUNT }, () =>
-      triggerBenchRun('benchSequentialStepsWorkflow', [CONCURRENT_STEP_COUNT])
+    Array.from({ length: runCount }, () =>
+      triggerBenchRun('benchSequentialStepsWorkflow', [stepCount])
     )
   );
   const completed = await Promise.all(
     triggers.map(async ({ runId, clientStart }) => {
       const returnValue = await withTimeout(
         getReturnValue(runId),
-        RUN_TIMEOUT_MS + CONCURRENT_STEP_COUNT * 5_000,
+        RUN_TIMEOUT_MS + stepCount * 5_000,
         `concurrent workflow returnValue (run ${runId})`
       );
       const steps = timingsFromReturnValue(returnValue, runId);
-      if (steps.length !== CONCURRENT_STEP_COUNT) {
+      if (steps.length !== stepCount) {
         throw new Error(
-          `Run ${runId} returned ${steps.length} step timings, expected ${CONCURRENT_STEP_COUNT}`
+          `Run ${runId} returned ${steps.length} step timings, expected ${stepCount}`
         );
       }
       return { runId, clientStart, steps };
@@ -587,7 +606,7 @@ async function runConcurrentIteration(): Promise<ConcurrentIterationResult> {
       (run) => run.steps[0].start - run.clientStart
     ),
     stepsPerSecond:
-      (CONCURRENT_RUN_COUNT * CONCURRENT_STEP_COUNT * 1000) / makespanMs,
+      (runCount * stepCount * 1000) / makespanMs,
   };
 }
 
@@ -796,7 +815,7 @@ const SCENARIO_DESCRIPTIONS = [
   },
 ];
 
-describe('workflow benchmarks', () => {
+describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
   // Preflight: prove the deployment executes workflows (and the trigger route
   // works) before any scenario spends its attempt budget. Without this, a
   // target that accepts run creation but never executes runs (e.g. queue not
@@ -1119,6 +1138,132 @@ describe('workflow benchmarks', () => {
           samples,
         })
       )
+    );
+  });
+});
+
+interface CapacityLevelResult {
+  runCount: number;
+  stepCount: number;
+  iterations: number;
+  logicalSteps: number;
+  startedAt: string;
+  finishedAt: string;
+  wallClockMs: number;
+  metrics: {
+    makespanMs: MetricStats;
+    stepsPerSecond: MetricStats;
+    runDurationMs: MetricStats;
+    ttfsMs: MetricStats;
+  };
+  backendUsage: {
+    before: BackendMetricsSnapshot | undefined;
+    after: BackendMetricsSnapshot | undefined;
+    delta: Record<string, number> | undefined;
+    derived: Record<string, number> | undefined;
+  };
+}
+
+const capacityLevels: CapacityLevelResult[] = [];
+
+describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
+  beforeAll(async () => {
+    const { runId } = await triggerBenchRun('benchSequentialStepsWorkflow', [1]);
+    const returnValue = await withTimeout(
+      getReturnValue(runId),
+      PREFLIGHT_TIMEOUT_MS,
+      `capacity preflight run (run ${runId})`
+    );
+    timingsFromReturnValue(returnValue, runId);
+    console.log(`[bench] capacity preflight ok (run ${runId})`);
+  }, PREFLIGHT_TIMEOUT_MS + 60_000);
+
+  test('concurrency saturation curve', { timeout: 3 * 60 * 60_000 }, async () => {
+    for (const runCount of CAPACITY_RUN_COUNTS) {
+      const before = await captureBackendMetrics();
+      const startedAt = new Date().toISOString();
+      const wallStart = performance.now();
+      const samples = await runScenario(
+        `${runCount} concurrent x ${CAPACITY_STEP_COUNT} steps`,
+        CAPACITY_ITERATIONS,
+        () => runConcurrentIteration(runCount, CAPACITY_STEP_COUNT),
+        {
+          warmupIterations: 0,
+          extraAttempts: Math.max(1, Math.ceil(CAPACITY_ITERATIONS * 0.5)),
+        }
+      );
+      const wallClockMs = performance.now() - wallStart;
+      const finishedAt = new Date().toISOString();
+      const after = await captureBackendMetrics();
+      const delta = diffBackendMetrics(before, after);
+      const level: CapacityLevelResult = {
+        runCount,
+        stepCount: CAPACITY_STEP_COUNT,
+        iterations: CAPACITY_ITERATIONS,
+        logicalSteps: runCount * CAPACITY_STEP_COUNT * CAPACITY_ITERATIONS,
+        startedAt,
+        finishedAt,
+        wallClockMs: Math.round(wallClockMs),
+        metrics: {
+          makespanMs: computeStats(samples.map((sample) => sample.makespanMs)),
+          stepsPerSecond: computeStats(
+            samples.map((sample) => sample.stepsPerSecond)
+          ),
+          runDurationMs: computeStats(
+            samples.flatMap((sample) => sample.runDurationMs)
+          ),
+          ttfsMs: computeStats(samples.flatMap((sample) => sample.ttfsMs)),
+        },
+        backendUsage: {
+          before,
+          after,
+          delta,
+          derived: deriveBackendMetrics(delta),
+        },
+      };
+      capacityLevels.push(level);
+      console.log(
+        `[bench] capacity ${runCount}x${CAPACITY_STEP_COUNT}: ${level.metrics.stepsPerSecond.avg} steps/s, p99 run ${level.metrics.runDurationMs.p99}ms`
+      );
+    }
+  });
+
+  afterAll(() => {
+    if (capacityLevels.length === 0) return;
+    const appName = process.env.APP_NAME || 'unknown';
+    const backend = getBackend();
+    const outputPath = path.resolve(
+      process.cwd(),
+      process.env.BENCH_OUTPUT_FILE ??
+        `capacity-results-${appName}-${backend}.json`
+    );
+    const results = {
+      version: 1,
+      methodologyVersion: BENCH_METHODOLOGY_VERSION,
+      kind: 'capacity-sweep',
+      app: appName,
+      backend,
+      generatedAt: new Date().toISOString(),
+      commit: process.env.GITHUB_SHA || undefined,
+      config: {
+        runCounts: CAPACITY_RUN_COUNTS,
+        stepCount: CAPACITY_STEP_COUNT,
+        iterations: CAPACITY_ITERATIONS,
+        runTimeoutMs: RUN_TIMEOUT_MS,
+      },
+      levels: capacityLevels,
+    };
+    fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
+    console.log(`[bench] Capacity results written to ${outputPath}`);
+    console.table(
+      capacityLevels.map((level) => ({
+        concurrentRuns: level.runCount,
+        steps: level.logicalSteps,
+        stepsPerSecond: level.metrics.stepsPerSecond.avg,
+        runDurationAvg: level.metrics.runDurationMs.avg,
+        runDurationP99: level.metrics.runDurationMs.p99,
+        ttfsP99: level.metrics.ttfsMs.p99,
+      }))
     );
   });
 });
