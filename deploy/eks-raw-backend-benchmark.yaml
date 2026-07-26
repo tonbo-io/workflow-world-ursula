@@ -1,0 +1,169 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workflow-benchmark
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workflow-raw-ursula
+  namespace: workflow-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: workflow-raw-ursula
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        workflow-benchmark-role: app
+      containers:
+        - name: runner
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              pnpm --filter workflow-benchmark-runner benchmark:raw
+              printf 'RAW_BENCH_RESULT_BASE64='
+              base64 -w 0 "$RAW_BENCH_OUTPUT_FILE"
+              printf '\n'
+          env:
+            - name: RAW_BENCH_BACKEND
+              value: ursula
+            - name: RAW_BENCH_LABEL
+              value: ursula-eks-arm64-memory-wal
+            - name: RAW_URSULA_URL
+              value: http://ursula-gateway.ursula.svc.cluster.local:4437
+            - name: RAW_URSULA_BUCKET
+              value: workflow-raw-benchmark
+            - name: RAW_BENCH_OUTPUT_FILE
+              value: /results/raw-ursula.json
+            - name: RAW_CONCURRENCY
+              value: "1,32,128,256"
+            - name: RAW_INDEPENDENT_OPERATIONS
+              value: "512"
+            - name: RAW_SEQUENTIAL_APPENDS
+              value: "500"
+            - name: RAW_LIVE_SAMPLES
+              value: "100"
+            - name: RAW_REPLAY_RECORDS
+              value: "1000"
+            - name: RAW_REPLAY_PAYLOAD_BYTES
+              value: "1024"
+            - name: RAW_COLD_REPLAY_BYTES
+              value: "10485760"
+            - name: RAW_COLD_SETTLE_MS
+              value: "30000"
+            - name: RAW_BENCH_TIMEOUT_MS
+              value: "1800000"
+            - name: WORKFLOW_URSULA_METRICS_URLS
+              value: >-
+                http://ursula-0.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
+                http://ursula-1.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics,
+                http://ursula-2.ursula-headless.ursula.svc.cluster.local:4437/__ursula/metrics
+            - name: WORKFLOW_URSULA_GATEWAY_METRICS_URL
+              value: http://ursula-gateway.ursula.svc.cluster.local:4437/__ursula/gateway/metrics
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workflow-raw-postgres
+  namespace: workflow-benchmark-postgres
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: workflow-raw-postgres
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        workflow-benchmark-role: app
+      initContainers:
+        - name: fetch-rds-ca
+          image: public.ecr.aws/docker/library/alpine:3.22
+          command: [/bin/sh, -ec]
+          args:
+            - wget -qO /rds-ca/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+          volumeMounts:
+            - name: rds-ca
+              mountPath: /rds-ca
+      containers:
+        - name: runner
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              pnpm --filter workflow-benchmark-runner benchmark:raw
+              printf 'RAW_BENCH_RESULT_BASE64='
+              base64 -w 0 "$RAW_BENCH_OUTPUT_FILE"
+              printf '\n'
+          env:
+            - name: RAW_BENCH_BACKEND
+              value: postgres
+            - name: RAW_BENCH_LABEL
+              value: postgres-rds-multi-az-arm64-client
+            - name: RAW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
+            - name: RAW_BENCH_OUTPUT_FILE
+              value: /results/raw-postgres.json
+            - name: RAW_CONCURRENCY
+              value: "1,32,128,256"
+            - name: RAW_INDEPENDENT_OPERATIONS
+              value: "512"
+            - name: RAW_SEQUENTIAL_APPENDS
+              value: "500"
+            - name: RAW_LIVE_SAMPLES
+              value: "100"
+            - name: RAW_REPLAY_RECORDS
+              value: "1000"
+            - name: RAW_REPLAY_PAYLOAD_BYTES
+              value: "1024"
+            - name: RAW_COLD_REPLAY_BYTES
+              value: "0"
+            - name: RAW_BENCH_TIMEOUT_MS
+              value: "1800000"
+            - name: WORKFLOW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: rds-ca
+              mountPath: /etc/ssl/rds
+              readOnly: true
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: rds-ca
+          emptyDir: {}

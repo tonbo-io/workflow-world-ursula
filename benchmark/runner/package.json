@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "benchmark": "vitest run benchmark.test.ts --reporter=verbose",
+    "benchmark:raw": "vitest run raw-backend.test.ts --reporter=verbose",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

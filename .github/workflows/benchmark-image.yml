@@ -51,6 +51,6 @@ jobs:
           file: Dockerfile.benchmark
           build-args: |
             BENCHMARK_WORLD=${{ matrix.world }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-${{ matrix.name }}
