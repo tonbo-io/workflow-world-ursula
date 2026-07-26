@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-26 14:05 CST
 
-Status: measurement and first-pass analysis complete; infrastructure cleanup and publication are in progress. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
+Status: measurement, first-pass analysis, publication, and temporary infrastructure cleanup are complete. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
 
 ## Goal
 
@@ -283,7 +283,7 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [ ] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.
 - [ ] Publish the final comparison after the right-sized topology and queue fix are measured.
-- [ ] Destroy RDS and remove temporary application nodes after evidence is saved.
+- [x] Destroy RDS and remove temporary application nodes after evidence is saved; verify the canary returns to 3/3 ready Ursula voters.
 
 ## Evidence
 
