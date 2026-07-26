@@ -10,6 +10,8 @@ RUN corepack enable
 
 WORKDIR /workspace
 
+ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /rds-ca/global-bundle.pem
+
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
 COPY benchmark/app/package.json benchmark/app/package.json
 COPY benchmark/runner/package.json benchmark/runner/package.json
@@ -38,6 +40,7 @@ RUN corepack enable
 
 WORKDIR /workspace
 COPY --from=build /workspace /workspace
+COPY --from=build /rds-ca/global-bundle.pem /etc/ssl/rds/global-bundle.pem
 
 EXPOSE 3000
 
