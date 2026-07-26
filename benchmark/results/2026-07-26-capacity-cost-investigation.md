@@ -249,6 +249,69 @@ The defensible conclusion is not that Ursula is already universally cheaper than
 4. Ursula's strongest measured result is its stress throughput and long-history behavior; its most urgent production blockers are queue admission/fairness and cold-object packing.
 5. Managed World's `$2.50 / 100k` step charge remains an order of magnitude above either self-hosted backend before application compute and operations are considered.
 
+## ARM canary rerun after queue correctness fixes
+
+The projected `3 × m7g.large` Ursula topology is now measured rather than extrapolated. The canary ran Ursula 0.3.13 with 256 groups, memory WAL, and S3 cold storage. Both backends used eight application replicas on the same two `m7g.xlarge` ARM nodes, ran serially, and executed the same `25,50,100,250,500,1000` run sweep with 20 steps per run and eight workflow queues. PostgreSQL used 30 workers and a 32-connection pool per application replica; the initial 64/66 setting reached 544 RDS connections and made every application readiness probe fail at 500 runs even though RDS CPU was only 26.5%.
+
+Two adapter fixes were required before the clean run:
+
+- Queue contention now refreshes only the missing journal suffix instead of discarding the cache and rebuilding from a checkpoint after every 412.
+- A local mutation freezes its optimistic record tail before waiting behind another local append. This prevents a stale lease or ack transition from adopting the newer tail and committing after an earlier mutation removed the referenced message.
+
+The second defect was discovered by the first ARM rerun: it failed at 100 runs with `Queue transition references missing message`. The regression test reproduces concurrent ack and lease extension on one journal, and the fixed image subsequently completed both the single-queue and eight-queue 1,000-run levels.
+
+### Eight-queue capacity
+
+| Concurrent runs × 20 steps | Ursula throughput / TTFS p99 / run p99 | PostgreSQL throughput / TTFS p99 / run p99 |
+| --- | ---: | ---: |
+| 25 | 58.0 steps/s / 0.838 s / 8.587 s | 69.2 steps/s / 0.372 s / 7.072 s |
+| 50 | 91.4 steps/s / 1.557 s / 10.852 s | 94.3 steps/s / 0.643 s / 10.385 s |
+| 100 | 93.4 steps/s / 4.086 s / 20.918 s | 81.0 steps/s / 1.466 s / 24.307 s |
+| 250 | 111.2 steps/s / 29.043 s / 44.302 s | 97.8 steps/s / 39.145 s / 48.852 s |
+| 500 | 115.3 steps/s / 62.274 s / 82.183 s | 96.3 steps/s / 76.133 s / 96.891 s |
+| 1,000 | 116.1 steps/s / 147.652 s / 160.959 s | 93.1 steps/s / 160.732 s / 196.831 s |
+
+At 1,000 runs, Ursula delivered 24.7% more throughput and an 18.2% lower run-duration p99. At 500 runs it delivered 19.7% more throughput and a 15.2% lower run-duration p99. PostgreSQL still has the better low-load TTFS, while Ursula's advantage appears under sustained concurrent pressure.
+
+The one-hot-queue probe also completed all levels after the correctness fix:
+
+| Concurrent runs × 20 steps | Steps/s | TTFS p99 | Run p99 |
+| --- | ---: | ---: | ---: |
+| 25 | 70.1 | 1.723 s | 7.022 s |
+| 50 | 66.5 | 11.211 s | 14.852 s |
+| 100 | 69.8 | 23.980 s | 27.963 s |
+| 250 | 104.1 | 43.674 s | 46.840 s |
+| 500 | 102.4 | 87.993 s | 94.887 s |
+| 1,000 | 103.8 | 171.859 s | 178.580 s |
+
+This confirms that the old admission failure was removed, but a single workflow queue remains a deliberate hot-key workload with poor fairness. Eight queues improve the 1,000-run throughput by 11.8% and run p99 by 9.9%.
+
+### Measured backend utilization
+
+The three Ursula voter instances averaged 19.1%, 21.3%, and 21.0% CPU in the first five-minute loaded sample and 13.1%, 15.7%, and 14.7% in the second partially loaded sample. Their post-run idle baseline was approximately 6.8–7.1%. Ursula therefore still had substantial voter CPU headroom; the eight-replica application/dispatcher tier capped this curve before the backend.
+
+The clean PostgreSQL run held 247–272 database connections and used 25.7–34.5% primary CPU. The failed 66-connection-pool run reached 544 connections. This is a material operational difference: Ursula's queue fix admits the 1,000-run burst without a per-process connection budget, while PostgreSQL requires explicit pool sizing.
+
+### Per-million-step backend cost
+
+This table is backend-only: the two shared ARM application nodes are common to both self-hosted runs and excluded. Prices are current us-east-1 on-demand catalog prices captured with the run: `m7g.large = $0.0816/hour`, PostgreSQL Multi-AZ `db.m7g.large = $0.337/hour`, and Multi-AZ gp3 storage `100 GiB × $0.23/GiB-month`. The fixed component is divided by the measured 1,000-run steady throughput, so the unit price is constant and does not increase when one customer sends fewer steps.
+
+| Backend | Fixed compute/storage per 1M steps | Request cost per 1M steps | First-month retained bytes | Measured first-month total |
+| --- | ---: | ---: | ---: | ---: |
+| Ursula, shared EKS, `3 × m7g.large` | $0.586 | $2.265 data/index PUTs + $0.046 snapshot PUTs | 3.91 GB, about $0.090 | **$2.986** |
+| PostgreSQL Multi-AZ `db.m7g.large` + 100 GiB gp3 | $1.099 | Included in provisioned gp3 baseline | Included in the fixed 100 GiB allocation | **$1.099** plus backup/transfer |
+| Managed World public step charge | — | — | Storage and function charges excluded | **$25.00** |
+
+Ursula now beats PostgreSQL on the measured backend compute component by 46.7%, but still loses total cost by 2.7× because of S3 PUT amplification. The eight-queue sweep produced 38,500 logical steps and 17,440 versioned cold objects: 8,720 `.bin` PUTs and 8,720 `.idx` PUTs. Snapshot activity added 352 PUTs. The retained `.bin` objects averaged only 14.8 KiB (`p50 13.5 KiB`, `p90 31.5 KiB`, `p99 59.6 KiB`), so same-stream compaction is not solving the dominant short-stream distribution.
+
+If cross-stream packing reduced data and index request volume from approximately 452,987 PUTs per million steps to roughly one 8 MiB pack PUT per 8 MiB of payload plus bounded metadata, the measured Ursula total would move close to its `$0.59/M` compute floor and become materially cheaper than this RDS comparator. That is now the highest-leverage cost optimization.
+
+### Benchmark infrastructure caveats
+
+The benchmark image now activates and caches pnpm in both build and runtime stages. Before that fix, a newly scaled private-subnet node attempted a Corepack npm download and crash-looped while an older node's cache hid the problem.
+
+The temporary managed node group also attached only the EKS cluster security group, whereas the original benchmark and voter nodes carried the shared OpenTofu node security group. Direct pod traffic worked after ingress was added, but ClusterIP traffic remained unavailable until the second node's ENIs carried the shared node group as well. Future benchmark node groups need a launch template that attaches both groups; this was an environment defect, not a backend result.
+
 ## Current interpretation
 
 ### Confirmed
@@ -370,10 +433,10 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [ ] Add a cross-stream group packfile targeting approximately 8 MiB objects, including safe shared-object GC.
 - [ ] Aggregate gateway metrics replica-by-replica and rerun route attribution.
 - [ ] Force a cold-cache miss via leadership transfer and measure real S3 replay.
-- [ ] Remove the queue enqueue-CAS admission ceiling and rerun the 1,000/2,000-run Ursula levels.
+- [x] Remove the queue enqueue-CAS admission ceiling and rerun the 1,000-run Ursula level.
 - [ ] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.
-- [ ] Publish the final comparison after the right-sized topology and queue fix are measured.
+- [x] Publish the ARM comparison after the right-sized topology and queue fix are measured.
 - [ ] Destroy the current raw-benchmark RDS and temporary application node after the first optimization target is chosen; verify the canary returns to 3/3 ready Ursula voters.
 
 ## Evidence
@@ -386,4 +449,9 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`postgres-rds-capacity-sharded.json`](./postgres-rds-capacity-sharded.json)
 - [`ursula-v038-capacity-scale.json`](./ursula-v038-capacity-scale.json)
 - [`postgres-rds-capacity-scale.json`](./postgres-rds-capacity-scale.json)
+- [`ursula-v0313-capacity-hot-queuefix.json`](./ursula-v0313-capacity-hot-queuefix.json)
+- [`ursula-v0313-capacity-hot-casfix.json`](./ursula-v0313-capacity-hot-casfix.json)
+- [`ursula-v0313-capacity-sharded-casfix.json`](./ursula-v0313-capacity-sharded-casfix.json)
+- [`postgres-rds-capacity-arm-pool66-failure.json`](./postgres-rds-capacity-arm-pool66-failure.json)
+- [`postgres-rds-capacity-arm-pool32.json`](./postgres-rds-capacity-arm-pool32.json)
 - [`2026-07-26-eks-comparison.md`](./2026-07-26-eks-comparison.md)
