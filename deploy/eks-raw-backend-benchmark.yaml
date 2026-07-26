@@ -137,6 +137,8 @@ spec:
               value: "1024"
             - name: RAW_COLD_REPLAY_BYTES
               value: "0"
+            - name: RAW_POSTGRES_POOL_SIZE
+              value: "32"
             - name: RAW_BENCH_TIMEOUT_MS
               value: "1800000"
             - name: WORKFLOW_POSTGRES_URL
