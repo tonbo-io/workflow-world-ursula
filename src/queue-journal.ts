@@ -600,13 +600,12 @@ export class QueueJournal {
     throw new Error(`Queue "${queueName}" remained contended during enqueue`);
   }
 
-  private claimCandidates(
+  private claimCandidate(
     state: QueueState,
     now: Date,
-    limit: number,
     ignoredMessageId?: MessageId,
     requiredConcurrencyKey?: string
-  ): QueueMessageState[] {
+  ): QueueMessageState | undefined {
     const activeLeaseKeys = new Set(
       [...state.messages.values()]
         .filter(
@@ -617,50 +616,34 @@ export class QueueJournal {
         )
         .map((candidate) => concurrencyKey(candidate.message))
     );
-    const candidates = [...state.messages.values()]
-      .filter((candidate) => {
-        if (candidate.messageId === ignoredMessageId) return false;
-        const key = concurrencyKey(candidate.message);
-        if (requiredConcurrencyKey && key !== requiredConcurrencyKey) {
-          return false;
-        }
-        if (candidate.status === 'acked') return false;
-        if (candidate.availableAt.getTime() > now.getTime()) return false;
-        if (activeLeaseKeys.has(key)) return false;
-        return (
-          candidate.status === 'pending' ||
-          (candidate.leaseExpiresAt?.getTime() ?? 0) <= now.getTime()
-        );
-      })
-      .sort(
-        (left, right) =>
-          left.availableAt.getTime() - right.availableAt.getTime() ||
-          left.createdAt.getTime() - right.createdAt.getTime()
-      );
-    const selected: QueueMessageState[] = [];
-    for (const candidate of candidates) {
-      const key = concurrencyKey(candidate.message);
-      if (activeLeaseKeys.has(key)) continue;
-      activeLeaseKeys.add(key);
-      selected.push(candidate);
-      if (selected.length >= limit) break;
+    let message: QueueMessageState | undefined;
+    for (const candidate of state.messages.values()) {
+      if (candidate.messageId === ignoredMessageId) continue;
+      if (
+        requiredConcurrencyKey &&
+        concurrencyKey(candidate.message) !== requiredConcurrencyKey
+      ) {
+        continue;
+      }
+      if (candidate.status === 'acked') continue;
+      if (candidate.availableAt.getTime() > now.getTime()) continue;
+      if (activeLeaseKeys.has(concurrencyKey(candidate.message))) continue;
+      if (
+        candidate.status !== 'pending' &&
+        (candidate.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
+      ) {
+        continue;
+      }
+      if (
+        !message ||
+        candidate.availableAt.getTime() < message.availableAt.getTime() ||
+        (candidate.availableAt.getTime() === message.availableAt.getTime() &&
+          candidate.createdAt.getTime() < message.createdAt.getTime())
+      ) {
+        message = candidate;
+      }
     }
-    return selected;
-  }
-
-  private claimCandidate(
-    state: QueueState,
-    now: Date,
-    ignoredMessageId?: MessageId,
-    requiredConcurrencyKey?: string
-  ): QueueMessageState | undefined {
-    return this.claimCandidates(
-      state,
-      now,
-      1,
-      ignoredMessageId,
-      requiredConcurrencyKey
-    )[0];
+    return message;
   }
 
   async claim(
@@ -668,57 +651,32 @@ export class QueueJournal {
     now: Date,
     leaseDurationMs: number
   ): Promise<QueueLease | null> {
-    return (await this.claimMany(queueName, now, leaseDurationMs, 1))[0] ?? null;
-  }
-
-  /**
-   * Claims independent messages in one guarded append.
-   *
-   * A dispatcher wake is observed by every adapter replica. Leasing one
-   * message per CAS makes those replicas contend with each other and with
-   * producers for every available message. A batch keeps the same queue-tail
-   * guard while amortizing that contention across the local delivery slots.
-   */
-  async claimMany(
-    queueName: ValidQueueName,
-    now: Date,
-    leaseDurationMs: number,
-    limit: number
-  ): Promise<QueueLease[]> {
-    if (!Number.isSafeInteger(limit) || limit < 1) {
-      throw new Error('Queue claim limit must be a positive integer');
-    }
     for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
       let state = await this.loadForMutation(queueName);
-      let messages = this.claimCandidates(state, now, limit);
-      if (messages.length === 0) {
+      let message = this.claimCandidate(state, now);
+      if (!message) {
         state = await this.load(queueName);
-        messages = this.claimCandidates(state, now, limit);
+        message = this.claimCandidate(state, now);
       }
-      if (messages.length === 0) return [];
-      const leases = messages.map((message) => {
-        const leaseId = randomUUID();
-        const transition = {
-          version: 1,
-          type: 'leased',
-          messageId: message.messageId,
-          leaseId,
-          attempt: message.attempt + 1,
-          expiresAt: new Date(now.getTime() + leaseDurationMs).toISOString(),
-          createdAt: now.toISOString(),
-        } satisfies QueueTransition;
-        return { message, leaseId, transition };
-      });
+      if (!message) return null;
+      const leaseId = randomUUID();
+      const transition: QueueTransition = {
+        version: 1,
+        type: 'leased',
+        messageId: message.messageId,
+        leaseId,
+        attempt: message.attempt + 1,
+        expiresAt: new Date(now.getTime() + leaseDurationMs).toISOString(),
+        createdAt: now.toISOString(),
+      };
       try {
-        await this.appendTransitions(
+        await this.appendTransition(
           queueName,
           state,
-          leases.map(({ transition }) => transition),
-          `queue-lease-batch:${leases
-            .map(({ message, leaseId }) => `${message.messageId}:${leaseId}`)
-            .join(',')}`
+          transition,
+          `queue-lease:${message.messageId}:${leaseId}`
         );
-        return leases.map(({ leaseId, message, transition }) => ({
+        return {
           leaseId,
           message: {
             ...message,
@@ -727,7 +685,7 @@ export class QueueJournal {
             leaseId,
             leaseExpiresAt: new Date(transition.expiresAt),
           },
-        }));
+        };
       } catch (error) {
         if (isUrsulaRequestError(error, 412)) {
           await this.refreshAfterContention(queueName);
@@ -737,7 +695,7 @@ export class QueueJournal {
         throw error;
       }
     }
-    return [];
+    return null;
   }
 
   nextLocalDeadline(queueName: ValidQueueName, now: Date): Date | undefined {
