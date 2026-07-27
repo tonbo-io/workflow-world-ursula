@@ -16,6 +16,7 @@ const URSULA_COUNTERS = [
   'cold_flush_upload_bytes',
   'cold_flush_uploads',
   'cold_gc_reclaimed',
+  'cold_hot_bytes',
   'cold_orphan_bytes',
   'cold_orphan_cleanup_attempts',
   'cold_store_read_bytes',
@@ -27,6 +28,19 @@ const URSULA_COUNTERS = [
   'group_lock_wait_ns',
   'raft_apply_entries',
   'raft_apply_ns',
+  'raft_grpc_append_stream_fallbacks',
+  'raft_grpc_append_stream_inflight_max',
+  'raft_grpc_append_stream_request_bytes',
+  'raft_grpc_append_stream_requests',
+  'raft_grpc_append_stream_response_bytes',
+  'raft_grpc_append_stream_responses',
+  'raft_grpc_append_stream_session_failures',
+  'raft_grpc_append_stream_sessions_opened',
+  'raft_grpc_append_unary_calls',
+  'raft_snapshot_body_bytes',
+  'raft_snapshot_builds',
+  'raft_snapshot_external_uploads',
+  'raft_snapshot_pointer_bytes',
   'raft_write_many_batches',
   'raft_write_many_commands',
   'raft_write_many_logical_commands',
@@ -274,6 +288,23 @@ export function deriveBackendMetrics(
         'raft_write_many_response_ns',
         'raft_write_many_batches'
       ),
+      raftGrpcAppendStreamRequestBytesPerRequest: per(
+        counters,
+        'raft_grpc_append_stream_request_bytes',
+        'raft_grpc_append_stream_requests'
+      ),
+      raftGrpcAppendStreamResponseBytesPerResponse: per(
+        counters,
+        'raft_grpc_append_stream_response_bytes',
+        'raft_grpc_append_stream_responses'
+      ),
+      raftGrpcAppendStreamUsageRatio:
+        (counters.raft_grpc_append_stream_requests ?? 0) /
+        Math.max(
+          1,
+          (counters.raft_grpc_append_stream_requests ?? 0) +
+            (counters.raft_grpc_append_unary_calls ?? 0)
+        ),
       walWriteNsPerBatch: per(counters, 'wal_write_ns', 'wal_batches'),
       walSyncNsPerBatch: per(counters, 'wal_sync_ns', 'wal_batches'),
       gatewayRedirectNsPerRedirect: per(
