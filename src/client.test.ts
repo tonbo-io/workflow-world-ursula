@@ -102,6 +102,49 @@ describe('UrsulaClient', () => {
     expect(request?.body).toBe('{"event":"created"}');
   });
 
+  it('retries a leader-unknown create with the same producer operation', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        response('leader election in progress', { status: 503 })
+      )
+      .mockResolvedValueOnce(
+        response(null, {
+          status: 201,
+          headers: {
+            'stream-record-start': '0',
+            'stream-record-next': '1',
+          },
+        })
+      );
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await expect(
+      client.append(
+        'run-1',
+        { event: 'created' },
+        {
+          operationId: 'event-1',
+          expectedRecord: 0,
+          createIfMissing: true,
+        }
+      )
+    ).resolves.toEqual({ startRecord: 0, nextRecord: 1 });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const first = fetch.mock.calls[0]?.[1];
+    const second = fetch.mock.calls[1]?.[1];
+    expect(first?.method).toBe('PUT');
+    expect(second?.method).toBe('PUT');
+    expect(first?.body).toBe(second?.body);
+    expect(
+      new Headers(first?.headers).get('producer-id')
+    ).toBe(new Headers(second?.headers).get('producer-id'));
+  });
+
   it('falls back to guarded append when create finds an existing stream', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
