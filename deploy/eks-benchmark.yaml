@@ -9,7 +9,7 @@ metadata:
   name: workflow-benchmark-app
   namespace: workflow-benchmark
 spec:
-  replicas: 6
+  replicas: 3
   selector:
     matchLabels:
       app: workflow-benchmark-app
@@ -37,7 +37,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-v0322-profile-8app
+              value: workflow-benchmark-v0322-dispatch5-8app
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1
             - name: WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED
@@ -47,7 +47,7 @@ spec:
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
               value: "1"
             - name: WORKFLOW_BENCH_PROFILE
-              value: "1"
+              value: "0"
             - name: PORT
               value: "3000"
           ports:
@@ -72,7 +72,7 @@ metadata:
   name: workflow-benchmark-dispatcher
   namespace: workflow-benchmark
 spec:
-  replicas: 2
+  replicas: 5
   selector:
     matchLabels:
       app: workflow-benchmark-app
@@ -103,7 +103,7 @@ spec:
             - name: WORKFLOW_URSULA_URL
               value: http://ursula-gateway.ursula.svc.cluster.local:4437
             - name: WORKFLOW_URSULA_BUCKET
-              value: workflow-benchmark-v0322-profile-8app
+              value: workflow-benchmark-v0322-dispatch5-8app
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1
             - name: WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED
@@ -113,7 +113,7 @@ spec:
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
               value: "1"
             - name: WORKFLOW_BENCH_PROFILE
-              value: "1"
+              value: "0"
             - name: PORT
               value: "3000"
           ports:
