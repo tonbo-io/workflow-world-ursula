@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-28
 
-Status: Ursula 0.3.26 fixes the cold-health leadership storm and completes the same-EKS, same-application-tier cost measurement with immutable benchmark images. On the current reproducible three-sample comparison, Ursula delivers 600.7 steps/s versus PostgreSQL's 460.5 steps/s, with lower run and TTFS p99, but the throughput advantage is only 1.304× rather than the required 1.5×. Exact cross-AZ measurement reverses the previous provisional cost result: Ursula costs approximately `$0.90–0.91 / 1M` steps versus PostgreSQL's `$0.233 / 1M` at the agreed 40% compute allocation. HTTP responses crossing `voter -> gateway -> app` account for 63% of Ursula's measured cross-AZ bytes, so same-zone gateway routing and response-path compression are now the primary structural experiments.
+Status: Ursula 0.3.27 enables same-zone gateway routing and removes the app↔gateway half of the doubled cross-AZ HTTP response path. On the current reproducible three-sample comparison, Ursula delivers 611.4 steps/s versus PostgreSQL's 460.5 steps/s, with lower run and TTFS p99, but the throughput advantage is only 1.328× rather than the required 1.5×. Cross-AZ traffic falls from 41.076 to approximately 24.250 GB per million steps and total measured cost falls from approximately `$0.90–0.91` to `$0.565–0.568 / 1M` steps. This is a meaningful improvement, but PostgreSQL still costs approximately `$0.233 / 1M`; voter→gateway record responses and Raft replication are now the dominant remaining network paths.
 
 ## Goal
 
@@ -18,7 +18,7 @@ The comparison must answer three different questions:
 
 | Component | Configuration |
 | --- | --- |
-| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.26 |
+| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.27 |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
 | Application tier | Current comparison uses eight one-core pods on two isolated `m7g.xlarge` ARM EKS workers; Ursula uses three request-only plus five dispatcher pods, while PostgreSQL uses eight combined workers |
 | Region | `us-east-1`, same VPC |
@@ -85,13 +85,56 @@ The fixed component uses the agreed 40% allocation for both backends. This is a 
 
 Across the three Ursula samples, cold counters recorded 25 physical uploads and 207,151,796 bytes over 75,000 steps, normalizing to approximately 333 pack uploads and 2.762 GB per million steps. Pack size remains close to the intended 8 MiB. Operations are not assigned a speculative dollar amount; including them cannot rescue the current Ursula result.
 
+## 2026-07-28 Ursula 0.3.27 same-zone routing iteration
+
+This iteration changed only gateway endpoint selection and retained the exact 0.3.26 benchmark topology, immutable application image, packet-meter definition, workload, and fresh-bucket policy:
+
+- Ursula image: `ghcr.io/tonbo-io/ursula@sha256:0a6244ebd369003a00f600f065c7a3e6cbf2ded7c23d125b1e2371e6b587cc3e`;
+- Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula:0.3.27@sha256:3e9f7ea9b7f9e6b4a087d1bda0cf08c2ef7858cab679331b3a324973dd1ef559`;
+- gateway Service: `trafficDistribution: PreferSameZone`;
+- rollout: GitOps-managed memory-WAL `OnDelete` sequence with drain, `prepare-restart`, pod replacement, catch-up, strict three-node verification, and zero post-rollout restarts;
+- routing proof: the live EndpointSlice assigned exactly one ready gateway endpoint to each of `us-east-1a`, `us-east-1b`, and `us-east-1c`, with a matching zone hint.
+
+### Performance
+
+| Metric | Ursula 0.3.27 samples | Ursula median | PostgreSQL median | Comparison |
+| --- | ---: | ---: | ---: | ---: |
+| Throughput | 612.3, 608.1, 611.4 steps/s | **611.4 steps/s** | 460.5 steps/s | **1.328×** |
+| Run-duration p99 | 39.427, 40.078, 39.240 s | **39.427 s** | 53.254 s | **26.0% lower** |
+| TTFS p99 | 35.065, 31.483, 35.844 s | **35.065 s** | 42.860 s | **18.2% lower** |
+
+The p99 gate remains met. Reaching 1.5× PostgreSQL requires 690.8 steps/s, another 13.0% above the current Ursula median.
+
+### Network effect
+
+The exact sender-side meter counted only cross-zone pod pairs and counted each packet once at its source. The idle rate remained effectively unchanged, which is expected because endpoint locality targets the loaded application path rather than Raft heartbeats.
+
+| Cross-AZ wire bytes / 1M steps | Ursula 0.3.26 | Ursula 0.3.27 | Change |
+| --- | ---: | ---: | ---: |
+| Load-dependent median | 37.201 GB | 20.415 GB | **−45.1%** |
+| Always-on idle normalized at median throughput | 3.875 GB | 3.835 GB | −1.0% |
+| **Total** | **41.076 GB** | **24.250 GB** | **−41.0%** |
+
+Post-run per-pair diagnostics showed no material cross-zone gateway↔app traffic, proving that EKS honored the EndpointSlice hints. The remaining gross sample, including a short diagnostic idle tail, was dominated by approximately 322.3 MB voter→gateway responses, 313.5 MB voter→voter Raft traffic, and 63.9 MB gateway→voter requests. Same-zone routing therefore removed the intended duplicated response leg; it did not merely shift bytes into another application path.
+
+### Cost effect
+
+| Cost / 1M steps | Ursula 0.3.26 | Ursula 0.3.27 | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| 40%-allocated backend compute/storage | `$0.048` | `$0.0475` | `$0.0889` |
+| Cross-AZ transfer | `$0.822` | `$0.4850` | `$0.1445` |
+| S3 packed payload, PUTs, first-month average retention | `$0.032–0.035` | `$0.032–0.035` | included in RDS |
+| **Measured total before operations** | **`$0.90–0.91`** | **`$0.565–0.568`** | **`$0.233`** |
+
+The independent change reduced Ursula's measured total by approximately 37% and is therefore a meaningful, reproducible improvement rather than a plateau iteration. It resets the no-progress counter. The objective is still not met: Ursula remains approximately 2.4× PostgreSQL's cost, while the 30%-lower target is at most `$0.163 / 1M` steps.
+
 ### Next gates
 
-1. Add a Helm-configurable `trafficDistribution: PreferSameZone` to the gateway Service, promote it through GitOps, and repeat three warm jobs with the same packet meter.
-2. Require the app↔gateway cross-AZ component to fall materially; reject the change if EndpointSlice routing does not honor the preference on EKS.
-3. Add HTTP response byte/compression metrics, then compress JSON record responses across both voter→gateway and gateway→app legs without changing Durable Streams semantics.
-4. Reduce the 256-group idle heartbeat floor only after the response path is fixed; idle Raft traffic is measurable but not the dominant loaded component.
-5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below 70% of the PostgreSQL comparator.
+1. Compress finite JSON/NDJSON record responses at the voter so the same encoded bytes traverse voter→gateway and gateway→client; explicitly exclude SSE and preserve long-poll completion semantics.
+2. Add coverage for content negotiation and streaming exclusions, then repeat three warm jobs with the exact same source-side cross-AZ meter.
+3. Require a material drop in voter→gateway response bytes without a throughput or p99 regression; report both encoded wire bytes and logical record bytes.
+4. After the response path, target voter→voter variable traffic and the 256-group idle heartbeat floor as separate, independently measurable iterations.
+5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps.
 
 ## 2026-07-27 structural Workflow rerun
 
