@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - .github/workflows/benchmark-image.yml
       - benchmark/**
       - src/**
       - Dockerfile.benchmark
@@ -14,6 +15,7 @@ on:
     branches:
       - main
     paths:
+      - .github/workflows/benchmark-image.yml
       - benchmark/**
       - src/**
       - Dockerfile.benchmark
@@ -53,4 +55,6 @@ jobs:
             BENCHMARK_WORLD=${{ matrix.world }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-${{ matrix.name }}
+          tags: |
+            ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-${{ matrix.name }}
+            ghcr.io/tonbo-io/workflow-world-ursula-benchmark:${{ github.sha }}-${{ matrix.name }}
