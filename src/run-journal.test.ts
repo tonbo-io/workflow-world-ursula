@@ -337,6 +337,8 @@ describe('RunJournal', () => {
     const runId = 'wrun_compact_step';
     const stepId = 'step_compact';
     const createdAt = new Date('2026-07-28T00:00:00.000Z');
+    const startedAt = new Date('2026-07-28T00:00:00.003Z');
+    const completedAt = new Date('2026-07-28T00:00:00.011Z');
     const input = Uint8Array.from([1, 2, 3]);
     const output = Uint8Array.from([4, 5, 6]);
     const events = [
@@ -362,7 +364,7 @@ describe('RunJournal', () => {
         },
         runId,
         eventId: 'evnt_compact_started',
-        createdAt,
+        createdAt: startedAt,
         specVersion: 5,
       },
       {
@@ -372,14 +374,14 @@ describe('RunJournal', () => {
           result: output,
           stepName: 'step//test//compact',
           workflowName: 'workflow//test//compact',
-          eventCount: 3,
+          finalSchedulingReplay: 88,
           optimizations: ['turbo'],
-          stepCount: 1,
-          stso: 7,
+          rsfs: 93,
+          ttfs: 188,
         },
         runId,
         eventId: 'evnt_compact_completed',
-        createdAt,
+        createdAt: completedAt,
         specVersion: 5,
       },
     ] satisfies Event[];
@@ -391,10 +393,10 @@ describe('RunJournal', () => {
       input,
       output,
       attempt: 1,
-      startedAt: createdAt,
-      completedAt: createdAt,
+      startedAt,
+      completedAt,
       createdAt,
-      updatedAt: createdAt,
+      updatedAt: completedAt,
       specVersion: 5,
     } satisfies Step;
     const commit = {
@@ -415,6 +417,7 @@ describe('RunJournal', () => {
     const stored = client.runRecordValues()[0];
     expect(stored).toMatchObject({ v: 2 });
     expect(Array.isArray((stored as { c: unknown }).c)).toBe(true);
+    expect((stored as { c: unknown[] }).c[0]).toBe(3);
     expect(JSON.stringify(stored).length).toBeLessThan(
       JSON.stringify({ ...commit, version: 1, runId, previousRecord: 0 })
         .length * 0.5

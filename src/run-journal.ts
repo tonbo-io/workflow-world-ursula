@@ -66,7 +66,7 @@ export interface RunJournalOptions {
   compactCompletedStepCommits?: boolean;
 }
 
-type CompactCompletedStepFields = [
+type CompactCompletedStepFieldsV2 = [
   2,
   [string, string, string],
   string,
@@ -87,9 +87,24 @@ type CompactCompletedStepFields = [
   number | null,
 ];
 
+type CompactCompletedStepFieldsV3 = [
+  3,
+  [string, string, string],
+  string,
+  [Date | string, Date | string, Date | string],
+  string,
+  string,
+  number,
+  unknown,
+  unknown,
+  string,
+  Record<string, unknown>,
+  number | null,
+];
+
 interface CompactCompletedStepCommit {
   v: 2;
-  c: CompactCompletedStepFields;
+  c: CompactCompletedStepFieldsV3;
 }
 
 interface RunCheckpoint {
@@ -329,16 +344,6 @@ const STARTED_STEP_DATA_KEYS = new Set([
   'stepName',
   'workflowName',
 ]);
-const COMPLETED_STEP_DATA_KEYS = new Set([
-  'eventCount',
-  'optimizations',
-  'result',
-  'stepCount',
-  'stepName',
-  'stso',
-  'ttfs',
-  'workflowName',
-]);
 const COMPLETED_STEP_KEYS = new Set([
   'attempt',
   'completedAt',
@@ -414,7 +419,6 @@ function compactCompletedStepCommit(
     ) ||
     !objectHasOnlyKeys(createdData, CREATED_STEP_DATA_KEYS) ||
     !objectHasOnlyKeys(startedData, STARTED_STEP_DATA_KEYS) ||
-    !objectHasOnlyKeys(completedData, COMPLETED_STEP_DATA_KEYS) ||
     !objectHasOnlyKeys(
       step as unknown as Record<string, unknown>,
       COMPLETED_STEP_KEYS
@@ -424,7 +428,9 @@ function compactCompletedStepCommit(
   }
 
   const stepId = created.correlationId;
-  const eventTime = created.createdAt;
+  const createdAt = created.createdAt;
+  const startedAt = started.createdAt;
+  const completedAt = completed.createdAt;
   const stepName = createdData.stepName;
   const workflowName = startedData.workflowName;
   const ownerMessageId = startedData.ownerMessageId;
@@ -452,71 +458,56 @@ function compactCompletedStepCommit(
     step.stepName !== stepName ||
     step.status !== 'completed' ||
     step.attempt !== 1 ||
-    !sameInstant(started.createdAt, eventTime) ||
-    !sameInstant(completed.createdAt, eventTime) ||
-    !sameInstant(step.createdAt, eventTime) ||
-    !sameInstant(step.startedAt, eventTime) ||
-    !sameInstant(step.completedAt, eventTime) ||
-    !sameInstant(step.updatedAt, eventTime) ||
+    !sameInstant(step.createdAt, createdAt) ||
+    !sameInstant(step.startedAt, startedAt) ||
+    !sameInstant(step.completedAt, completedAt) ||
+    !sameInstant(step.updatedAt, completedAt) ||
     !isDeepStrictEqual(step.input, createdData.input) ||
     !isDeepStrictEqual(step.output, completedData.result)
   ) {
     return undefined;
   }
 
-  const optionalNumber = (nested: unknown): number | null =>
-    typeof nested === 'number' ? nested : null;
-  const optimizations = completedData.optimizations;
-  if (
-    createdData.input === undefined ||
-    completedData.result === undefined ||
-    [
-      completedData.ttfs,
-      completedData.stso,
-      completedData.stepCount,
-      completedData.eventCount,
-    ].some(
-      (nested) => nested !== undefined && typeof nested !== 'number'
-    ) ||
-    (optimizations !== undefined &&
-      (!Array.isArray(optimizations) ||
-        !optimizations.every((item) => typeof item === 'string')))
-  ) {
+  if (createdData.input === undefined || completedData.result === undefined) {
     return undefined;
   }
+  const completedExtras = Object.fromEntries(
+    Object.entries(completedData).filter(
+      ([key, nested]) =>
+        nested !== undefined &&
+        key !== 'result' &&
+        key !== 'stepName' &&
+        key !== 'workflowName'
+    )
+  );
 
   return {
     v: 2,
     c: [
-      2,
+      3,
       [created.eventId, started.eventId, completed.eventId],
       stepId,
-      eventTime,
+      [createdAt, startedAt, completedAt],
       stepName,
       workflowName,
       specVersion,
       createdData.input,
       completedData.result,
       ownerMessageId,
-      [
-        optionalNumber(completedData.ttfs),
-        optionalNumber(completedData.stso),
-        optionalNumber(completedData.stepCount),
-        optionalNumber(completedData.eventCount),
-        (optimizations as string[] | undefined) ?? null,
-      ],
+      completedExtras,
       commit.externalStateUpdatedAt ?? null,
     ],
   };
 }
 
-function parseCompactCompletedStepCommit(
+function parseCompactCompletedStepCommitV2(
   value: unknown[],
   runId: string,
   record: number
 ): RunCommit {
   if (
     value.length !== 12 ||
+    value[0] !== 2 ||
     !Array.isArray(value[1]) ||
     value[1].length !== 3 ||
     !value[1].every((eventId) => typeof eventId === 'string') ||
@@ -545,7 +536,7 @@ function parseCompactCompletedStepCommit(
     ownerMessageId,
     telemetry,
     externalStateUpdatedAt,
-  ] = value as CompactCompletedStepFields;
+  ] = value as CompactCompletedStepFieldsV2;
   const [ttfs, stso, stepCount, eventCount, optimizations] = telemetry;
   if (
     [ttfs, stso, stepCount, eventCount].some(
@@ -614,6 +605,116 @@ function parseCompactCompletedStepCommit(
   };
 }
 
+function parseCompactCompletedStepCommitV3(
+  value: unknown[],
+  runId: string,
+  record: number
+): RunCommit {
+  const eventTimes = value[3];
+  const completedExtras = value[10];
+  if (
+    value.length !== 12 ||
+    value[0] !== 3 ||
+    !Array.isArray(value[1]) ||
+    value[1].length !== 3 ||
+    !value[1].every((eventId) => typeof eventId === 'string') ||
+    typeof value[2] !== 'string' ||
+    !Array.isArray(eventTimes) ||
+    eventTimes.length !== 3 ||
+    !eventTimes.every(
+      (nested) => typeof nested === 'string' || nested instanceof Date
+    ) ||
+    typeof value[4] !== 'string' ||
+    typeof value[5] !== 'string' ||
+    typeof value[6] !== 'number' ||
+    typeof value[9] !== 'string' ||
+    typeof completedExtras !== 'object' ||
+    completedExtras === null ||
+    Array.isArray(completedExtras) ||
+    (value[11] !== null && typeof value[11] !== 'number')
+  ) {
+    throw new Error('Invalid compact Ursula World completed-step commit');
+  }
+  const [
+    ,
+    eventIds,
+    stepId,
+    [createdAt, startedAt, completedAt],
+    stepName,
+    workflowName,
+    specVersion,
+    input,
+    output,
+    ownerMessageId,
+    extras,
+    externalStateUpdatedAt,
+  ] = value as CompactCompletedStepFieldsV3;
+  if (
+    Object.hasOwn(extras, 'result') ||
+    Object.hasOwn(extras, 'stepName') ||
+    Object.hasOwn(extras, 'workflowName')
+  ) {
+    throw new Error('Invalid compact Ursula World completed-step extras');
+  }
+  const events = [
+    EventSchema.parse({
+      runId,
+      eventId: eventIds[0],
+      eventType: 'step_created',
+      correlationId: stepId,
+      createdAt,
+      specVersion,
+      eventData: { input, stepName },
+    }),
+    EventSchema.parse({
+      runId,
+      eventId: eventIds[1],
+      eventType: 'step_started',
+      correlationId: stepId,
+      createdAt: startedAt,
+      specVersion,
+      eventData: { ownerMessageId, stepName, workflowName },
+    }),
+    EventSchema.parse({
+      runId,
+      eventId: eventIds[2],
+      eventType: 'step_completed',
+      correlationId: stepId,
+      createdAt: completedAt,
+      specVersion,
+      eventData: {
+        result: output,
+        stepName,
+        workflowName,
+        ...extras,
+      },
+    }),
+  ];
+  const step = StepSchema.parse({
+    runId,
+    stepId,
+    stepName,
+    status: 'completed',
+    input,
+    output,
+    attempt: 1,
+    createdAt,
+    startedAt,
+    completedAt,
+    updatedAt: completedAt,
+    specVersion,
+  });
+  return {
+    version: 1,
+    operationId: '',
+    runId,
+    previousRecord: record,
+    events,
+    steps: [{ id: stepId, value: step }],
+    ...(externalStateUpdatedAt === null ? {} : { externalStateUpdatedAt }),
+  };
+}
+
 function parseCommit(
   value: unknown,
   runId?: string,
@@ -631,7 +732,9 @@ function parseCommit(
     if (!Array.isArray(fields)) {
       throw new Error('Invalid compact Ursula World completed-step commit');
     }
-    return parseCompactCompletedStepCommit(fields, runId, record);
+    return fields[0] === 3
+      ? parseCompactCompletedStepCommitV3(fields, runId, record)
+      : parseCompactCompletedStepCommitV2(fields, runId, record);
   }
   if (typeof value !== 'object' || value === null) {
     throw new Error('Invalid Ursula World run commit');
