@@ -1,0 +1,321 @@
+{
+  "version": 1,
+  "methodologyVersion": 3,
+  "kind": "capacity-sweep",
+  "app": "eks-nextjs",
+  "backend": "postgres-rds-multi-az",
+  "generatedAt": "2026-07-27T12:00:32.121Z",
+  "config": {
+    "runCounts": [
+      100,
+      250,
+      500
+    ],
+    "stepCount": 50,
+    "iterations": 1,
+    "queueShards": 8,
+    "runTimeoutMs": 600000
+  },
+  "levels": [
+    {
+      "runCount": 100,
+      "stepCount": 50,
+      "iterations": 1,
+      "logicalSteps": 5000,
+      "startedAt": "2026-07-27T11:58:59.969Z",
+      "finishedAt": "2026-07-27T11:59:12.773Z",
+      "wallClockMs": 12804,
+      "metrics": {
+        "makespanMs": {
+          "best": 12546,
+          "avg": 12546,
+          "p75": 12546,
+          "p90": 12546,
+          "p99": 12546,
+          "samples": 1
+        },
+        "stepsPerSecond": {
+          "best": 398.5,
+          "avg": 398.5,
+          "p75": 398.5,
+          "p90": 398.5,
+          "p99": 398.5,
+          "samples": 1
+        },
+        "runDurationMs": {
+          "best": 7149,
+          "avg": 10324.3,
+          "p75": 11704,
+          "p90": 12076,
+          "p99": 12383,
+          "samples": 100
+        },
+        "ttfsMs": {
+          "best": 215,
+          "avg": 611.6,
+          "p75": 687,
+          "p90": 1041,
+          "p99": 1246,
+          "samples": 100
+        }
+      },
+      "backendUsage": {
+        "before": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T11:58:59.967Z",
+          "counters": {
+            "database_bytes": 149460659,
+            "xact_commit": 5474923,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 30903651,
+            "tup_returned": 26854392,
+            "tup_fetched": 16755008,
+            "tup_inserted": 324598,
+            "tup_updated": 97040,
+            "tup_deleted": 4245,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "after": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T11:59:12.801Z",
+          "counters": {
+            "database_bytes": 158381747,
+            "xact_commit": 5513469,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 33282050,
+            "tup_returned": 28791012,
+            "tup_fetched": 18344560,
+            "tup_inserted": 344364,
+            "tup_updated": 106940,
+            "tup_deleted": 4302,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "delta": {
+          "database_bytes": 8921088,
+          "xact_commit": 38546,
+          "xact_rollback": 0,
+          "blks_read": 0,
+          "blks_hit": 2378399,
+          "tup_returned": 1936620,
+          "tup_fetched": 1589552,
+          "tup_inserted": 19766,
+          "tup_updated": 9900,
+          "tup_deleted": 57,
+          "temp_files": 0,
+          "temp_bytes": 0
+        },
+        "derived": {
+          "gatewayLeaderCacheHitRatio": 0
+        }
+      }
+    },
+    {
+      "runCount": 250,
+      "stepCount": 50,
+      "iterations": 1,
+      "logicalSteps": 12500,
+      "startedAt": "2026-07-27T11:59:12.831Z",
+      "finishedAt": "2026-07-27T11:59:38.811Z",
+      "wallClockMs": 25980,
+      "metrics": {
+        "makespanMs": {
+          "best": 25655,
+          "avg": 25655,
+          "p75": 25655,
+          "p90": 25655,
+          "p99": 25655,
+          "samples": 1
+        },
+        "stepsPerSecond": {
+          "best": 487.2,
+          "avg": 487.2,
+          "p75": 487.2,
+          "p90": 487.2,
+          "p99": 487.2,
+          "samples": 1
+        },
+        "runDurationMs": {
+          "best": 18835,
+          "avg": 22114.5,
+          "p75": 22991,
+          "p90": 23556,
+          "p99": 25391,
+          "samples": 250
+        },
+        "ttfsMs": {
+          "best": 110,
+          "avg": 1653.2,
+          "p75": 1249,
+          "p90": 1659,
+          "p99": 20269,
+          "samples": 250
+        }
+      },
+      "backendUsage": {
+        "before": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T11:59:12.830Z",
+          "counters": {
+            "database_bytes": 158381747,
+            "xact_commit": 5513494,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 33282487,
+            "tup_returned": 28791255,
+            "tup_fetched": 18344690,
+            "tup_inserted": 344364,
+            "tup_updated": 106940,
+            "tup_deleted": 4302,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "after": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T11:59:38.843Z",
+          "counters": {
+            "database_bytes": 186308275,
+            "xact_commit": 5611149,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 42920480,
+            "tup_returned": 38244022,
+            "tup_fetched": 25270519,
+            "tup_inserted": 395180,
+            "tup_updated": 132490,
+            "tup_deleted": 4539,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "delta": {
+          "database_bytes": 27926528,
+          "xact_commit": 97655,
+          "xact_rollback": 0,
+          "blks_read": 0,
+          "blks_hit": 9637993,
+          "tup_returned": 9452767,
+          "tup_fetched": 6925829,
+          "tup_inserted": 50816,
+          "tup_updated": 25550,
+          "tup_deleted": 237,
+          "temp_files": 0,
+          "temp_bytes": 0
+        },
+        "derived": {
+          "gatewayLeaderCacheHitRatio": 0
+        }
+      }
+    },
+    {
+      "runCount": 500,
+      "stepCount": 50,
+      "iterations": 1,
+      "logicalSteps": 25000,
+      "startedAt": "2026-07-27T11:59:38.872Z",
+      "finishedAt": "2026-07-27T12:00:32.086Z",
+      "wallClockMs": 53214,
+      "metrics": {
+        "makespanMs": {
+          "best": 52902,
+          "avg": 52902,
+          "p75": 52902,
+          "p90": 52902,
+          "p99": 52902,
+          "samples": 1
+        },
+        "stepsPerSecond": {
+          "best": 472.6,
+          "avg": 472.6,
+          "p75": 472.6,
+          "p90": 472.6,
+          "p99": 472.6,
+          "samples": 1
+        },
+        "runDurationMs": {
+          "best": 22577,
+          "avg": 38155.5,
+          "p75": 47615,
+          "p90": 49825,
+          "p99": 52103,
+          "samples": 500
+        },
+        "ttfsMs": {
+          "best": 88,
+          "avg": 15531.8,
+          "p75": 28134,
+          "p90": 29949,
+          "p99": 46271,
+          "samples": 500
+        }
+      },
+      "backendUsage": {
+        "before": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T11:59:38.871Z",
+          "counters": {
+            "database_bytes": 186308275,
+            "xact_commit": 5611167,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 42920769,
+            "tup_returned": 38244153,
+            "tup_fetched": 25270649,
+            "tup_inserted": 395180,
+            "tup_updated": 132490,
+            "tup_deleted": 4539,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "after": {
+          "kind": "postgres",
+          "capturedAt": "2026-07-27T12:00:32.118Z",
+          "counters": {
+            "database_bytes": 246691507,
+            "xact_commit": 5823304,
+            "xact_rollback": 4,
+            "blks_read": 33,
+            "blks_hit": 58676542,
+            "tup_returned": 56259484,
+            "tup_fetched": 36976692,
+            "tup_inserted": 497782,
+            "tup_updated": 184140,
+            "tup_deleted": 5155,
+            "temp_files": 0,
+            "temp_bytes": 0
+          },
+          "targets": 1
+        },
+        "delta": {
+          "database_bytes": 60383232,
+          "xact_commit": 212137,
+          "xact_rollback": 0,
+          "blks_read": 0,
+          "blks_hit": 15755773,
+          "tup_returned": 18015331,
+          "tup_fetched": 11706043,
+          "tup_inserted": 102602,
+          "tup_updated": 51650,
+          "tup_deleted": 616,
+          "temp_files": 0,
+          "temp_bytes": 0
+        },
+        "derived": {
+          "gatewayLeaderCacheHitRatio": 0
+        }
+      }
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-27
 
-Status: the Workflow-level capacity sweep, raw-storage isolation benchmark, first high-cardinality server follow-ups, and a fair application-CPU headroom rerun are complete. Ursula 0.3.22 removes the aged-state throughput collapse and beats the distributed PostgreSQL World mutation path, but the complete Workflow runtime converges with PostgreSQL once both receive eight application cores. The active investigation is now deterministic replay/application CPU rather than Raft throughput. New-stream tail latency and production cold-storage economics also remain open. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
+Status: the Workflow-level capacity sweep, raw-storage isolation benchmark, high-cardinality server follow-ups, and the first structural Workflow-runtime pass are complete. On the current fair eight-application-pod topology, the median complete-Workflow result is now 584.8 steps/s for Ursula versus 428.6 steps/s for PostgreSQL, a 1.364× advantage, with materially lower run and TTFS p99. This is real progress but still below the 1.5× throughput goal. Fixed Ursula backend cost normalizes 48.0% below the RDS comparator and current packed cold objects are approximately 8 MiB, but total cost is not signed off until cross-AZ bytes, snapshot/reference writes, and longer retention are measured. The active investigation is now dispatcher ownership and request/network amplification rather than Raft throughput or further queue-partition tuning.
 
 ## Goal
 
@@ -25,6 +25,51 @@ The comparison must answer three different questions:
 | Workload | Vercel Workflow-compatible sequential no-op steps through the same benchmark application |
 
 Application compute is common to both backends and is excluded from backend price comparisons, but its CPU and memory must still be sampled to prove it did not become the load generator bottleneck.
+
+## 2026-07-27 structural Workflow rerun
+
+This rerun supersedes the earlier complete-Workflow comparison, but does not replace the historical primitive and failure-analysis sections below. It used Ursula 0.3.22 on three `m7g.large` voters across three availability zones with memory WAL, S3 cold storage, and 256 Raft groups. Both backends used eight one-core application pods spread four-per-node over the same two `m7g.xlarge` ARM workers. PostgreSQL remained RDS PostgreSQL 17 Multi-AZ on `db.m7g.large` with 100 GiB gp3.
+
+The measured path includes the structural changes accumulated through `workflow-world-ursula` PRs #64–#72:
+
+- one owned logical step commits its run events and entity deltas in one authoritative Ursula append;
+- the benchmark tree-shakes the Workflow VM bundle from 624,177 bytes to 32,584 bytes without changing replay semantics;
+- hot run-journal reads slice the requested event page instead of cloning the entire retained event history;
+- idempotent reads and producer-deduplicated writes retry temporary leader-unknown `503` responses;
+- Ursula JSON decoding uses native `JSON.parse` plus an object-only tagged-value walk instead of invoking a reviver callback for every primitive.
+
+Each sample below is an independent no-profiler `500 runs × 50 sequential steps` job on the same warmed application and backend topology. Reporting the median of three jobs avoids selecting the previous 636.7 steps/s high sample as the headline.
+
+| Complete Workflow metric | Ursula samples | PostgreSQL samples | Median comparison |
+| --- | ---: | ---: | ---: |
+| Throughput | 524.7, 584.8, 609.6 steps/s | 402.2, 428.6, 472.6 steps/s | **584.8 vs 428.6; Ursula 1.364×** |
+| Run-duration p99 | 40.081, 41.343, 45.749 s | 52.103, 57.314, 60.879 s | **41.343 vs 57.314 s; Ursula 27.9% lower** |
+| TTFS p99 | 26.753, 27.650, 33.718 s | 46.271, 46.625, 52.327 s | **27.650 vs 46.625 s; Ursula 40.7% lower** |
+| Backend state transitions | 28,533–28,627 accepted appends | 212,137–218,771 committed transactions | approximately 1.14 appends vs 8.49 transactions per logical step |
+
+The p99 goal is met at this stress point. The throughput goal is not: 1.5× the PostgreSQL median is 642.9 steps/s, so Ursula still needs another 9.9% over its measured median without worsening tails. Increasing physical queue partitions from 8 to 32 was tested and rejected: it delivered 521.2 steps/s with 46.317 s run p99 and 40.786 s TTFS p99 because every application replica opened more partition watchers.
+
+CPU profiles show why more Raft parameter tuning is unlikely to close this gap. Ursula's storage mutation path is already faster, and one logical step is already approximately one append. The remaining wall time is dominated by Workflow VM/replay scheduling, garbage collection, application `runMicrotasks`, JSON decoding, and duplicated dispatcher/watch activity. The next structural experiment is explicit partition ownership or a smaller dedicated dispatcher set so that eight application replicas do not all maintain every queue-partition long poll.
+
+### Current per-million-step cost boundary
+
+This is an always-busy shared-service normalization, not a per-tenant fixed-cost allocation. It excludes the identical application tier.
+
+| Backend | Monthly fixed backend | Median throughput | Fixed cost / 1M steps |
+| --- | ---: | ---: | ---: |
+| Ursula, shared EKS, `3 × m7g.large` | $190.70 | 584.8 steps/s | **$0.126** |
+| RDS Multi-AZ `db.m7g.large` + 100 GiB gp3 | $269.01 | 428.6 steps/s | **$0.242** |
+
+The fixed Ursula component is 48.0% lower. Across the combined 75,000-step Ursula measurement window, the cold counters advanced by two physical uploads and 16,550,524 bytes while publishing 202 logical stream slices. The two shared objects averaged 8,275,262 bytes, matching the intended approximately 8 MiB pack target. Normalized to one million steps, that observed window is approximately 26.7 physical PUTs, 221 MB of retained payload, about `$0.00013` in PUT charges, and about `$0.005` for the first retained month. Flush is asynchronous—the individual job deltas were zero, two, and zero uploads—so this combined window is evidence for object shape and order of magnitude, not an exact per-job bill.
+
+On that limited evidence, fixed backend plus packed payload is approximately `$0.131 / 1M` steps before snapshot/reference writes, reads, cross-AZ transfer, backups, and operations, versus `$0.242 / 1M` for the RDS baseline. Ursula must remain below `$0.169 / 1M` to satisfy the 30% total-cost target, leaving only about `$0.039 / 1M` for the unmeasured items. Current EC2 network counters cannot separate same-AZ traffic, cross-AZ traffic, duplicated sender/receiver accounting, background Raft traffic, or application traffic. The total-cost target therefore remains unverified; the next benchmark must collect per-AZ billable bytes or VPC flow-log evidence rather than infer them from aggregate `NetworkIn`/`NetworkOut`.
+
+### Immediate next gates
+
+1. Prototype dispatcher/partition ownership that preserves failover while reducing the current `applications × queues × partitions` watcher multiplication.
+2. Repeat the exact three-job Ursula/PostgreSQL comparison and require at least 642.9 median Ursula steps/s with no run-p99 regression.
+3. Instrument cross-AZ and snapshot/reference bytes over the exact job window; require total Ursula backend cost below `$0.169 / 1M` steps.
+4. Upstream the `@workflow/world` side-effect metadata fix so the 94.8% VM-bundle reduction is not benchmark-local.
 
 ## Numbers obtained so far
 
