@@ -356,22 +356,25 @@ export function createQueue(
       const handler = deliveryBaseUrl() ? undefined : handlerFor(queueName);
       if (!handler && !deliveryBaseUrl()) continue;
       while (inFlight.size < concurrency) {
-        const lease = await journal.claim(
+        const leases = await journal.claimMany(
           queueName,
           new Date(),
-          leaseDurationMs
+          leaseDurationMs,
+          concurrency - inFlight.size
         );
-        if (!lease) break;
-        const task = deliverChain(queueName, lease, handler)
-          .catch(() => {
-            // Delivery already persisted a retry when possible. A lost lease
-            // is safely recovered by expiry on another dispatcher.
-          })
-          .finally(() => {
-            inFlight.delete(task);
-            wake();
-          });
-        inFlight.add(task);
+        if (leases.length === 0) break;
+        for (const lease of leases) {
+          const task = deliverChain(queueName, lease, handler)
+            .catch(() => {
+              // Delivery already persisted a retry when possible. A lost lease
+              // is safely recovered by expiry on another dispatcher.
+            })
+            .finally(() => {
+              inFlight.delete(task);
+              wake();
+            });
+          inFlight.add(task);
+        }
       }
     }
     return queueNames;
