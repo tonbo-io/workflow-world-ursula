@@ -1,6 +1,8 @@
-import type { Event, WorkflowRun } from '@workflow/world';
+import type { Event, Step, WorkflowRun } from '@workflow/world';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  parseUrsulaJson,
+  stringifyUrsulaJson,
   type UrsulaAppendOptions,
   UrsulaClient,
   UrsulaRequestError,
@@ -28,6 +30,32 @@ class MemoryClient {
         !stream.startsWith('run-checkpoint-')
       ) {
         this.streams.set(stream, []);
+      }
+    }
+  }
+
+  runRecordValues(): unknown[] {
+    return [...this.streams.entries()]
+      .filter(
+        ([stream]) =>
+          stream.startsWith('run-') &&
+          !stream.startsWith('run-checkpoint-')
+      )
+      .flatMap(([, values]) => values);
+  }
+
+  roundTripRunRecordsThroughJson(): void {
+    for (const [stream, values] of this.streams) {
+      if (
+        stream.startsWith('run-') &&
+        !stream.startsWith('run-checkpoint-')
+      ) {
+        this.streams.set(
+          stream,
+          values.map((value) =>
+            parseUrsulaJson(stringifyUrsulaJson(value))
+          )
+        );
       }
     }
   }
@@ -302,6 +330,105 @@ describe('RunJournal', () => {
     const body = JSON.parse(append?.[1]?.body as string);
     expect(body.events).toHaveLength(1);
     expect(body.run.status).toBe('pending');
+  });
+
+  it('compacts an owned completed step and lets an unconditional reader rebuild it', async () => {
+    const client = new MemoryClient();
+    const runId = 'wrun_compact_step';
+    const stepId = 'step_compact';
+    const createdAt = new Date('2026-07-28T00:00:00.000Z');
+    const input = Uint8Array.from([1, 2, 3]);
+    const output = Uint8Array.from([4, 5, 6]);
+    const events = [
+      {
+        eventType: 'step_created',
+        correlationId: stepId,
+        eventData: {
+          input,
+          stepName: 'step//test//compact',
+        },
+        runId,
+        eventId: 'evnt_compact_created',
+        createdAt,
+        specVersion: 5,
+      },
+      {
+        eventType: 'step_started',
+        correlationId: stepId,
+        eventData: {
+          ownerMessageId: 'msg_compact',
+          stepName: 'step//test//compact',
+          workflowName: 'workflow//test//compact',
+        },
+        runId,
+        eventId: 'evnt_compact_started',
+        createdAt,
+        specVersion: 5,
+      },
+      {
+        eventType: 'step_completed',
+        correlationId: stepId,
+        eventData: {
+          result: output,
+          stepName: 'step//test//compact',
+          workflowName: 'workflow//test//compact',
+          eventCount: 3,
+          optimizations: ['turbo'],
+          stepCount: 1,
+          stso: 7,
+        },
+        runId,
+        eventId: 'evnt_compact_completed',
+        createdAt,
+        specVersion: 5,
+      },
+    ] satisfies Event[];
+    const step = {
+      runId,
+      stepId,
+      stepName: 'step//test//compact',
+      status: 'completed',
+      input,
+      output,
+      attempt: 1,
+      startedAt: createdAt,
+      completedAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+      specVersion: 5,
+    } satisfies Step;
+    const commit = {
+      operationId: 'run-step-transaction:compact',
+      events,
+      steps: [{ id: stepId, value: step }],
+      externalStateUpdatedAt: createdAt.getTime(),
+    };
+    const writer = new RunJournal(client as unknown as UrsulaClient, {
+      compactCompletedStepCommits: true,
+    });
+    const state = await writer.loadForMutation(runId, {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    await writer.append(state, commit);
+
+    const stored = client.runRecordValues()[0];
+    expect(stored).toMatchObject({ v: 2 });
+    expect(Array.isArray((stored as { c: unknown }).c)).toBe(true);
+    expect(JSON.stringify(stored).length).toBeLessThan(
+      JSON.stringify({ ...commit, version: 1, runId, previousRecord: 0 })
+        .length * 0.5
+    );
+
+    client.roundTripRunRecordsThroughJson();
+    const reader = new RunJournal(client as unknown as UrsulaClient);
+    await expect(reader.load(runId)).resolves.toMatchObject({
+      nextRecord: 1,
+    });
+    await expect(reader.events(runId)).resolves.toEqual(events);
+    await expect(reader.load(runId)).resolves.toMatchObject({
+      steps: new Map([[stepId, step]]),
+    });
   });
 
   it('resumes cold-start materialization from the latest checkpoint', async () => {

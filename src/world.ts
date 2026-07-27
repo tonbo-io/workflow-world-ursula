@@ -15,6 +15,13 @@ export interface UrsulaWorldConfig
    * The runtime must guarantee one active handler for the owning queue message.
    */
   experimentalOwnedStepTransactions?: boolean;
+  /**
+   * Writes successful owned-step transactions in the compact journal format.
+   *
+   * Reader support is unconditional. Enable writing only after every process
+   * in a rolling deployment runs a version that understands the format.
+   */
+  experimentalCompactCompletedStepCommits?: boolean;
 }
 
 function positiveInteger(
@@ -104,6 +111,9 @@ function environmentConfig(): UrsulaWorldConfig {
     ),
     experimentalOwnedStepTransactions:
       process.env.WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS === '1',
+    experimentalCompactCompletedStepCommits:
+      process.env
+        .WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS === '1',
   };
 }
 
@@ -134,7 +144,10 @@ export function createWorld(
   config: UrsulaWorldConfig = environmentConfig()
 ): World {
   const client = new UrsulaClient(config);
-  const journal = new RunJournal(client);
+  const journal = new RunJournal(client, {
+    compactCompletedStepCommits:
+      config.experimentalCompactCompletedStepCommits,
+  });
   const executions = new RunExecutionCoordinator(journal, {
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
   });
