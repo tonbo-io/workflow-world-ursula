@@ -302,6 +302,9 @@ describe('Ursula queue runtime', () => {
     await vi.waitFor(() => expect(delivered).toHaveLength(3));
     await queue.close();
 
-    expect(delivered.slice(0, 2)).toEqual(['first-1', 'second-1']);
+    expect(delivered.slice(0, 2)).toContain('second-1');
+    expect(
+      delivered.slice(0, 2).filter((runId) => runId.startsWith('first-'))
+    ).toHaveLength(1);
   });
 });

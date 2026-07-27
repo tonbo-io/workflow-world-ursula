@@ -138,7 +138,8 @@ window.
 Each logical Workflow queue is split into a fixed set of physical, append-only
 queue journals. The stable execution-lane key (`runId` plus `stepId` when
 present) selects one partition, so one lane remains ordered while unrelated
-runs no longer contend on one global record tail:
+runs no longer contend on one global record tail. No ordering is promised
+between independent execution lanes:
 
 ```text
 enqueued(availableAt)
