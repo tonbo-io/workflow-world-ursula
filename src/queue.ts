@@ -13,6 +13,10 @@ import {
   type UrsulaClient,
 } from './client.js';
 import {
+  RunExecutionCoordinator,
+  type DeliveryExecution,
+} from './execution.js';
+import {
   QueueJournal,
   queuePartition,
   type QueueLease,
@@ -76,7 +80,8 @@ function positiveInteger(
  */
 export function createQueue(
   client: UrsulaClient,
-  config: UrsulaQueueConfig = {}
+  config: UrsulaQueueConfig = {},
+  executions?: RunExecutionCoordinator
 ): UrsulaQueue {
   const pollIntervalMs = positiveInteger(
     config.pollIntervalMs,
@@ -187,6 +192,33 @@ export function createQueue(
     return journal;
   }
 
+  function deliveryExecution(
+    lease: QueueLease
+  ): DeliveryExecution | undefined {
+    const message = lease.message.message;
+    const runId =
+      'runId' in message
+        ? message.runId
+        : 'workflowRunId' in message
+          ? message.workflowRunId
+          : undefined;
+    if (!runId) return;
+    const stepId =
+      'stepId' in message && typeof message.stepId === 'string'
+        ? message.stepId
+        : undefined;
+    const expiresAt = lease.message.leaseExpiresAt;
+    if (!expiresAt) return;
+    return {
+      runId,
+      lane: stepId ? `step:${stepId}` : 'run',
+      token: lease.leaseId,
+      ownerMessageId: lease.message.messageId,
+      attempt: lease.message.attempt,
+      expiresAt,
+    };
+  }
+
   function partitionKey(
     queueName: ValidQueueName,
     partition: number
@@ -265,6 +297,7 @@ export function createQueue(
       );
     }
     const kind = parseQueueName(queueName).kind;
+    const execution = deliveryExecution(lease);
     const response = await fetch(
       createWorkflowUrl(baseUrl, {
         type: kind === 'workflow' ? 'flow' : 'step',
@@ -277,6 +310,15 @@ export function createQueue(
           'x-vqs-queue-name': queueName,
           'x-vqs-message-id': lease.message.messageId,
           'x-vqs-message-attempt': String(lease.message.attempt),
+          ...(execution
+            ? {
+                'x-ursula-run-id': execution.runId,
+                'x-ursula-execution-lane': execution.lane,
+                'x-ursula-execution-token': execution.token,
+                'x-ursula-execution-expires-at':
+                  execution.expiresAt.toISOString(),
+              }
+            : {}),
         },
         body: stringifyUrsulaJson(lease.message.message),
       }
@@ -300,14 +342,16 @@ export function createQueue(
     handler: QueueHandler | undefined
   ): Promise<{ timeoutSeconds?: number } | undefined> {
     if (!handler) return invokeHttp(queueName, lease);
-    return (
+    const call = async () =>
       (await handler(lease.message.message, {
         attempt: lease.message.attempt,
         queueName,
         messageId: lease.message.messageId,
         requestId: lease.message.headers?.['x-vercel-id'],
-      })) ?? undefined
-    );
+      })) ?? undefined;
+    return executions
+      ? executions.run(deliveryExecution(lease), call)
+      : call();
   }
 
   async function heartbeat(
@@ -558,15 +602,39 @@ export function createQueue(
         );
       }
       try {
-        const result = await handler(
-          parseUrsulaJson<unknown>(await request.text()),
-          {
+        const message = parseUrsulaJson<unknown>(await request.text());
+        const call = async () =>
+          handler(message, {
             attempt,
             queueName: queueName.data,
             messageId: messageId.data,
             requestId: request.headers.get('x-vercel-id') ?? undefined,
-          }
+          });
+        const runId = request.headers.get('x-ursula-run-id');
+        const lane = request.headers.get('x-ursula-execution-lane');
+        const token = request.headers.get('x-ursula-execution-token');
+        const expiresAtRaw = request.headers.get(
+          'x-ursula-execution-expires-at'
         );
+        const expiresAt = expiresAtRaw ? new Date(expiresAtRaw) : undefined;
+        const execution =
+          runId &&
+          lane &&
+          token &&
+          expiresAt &&
+          !Number.isNaN(expiresAt.getTime())
+            ? {
+                runId,
+                lane,
+                token,
+                ownerMessageId: messageId.data,
+                attempt,
+                expiresAt,
+              }
+            : undefined;
+        const result = executions
+          ? await executions.run(execution, call)
+          : await call();
         return Response.json(result ?? { ok: true });
       } catch (error) {
         return Response.json(String(error), { status: 500 });

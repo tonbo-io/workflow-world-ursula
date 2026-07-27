@@ -19,6 +19,15 @@ export interface EntityChange<T> {
   value: T | null;
 }
 
+export interface RunExecutionLease {
+  lane: string;
+  token: string;
+  ownerMessageId: string;
+  attempt: number;
+  expiresAt: Date;
+  generation: number;
+}
+
 export interface RunCommit {
   version: 1;
   operationId: string;
@@ -29,6 +38,7 @@ export interface RunCommit {
   steps?: EntityChange<Step>[];
   hooks?: EntityChange<Hook>[];
   waits?: EntityChange<Wait>[];
+  executionLeases?: EntityChange<RunExecutionLease>[];
   externalStateUpdatedAt?: number;
 }
 
@@ -40,6 +50,7 @@ export interface RunJournalState {
   hooks: Map<string, Hook>;
   hookRetentionUntil: Map<string, Date>;
   waits: Map<string, Wait>;
+  executionLeases: Map<string, RunExecutionLease>;
   externalStateUpdatedAt?: number;
 }
 
@@ -52,6 +63,9 @@ interface RunCheckpoint {
   hooks: Hook[];
   hookRetentionUntil: [string, string][];
   waits: Wait[];
+  executionLeases: Array<
+    Omit<RunExecutionLease, 'expiresAt'> & { expiresAt: string }
+  >;
   externalStateUpdatedAt?: number;
 }
 
@@ -96,6 +110,7 @@ function emptyState(runId: string): RunJournalState {
     hooks: new Map(),
     hookRetentionUntil: new Map(),
     waits: new Map(),
+    executionLeases: new Map(),
   };
 }
 
@@ -105,6 +120,17 @@ function cloneState(state: RunJournalState): RunJournalState {
   // record. Competing callers retain their own nextRecord scalar and therefore
   // still fail the stale CAS before applying their materialization.
   return { ...state };
+}
+
+function cloneStateForPreview(state: RunJournalState): RunJournalState {
+  return {
+    ...state,
+    steps: new Map(state.steps),
+    hooks: new Map(state.hooks),
+    hookRetentionUntil: new Map(state.hookRetentionUntil),
+    waits: new Map(state.waits),
+    executionLeases: new Map(state.executionLeases),
+  };
 }
 
 function checkpointFromState(state: RunJournalState): RunCheckpoint {
@@ -120,6 +146,10 @@ function checkpointFromState(state: RunJournalState): RunCheckpoint {
       value.toISOString(),
     ]),
     waits: [...state.waits.values()],
+    executionLeases: [...state.executionLeases.values()].map((lease) => ({
+      ...lease,
+      expiresAt: lease.expiresAt.toISOString(),
+    })),
     ...(state.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: state.externalStateUpdatedAt }
       : {}),
@@ -140,7 +170,9 @@ function stateFromCheckpoint(
     !Array.isArray(checkpoint.steps) ||
     !Array.isArray(checkpoint.hooks) ||
     !Array.isArray(checkpoint.hookRetentionUntil) ||
-    !Array.isArray(checkpoint.waits)
+    !Array.isArray(checkpoint.waits) ||
+    (checkpoint.executionLeases !== undefined &&
+      !Array.isArray(checkpoint.executionLeases))
   ) {
     return;
   }
@@ -175,6 +207,12 @@ function stateFromCheckpoint(
           return [parsed.waitId, parsed];
         })
       ),
+      executionLeases: new Map(
+        (checkpoint.executionLeases ?? []).map((lease) => {
+          const parsed = parseExecutionLease(lease);
+          return [parsed.lane, parsed];
+        })
+      ),
       ...(checkpoint.externalStateUpdatedAt !== undefined
         ? { externalStateUpdatedAt: checkpoint.externalStateUpdatedAt }
         : {}),
@@ -182,6 +220,39 @@ function stateFromCheckpoint(
   } catch {
     return;
   }
+}
+
+function parseExecutionLease(value: unknown): RunExecutionLease {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Invalid Ursula World run execution lease');
+  }
+  const lease = value as Partial<
+    Omit<RunExecutionLease, 'expiresAt'> & { expiresAt: unknown }
+  >;
+  if (
+    typeof lease.lane !== 'string' ||
+    typeof lease.token !== 'string' ||
+    typeof lease.ownerMessageId !== 'string' ||
+    !Number.isSafeInteger(lease.attempt) ||
+    (lease.attempt as number) < 1 ||
+    typeof lease.expiresAt !== 'string' ||
+    !Number.isSafeInteger(lease.generation) ||
+    (lease.generation as number) < 1
+  ) {
+    throw new Error('Invalid Ursula World run execution lease');
+  }
+  const expiresAt = new Date(lease.expiresAt);
+  if (Number.isNaN(expiresAt.getTime())) {
+    throw new Error('Invalid Ursula World run execution lease expiry');
+  }
+  return {
+    lane: lease.lane,
+    token: lease.token,
+    ownerMessageId: lease.ownerMessageId,
+    attempt: lease.attempt as number,
+    expiresAt,
+    generation: lease.generation as number,
+  };
 }
 
 function parseCommit(value: unknown): RunCommit {
@@ -226,6 +297,14 @@ function parseCommit(value: unknown): RunCommit {
           waits: commit.waits.map(({ id, value }) => ({
             id,
             value: value === null ? null : WaitSchema.parse(value),
+          })),
+        }
+      : {}),
+    ...(commit.executionLeases
+      ? {
+          executionLeases: commit.executionLeases.map(({ id, value }) => ({
+            id,
+            value: value === null ? null : parseExecutionLease(value),
           })),
         }
       : {}),
@@ -287,6 +366,7 @@ function applyCommit(
   applyChanges(state.steps, commit.steps);
   applyChanges(state.hooks, commit.hooks);
   applyChanges(state.waits, commit.waits);
+  applyChanges(state.executionLeases, commit.executionLeases);
   if (commit.externalStateUpdatedAt !== undefined) {
     state.externalStateUpdatedAt = commit.externalStateUpdatedAt;
   }
@@ -327,6 +407,24 @@ export class RunJournal {
   evict(runId: string): void {
     this.cache.delete(runId);
     this.eventCache.delete(runId);
+  }
+
+  preview(
+    state: RunJournalState,
+    commit: Omit<RunCommit, 'version' | 'runId' | 'previousRecord'>
+  ): RunJournalState {
+    const preview = cloneStateForPreview(state);
+    applyCommit(
+      preview,
+      {
+        ...commit,
+        version: 1,
+        runId: state.runId,
+        previousRecord: state.nextRecord,
+      },
+      state.nextRecord
+    );
+    return preview;
   }
 
   /**

@@ -5,11 +5,15 @@
   "scripts": {
     "benchmark": "vitest run benchmark.test.ts --reporter=verbose",
     "benchmark:raw": "vitest run raw-backend.test.ts --reporter=verbose",
+    "benchmark:world-storage": "vitest run world-storage.test.ts --reporter=verbose",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tonbo-io/world-ursula": "workspace:*",
+    "@workflow/world": "5.0.0-beta.22",
+    "@workflow/world-postgres": "5.0.0-beta.28",
     "pg": "8.20.0",
+    "ulid": "~3.0.1",
     "workflow": "https://workflow-tarballs-341yziqn7.labs.vercel.dev/workflow.tgz"
   },
   "devDependencies": {

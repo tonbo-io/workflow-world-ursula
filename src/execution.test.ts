@@ -1,0 +1,357 @@
+import type { AnyEventRequest } from '@workflow/world';
+import { describe, expect, it } from 'vitest';
+import {
+  type UrsulaAppendOptions,
+  UrsulaClient,
+  type UrsulaRecord,
+  UrsulaRequestError,
+} from './client.js';
+import {
+  type DeliveryExecution,
+  RunExecutionCoordinator,
+} from './execution.js';
+import { RunJournal, type RunCommit } from './run-journal.js';
+import { createStorage } from './storage.js';
+
+class MemoryClient extends UrsulaClient {
+  readonly appends: Array<{ stream: string; values: unknown[] }> = [];
+  private readonly streams = new Map<string, unknown[]>();
+
+  constructor() {
+    super({ baseUrl: 'https://ursula.test' });
+  }
+
+  async ensureJsonStream(stream: string): Promise<void> {
+    if (!this.streams.has(stream)) this.streams.set(stream, []);
+  }
+
+  async append<T>(
+    stream: string,
+    values: T | readonly T[],
+    options: UrsulaAppendOptions
+  ): Promise<{ startRecord: number; nextRecord: number }> {
+    const current = this.streams.get(stream) ?? [];
+    if (
+      options.expectedRecord !== undefined &&
+      options.expectedRecord !== current.length
+    ) {
+      throw new UrsulaRequestError(
+        'append records',
+        new Response('record tail mismatch', { status: 412 }),
+        'record tail mismatch'
+      );
+    }
+    const records = Array.isArray(values) ? [...values] : [values];
+    const startRecord = current.length;
+    current.push(...records);
+    this.streams.set(stream, current);
+    this.appends.push({ stream, values: records });
+    return { startRecord, nextRecord: current.length };
+  }
+
+  async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
+    return (this.streams.get(stream) ?? [])
+      .slice(start)
+      .map((value, index) => ({
+        record: start + index,
+        value: value as T,
+      }));
+  }
+
+  async read<T>(
+    stream: string,
+    start = 0,
+    limit = 1000
+  ): Promise<{
+    records: UrsulaRecord<T>[];
+    nextRecord: number;
+    closed: boolean;
+    upToDate: boolean;
+  }> {
+    const records = (await this.readAll<T>(stream, start)).slice(0, limit);
+    return {
+      records,
+      nextRecord: start + records.length,
+      closed: false,
+      upToDate: true,
+    };
+  }
+
+  async readTail<T>(
+    stream: string,
+    count = 1
+  ): Promise<{
+    records: UrsulaRecord<T>[];
+    nextRecord: number;
+    closed: boolean;
+    upToDate: boolean;
+  }> {
+    const values = this.streams.get(stream) ?? [];
+    const start = Math.max(0, values.length - count);
+    return {
+      records: values.slice(start).map((value, index) => ({
+        record: start + index,
+        value: value as T,
+      })),
+      nextRecord: values.length,
+      closed: false,
+      upToDate: true,
+    };
+  }
+
+  async publishSnapshotAtRecord(): Promise<void> {}
+
+  async advanceRetentionAtRecord(): Promise<void> {}
+
+  runCommits(): RunCommit[] {
+    return this.appends
+      .filter(
+        ({ stream }) =>
+          stream.startsWith('run-') &&
+          !stream.startsWith('run-checkpoint-')
+      )
+      .flatMap(({ values }) => values)
+      .filter(
+        (value): value is RunCommit =>
+          typeof value === 'object' &&
+          value !== null &&
+          'runId' in value &&
+          'events' in value
+      );
+  }
+}
+
+function delivery(
+  token: string,
+  overrides: Partial<DeliveryExecution> = {}
+): DeliveryExecution {
+  return {
+    runId: 'wrun_atomic',
+    lane: 'run',
+    token,
+    ownerMessageId: 'msg_atomic',
+    attempt: 1,
+    expiresAt: new Date(Date.now() + 60_000),
+    ...overrides,
+  };
+}
+
+function stepStarted(stepId: string): AnyEventRequest {
+  return {
+    eventType: 'step_started',
+    correlationId: stepId,
+    eventData: {
+      stepName: `step//test//${stepId}`,
+      workflowName: 'workflow//test//atomic',
+      input: Uint8Array.from([1]),
+      ownerMessageId: 'msg_atomic',
+    },
+    specVersion: 5,
+  };
+}
+
+function stepCompleted(stepId: string): AnyEventRequest {
+  return {
+    eventType: 'step_completed',
+    correlationId: stepId,
+    eventData: {
+      stepName: `step//test//${stepId}`,
+      workflowName: 'workflow//test//atomic',
+      result: Uint8Array.from([2]),
+    },
+    specVersion: 5,
+  };
+}
+
+async function setup(allowOwnedLazyStarts = true) {
+  const memory = new MemoryClient();
+  const client = memory;
+  const journal = new RunJournal(client);
+  const executions = new RunExecutionCoordinator(journal, {
+    allowOwnedLazyStarts,
+  });
+  const { storage } = createStorage(client, { journal, executions });
+  await storage.events.create('wrun_atomic', {
+    eventType: 'run_created',
+    eventData: {
+      deploymentId: 'dpl_atomic',
+      workflowName: 'workflow//test//atomic',
+      input: Uint8Array.from([0]),
+    },
+    specVersion: 5,
+  });
+  await storage.events.create('wrun_atomic', {
+    eventType: 'run_started',
+    specVersion: 5,
+  });
+  return { client, executions, journal, memory, storage };
+}
+
+describe('atomic step transactions', () => {
+  it('keeps the public two-append contract by default', async () => {
+    const { memory, storage } = await setup(false);
+    const before = memory.runCommits().length;
+
+    await storage.events.create('wrun_atomic', stepStarted('step-default'));
+    await storage.events.create('wrun_atomic', stepCompleted('step-default'));
+
+    expect(memory.runCommits().slice(before)).toHaveLength(2);
+  });
+
+  it('does not serialize owned commits from different runs', async () => {
+    const { executions } = await setup();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const first = executions.exclusive('run-a', async () => {
+      started();
+      await gate;
+    });
+    await firstStarted;
+
+    await expect(
+      executions.exclusive('run-b', async () => 'done')
+    ).resolves.toBe('done');
+    release();
+    await first;
+  });
+
+  it('commits an owned lazy turbo step without a queue delivery context', async () => {
+    const { memory, storage } = await setup();
+    const before = memory.runCommits().length;
+
+    const started = await storage.events.create(
+      'wrun_atomic',
+      stepStarted('step-turbo')
+    );
+    expect(started.step?.status).toBe('running');
+    await storage.events.create(
+      'wrun_atomic',
+      stepCompleted('step-turbo')
+    );
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(1);
+    expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
+      'step_created',
+      'step_started',
+      'step_completed',
+    ]);
+  });
+
+  it('commits step_started and step_completed in one run record', async () => {
+    const { executions, memory, storage } = await setup();
+    const before = memory.runCommits().length;
+
+    await executions.run(delivery('lease-1'), async () => {
+      const started = await storage.events.create(
+        'wrun_atomic',
+        stepStarted('step-1')
+      );
+      expect(started.step?.status).toBe('running');
+      await storage.events.create('wrun_atomic', stepCompleted('step-1'));
+    });
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(2);
+    expect(commits[0]?.events).toEqual([]);
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+      'step_created',
+      'step_started',
+      'step_completed',
+    ]);
+    await expect(
+      storage.steps.get('wrun_atomic', 'step-1')
+    ).resolves.toMatchObject({ status: 'completed', attempt: 1 });
+  });
+
+  it('serializes parallel terminal commits without losing either step', async () => {
+    const { executions, memory, storage } = await setup();
+    const before = memory.runCommits().length;
+
+    await executions.run(delivery('lease-parallel'), async () => {
+      await Promise.all([
+        (async () => {
+          await storage.events.create(
+            'wrun_atomic',
+            stepStarted('step-a')
+          );
+          await storage.events.create(
+            'wrun_atomic',
+            stepCompleted('step-a')
+          );
+        })(),
+        (async () => {
+          await storage.events.create(
+            'wrun_atomic',
+            stepStarted('step-b')
+          );
+          await storage.events.create(
+            'wrun_atomic',
+            stepCompleted('step-b')
+          );
+        })(),
+      ]);
+    });
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(3);
+    expect(
+      commits
+        .slice(1)
+        .flatMap(({ events }) => events)
+        .filter(({ eventType }) => eventType === 'step_completed')
+        .map(({ correlationId }) => correlationId)
+        .sort()
+    ).toEqual(['step-a', 'step-b']);
+  });
+
+  it('fences a stale handler after a newer lease generation takes over', async () => {
+    const { client, journal } = await setup();
+    const first = new RunExecutionCoordinator(journal);
+    const second = new RunExecutionCoordinator(journal);
+    const { storage } = createStorage(client, {
+      journal,
+      executions: first,
+    });
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let staged = () => {};
+    const stagedGate = new Promise<void>((resolve) => {
+      staged = resolve;
+    });
+    const stale = first.run(
+      delivery('lease-old', {
+        expiresAt: new Date(Date.now() + 20),
+      }),
+      async () => {
+        await storage.events.create('wrun_atomic', stepStarted('step-stale'));
+        staged();
+        await gate;
+        await storage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-stale')
+        );
+      }
+    );
+    await stagedGate;
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await second.run(
+      delivery('lease-new', {
+        ownerMessageId: 'msg_new',
+        attempt: 2,
+      }),
+      async () => {}
+    );
+    release();
+
+    await expect(stale).rejects.toThrow('changed ownership');
+  });
+});
