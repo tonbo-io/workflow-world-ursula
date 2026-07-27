@@ -40,7 +40,7 @@ describe.skipIf(!baseUrl || !bucket)('Ursula retention recovery', () => {
 
       const sourceStream = `queue-${createHash('sha256')
         .update(queueName)
-        .digest('base64url')}`;
+        .digest('base64url')}-p000`;
       const retainedRead = await new UrsulaClient({ baseUrl, bucket })
         .read(sourceStream, 0)
         .catch((error: unknown) => error);

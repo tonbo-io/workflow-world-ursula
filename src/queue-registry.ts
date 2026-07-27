@@ -5,12 +5,14 @@ import { type UrsulaClient, UrsulaRequestError } from './client.js';
 const QUEUE_REGISTRY_STREAM = 'registry-queues';
 
 interface QueueRegistration {
-  version: 1;
+  version: 1 | 2;
   queueName: ValidQueueName;
+  partition?: number;
 }
 
 export class QueueRegistry {
   private readonly queueNames = new Set<ValidQueueName>();
+  private readonly partitionsByQueue = new Map<ValidQueueName, Set<number>>();
   private nextRecord = 0;
 
   constructor(private readonly client: UrsulaClient) {}
@@ -28,26 +30,51 @@ export class QueueRegistry {
           `Ursula queue registry is discontinuous at record ${this.nextRecord}`
         );
       }
-      this.queueNames.add(ValidQueueNameSchema.parse(value.queueName));
+      const queueName = ValidQueueNameSchema.parse(value.queueName);
+      this.queueNames.add(queueName);
+      if (
+        value.version === 2 &&
+        Number.isSafeInteger(value.partition) &&
+        (value.partition ?? -1) >= 0
+      ) {
+        let partitions = this.partitionsByQueue.get(queueName);
+        if (!partitions) {
+          partitions = new Set();
+          this.partitionsByQueue.set(queueName, partitions);
+        }
+        partitions.add(value.partition as number);
+      }
       this.nextRecord = record + 1;
     }
   }
 
-  async register(queueName: ValidQueueName): Promise<void> {
-    if (this.queueNames.has(queueName)) return;
+  async register(queueName: ValidQueueName, partition: number): Promise<void> {
+    if (this.partitionsByQueue.get(queueName)?.has(partition)) return;
     await this.client.append(
       QUEUE_REGISTRY_STREAM,
-      { version: 1, queueName } satisfies QueueRegistration,
+      { version: 2, queueName, partition } satisfies QueueRegistration,
       {
-        operationId: `register-queue:${queueName}`,
+        operationId: `register-queue:${queueName}:partition:${partition}`,
         createIfMissing: true,
       }
     );
     this.queueNames.add(queueName);
+    let partitions = this.partitionsByQueue.get(queueName);
+    if (!partitions) {
+      partitions = new Set();
+      this.partitionsByQueue.set(queueName, partitions);
+    }
+    partitions.add(partition);
   }
 
   current(): ValidQueueName[] {
     return [...this.queueNames];
+  }
+
+  partitions(queueName: ValidQueueName): number[] {
+    return [...(this.partitionsByQueue.get(queueName) ?? [])].sort(
+      (left, right) => left - right
+    );
   }
 
   async list(): Promise<ValidQueueName[]> {

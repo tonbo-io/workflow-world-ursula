@@ -115,19 +115,25 @@ interface QueueCheckpoint {
 export interface QueueLease {
   message: QueueMessageState;
   leaseId: string;
+  partition: number;
 }
 
-function queueStream(queueName: ValidQueueName): string {
+function queueStream(queueName: ValidQueueName, partition: number): string {
   const digest = createHash('sha256').update(queueName).digest('base64url');
-  return `queue-${digest}`;
+  return `queue-${digest}-p${partition.toString().padStart(3, '0')}`;
 }
 
-function checkpointStream(queueName: ValidQueueName): string {
+function checkpointStream(
+  queueName: ValidQueueName,
+  partition: number
+): string {
   const digest = createHash('sha256').update(queueName).digest('base64url');
-  return `queue-checkpoint-${digest}`;
+  return `queue-checkpoint-${digest}-p${partition
+    .toString()
+    .padStart(3, '0')}`;
 }
 
-function concurrencyKey(message: QueuePayload): string {
+export function queueConcurrencyKey(message: QueuePayload): string {
   if ('runId' in message) {
     return message.stepId
       ? `run:${message.runId}:step:${message.stepId}`
@@ -137,6 +143,19 @@ function concurrencyKey(message: QueuePayload): string {
     return `run:${message.workflowRunId}:step:${message.stepId}`;
   }
   return `health:${message.correlationId}`;
+}
+
+export function queuePartition(
+  message: QueuePayload,
+  partitionCount: number
+): number {
+  if (!Number.isSafeInteger(partitionCount) || partitionCount < 1) {
+    throw new Error('Ursula queue partitionCount must be a positive integer');
+  }
+  const digest = createHash('sha256')
+    .update(queueConcurrencyKey(message))
+    .digest();
+  return digest.readUInt32BE(0) % partitionCount;
 }
 
 function pruneIdempotency(state: QueueState, now: Date): void {
@@ -155,7 +174,7 @@ function activeLeaseDeadlines(
   for (const message of state.messages.values()) {
     const leaseExpiresAt = message.leaseExpiresAt?.getTime() ?? 0;
     if (message.status === 'leased' && leaseExpiresAt > nowMs) {
-      deadlines.set(concurrencyKey(message.message), leaseExpiresAt);
+      deadlines.set(queueConcurrencyKey(message.message), leaseExpiresAt);
     }
   }
   return deadlines;
@@ -242,7 +261,14 @@ export class QueueJournal {
   private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
-  constructor(private readonly client: UrsulaClient) {}
+  constructor(
+    private readonly client: UrsulaClient,
+    readonly partition = 0
+  ) {
+    if (!Number.isSafeInteger(partition) || partition < 0) {
+      throw new Error('Ursula queue partition must be a non-negative integer');
+    }
+  }
 
   private checkpointFromState(
     queueName: ValidQueueName,
@@ -332,7 +358,9 @@ export class QueueJournal {
     let records: UrsulaRecord<unknown>[];
     try {
       records = (
-        await this.client.readTail<unknown>(checkpointStream(queueName))
+        await this.client.readTail<unknown>(
+          checkpointStream(queueName, this.partition)
+        )
       ).records;
     } catch (error) {
       if (isUrsulaRequestError(error, 404)) {
@@ -353,7 +381,7 @@ export class QueueJournal {
     queueName: ValidQueueName,
     checkpoint: QueueCheckpoint
   ): Promise<void> {
-    const checkpointStreamId = checkpointStream(queueName);
+    const checkpointStreamId = checkpointStream(queueName, this.partition);
     const receipt = await this.client.append(checkpointStreamId, checkpoint, {
       operationId: `queue-checkpoint:${queueName}:${checkpoint.sourceNextRecord}`,
       createIfMissing: true,
@@ -372,12 +400,12 @@ export class QueueJournal {
     // from the derived checkpoint stream, but this source snapshot is still
     // the safety proof that authorizes Ursula to discard the journal prefix.
     await this.client.publishSnapshotAtRecord(
-      queueStream(queueName),
+      queueStream(queueName, this.partition),
       checkpoint.sourceNextRecord,
       checkpoint
     );
     await this.client.advanceRetentionAtRecord(
-      queueStream(queueName),
+      queueStream(queueName, this.partition),
       checkpoint.sourceNextRecord
     );
   }
@@ -452,10 +480,14 @@ export class QueueJournal {
     this.appendTurns.set(queueName, currentTurn);
     if (previousTurn) await previousTurn;
     try {
-      await this.client.append(queueStream(queueName), transitions, {
-        operationId,
-        expectedRecord,
-      });
+      await this.client.append(
+        queueStream(queueName, this.partition),
+        transitions,
+        {
+          operationId,
+          expectedRecord,
+        }
+      );
       // A concurrent long-poll waiter may have observed and applied our
       // records before the append response arrived. Never replay the same
       // transitions twice into the shared cache.
@@ -519,7 +551,9 @@ export class QueueJournal {
       return cached;
     }
     if (options.createIfMissing)
-      await this.client.ensureJsonStream(queueStream(queueName));
+      await this.client.ensureJsonStream(
+        queueStream(queueName, this.partition)
+      );
     return this.load(queueName);
   }
 
@@ -614,20 +648,20 @@ export class QueueJournal {
             candidate.status === 'leased' &&
             (candidate.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
         )
-        .map((candidate) => concurrencyKey(candidate.message))
+        .map((candidate) => queueConcurrencyKey(candidate.message))
     );
     let message: QueueMessageState | undefined;
     for (const candidate of state.messages.values()) {
       if (candidate.messageId === ignoredMessageId) continue;
       if (
         requiredConcurrencyKey &&
-        concurrencyKey(candidate.message) !== requiredConcurrencyKey
+        queueConcurrencyKey(candidate.message) !== requiredConcurrencyKey
       ) {
         continue;
       }
       if (candidate.status === 'acked') continue;
       if (candidate.availableAt.getTime() > now.getTime()) continue;
-      if (activeLeaseKeys.has(concurrencyKey(candidate.message))) continue;
+      if (activeLeaseKeys.has(queueConcurrencyKey(candidate.message))) continue;
       if (
         candidate.status !== 'pending' &&
         (candidate.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
@@ -678,6 +712,7 @@ export class QueueJournal {
         );
         return {
           leaseId,
+          partition: this.partition,
           message: {
             ...message,
             status: 'leased',
@@ -710,7 +745,7 @@ export class QueueJournal {
           ? (message.leaseExpiresAt?.getTime() ?? availableAt)
           : availableAt;
       const blockedUntil =
-        leaseDeadlines.get(concurrencyKey(message.message)) ?? availableAt;
+        leaseDeadlines.get(queueConcurrencyKey(message.message)) ?? availableAt;
       const candidate = Math.max(availableAt, leaseExpiresAt, blockedUntil);
       if (candidate <= now.getTime()) return now;
       if (deadline === undefined || candidate < deadline) {
@@ -799,7 +834,11 @@ export class QueueJournal {
             message.status === 'leased' && message.leaseId === nextLeaseId
         );
         if (committed) {
-          return { leaseId: nextLeaseId, message: { ...committed } };
+          return {
+            leaseId: nextLeaseId,
+            partition: this.partition,
+            message: { ...committed },
+          };
         }
         if (!current) return null;
         if (current.status !== 'leased' || current.leaseId !== lease.leaseId) {
@@ -818,7 +857,7 @@ export class QueueJournal {
         state,
         now,
         lease.message.messageId,
-        concurrencyKey(lease.message.message)
+        queueConcurrencyKey(lease.message.message)
       );
       const leased = candidate
         ? ({
@@ -846,6 +885,7 @@ export class QueueJournal {
         if (!candidate || !leased) return null;
         return {
           leaseId: nextLeaseId,
+          partition: this.partition,
           message: {
             ...candidate,
             status: 'leased',
@@ -936,7 +976,7 @@ export class QueueJournal {
         let cursor = cached.nextRecord;
         while (true) {
           const page = await this.client.read<QueueTransition>(
-            queueStream(queueName),
+            queueStream(queueName, this.partition),
             cursor
           );
           this.applyRecords(cached, page.records);
@@ -950,6 +990,9 @@ export class QueueJournal {
           cursor = cached.nextRecord;
         }
       } catch (error) {
+        if (isUrsulaRequestError(error, 404) && cached.nextRecord === 0) {
+          return cached;
+        }
         if (!isUrsulaRequestError(error, 410)) {
           throw error;
         }
@@ -962,7 +1005,7 @@ export class QueueJournal {
         this.applyRecords(
           state,
           await this.client.readAll<QueueTransition>(
-            queueStream(queueName),
+            queueStream(queueName, this.partition),
             state.nextRecord
           )
         );
@@ -995,11 +1038,13 @@ export class QueueJournal {
     // Registration and the first enqueue are separate Ursula appends. A
     // remote dispatcher can observe the registry entry in between them, so
     // make the queue stream exist before starting its long-poll.
-    await this.client.ensureJsonStream(queueStream(queueName));
+    await this.client.ensureJsonStream(
+      queueStream(queueName, this.partition)
+    );
     const state = this.cache.get(queueName) ?? (await this.load(queueName));
     try {
       const page = await this.client.waitForRecords<QueueTransition>(
-        queueStream(queueName),
+        queueStream(queueName, this.partition),
         state.nextRecord,
         timeoutMs,
         signal

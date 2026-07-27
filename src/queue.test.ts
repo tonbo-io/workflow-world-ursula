@@ -256,6 +256,13 @@ describe('Ursula queue runtime', () => {
 
     expect(memory.waitedStreams).toContain('registry-queues');
     expect(memory.waitTimeouts).toContain(25_000);
+    expect(
+      new Set(
+        memory.waitedStreams.filter(
+          (stream) => stream.startsWith('queue-') && stream !== 'registry-queues'
+        )
+      ).size
+    ).toBe(1);
   });
 
   it('does not watch or spin on queues this process cannot deliver', async () => {
