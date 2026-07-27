@@ -17,7 +17,6 @@ import {
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
-const MAX_ENQUEUE_CAS_RETRIES = 128;
 const MAX_RETRY_DELAY_MS = 50;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -179,6 +178,16 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
   }
   if (value.type === 'enqueued') {
     if (state.messages.has(value.messageId)) return;
+    const createdAt = new Date(value.createdAt);
+    if (value.idempotencyKey) {
+      const existing = state.idempotency.get(value.idempotencyKey);
+      // Enqueue records are intentionally appended without a queue-tail CAS.
+      // Concurrent retries can therefore both be durable. Journal order picks
+      // one canonical message while the retry window is active.
+      if (existing && existing.expiresAt.getTime() > createdAt.getTime()) {
+        return;
+      }
+    }
     const message: QueueMessageState = {
       messageId: MessageIdSchema.parse(value.messageId),
       queueName: value.queueName,
@@ -186,7 +195,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
       headers: value.headers,
       idempotencyKey: value.idempotencyKey,
       availableAt: new Date(value.availableAt),
-      createdAt: new Date(value.createdAt),
+      createdAt,
       attempt: 0,
       status: 'pending',
     };
@@ -239,7 +248,6 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
   private readonly appendTurns = new Map<ValidQueueName, Promise<void>>();
-  private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(private readonly client: UrsulaClient) {}
@@ -528,76 +536,51 @@ export class QueueJournal {
     message: QueuePayload,
     options: QueueOptions = {}
   ): Promise<MessageId> {
-    const previousTurn = this.enqueueTurns.get(queueName);
-    let releaseTurn = () => {};
-    const currentTurn = new Promise<void>((resolve) => {
-      releaseTurn = resolve;
-    });
-    this.enqueueTurns.set(queueName, currentTurn);
-    if (previousTurn) await previousTurn;
-    try {
-      return await this.enqueueUnlocked(queueName, message, options);
-    } finally {
-      releaseTurn();
-      if (this.enqueueTurns.get(queueName) === currentTurn) {
-        this.enqueueTurns.delete(queueName);
-      }
-    }
-  }
-
-  private async enqueueUnlocked(
-    queueName: ValidQueueName,
-    message: QueuePayload,
-    options: QueueOptions
-  ): Promise<MessageId> {
     QueuePayloadSchema.parse(message);
     const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
-    for (
-      let attempt = 0;
-      attempt < MAX_ENQUEUE_CAS_RETRIES;
-      attempt += 1
-    ) {
-      const state = await this.loadForMutation(queueName, {
-        createIfMissing: true,
-      });
-      const now = new Date();
-      pruneIdempotency(state, now);
-      if (options.idempotencyKey) {
-        const existing = state.idempotency.get(options.idempotencyKey);
-        if (existing) return existing.messageId;
-      }
-      const availableAt = new Date(
-        now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
-      );
-      const transition: QueueTransition = {
-        version: 1,
-        type: 'enqueued',
-        messageId,
-        queueName,
-        message,
-        headers: options.headers,
-        idempotencyKey: options.idempotencyKey,
-        availableAt: availableAt.toISOString(),
-        createdAt: now.toISOString(),
-      };
-      try {
-        await this.appendTransition(
-          queueName,
-          state,
-          transition,
-          `queue-enqueue:${queueName}:${messageId}`
-        );
-        return messageId;
-      } catch (error) {
-        if (isUrsulaRequestError(error, 412)) {
-          await this.refreshAfterContention(queueName);
-          await contentionBackoff(attempt);
-          continue;
-        }
-        throw error;
-      }
+    const state = await this.loadForMutation(queueName, {
+      createIfMissing: true,
+    });
+    const now = new Date();
+    pruneIdempotency(state, now);
+    if (options.idempotencyKey) {
+      const existing = state.idempotency.get(options.idempotencyKey);
+      if (existing) return existing.messageId;
     }
-    throw new Error(`Queue "${queueName}" remained contended during enqueue`);
+    const availableAt = new Date(
+      now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
+    );
+    const transition: QueueTransition = {
+      version: 1,
+      type: 'enqueued',
+      messageId,
+      queueName,
+      message,
+      headers: options.headers,
+      idempotencyKey: options.idempotencyKey,
+      availableAt: availableAt.toISOString(),
+      createdAt: now.toISOString(),
+    };
+    const previousNextRecord = state.nextRecord;
+    const receipt = await this.client.append(
+      queueStream(queueName),
+      transition,
+      {
+        operationId: `queue-enqueue:${queueName}:${messageId}`,
+      }
+    );
+    if (state.nextRecord === receipt.startRecord) {
+      applyTransition(state, transition);
+      state.nextRecord = receipt.nextRecord;
+    } else if (state.nextRecord < receipt.nextRecord) {
+      await this.load(queueName);
+    }
+    this.scheduleCheckpoint(queueName, state, previousNextRecord);
+    if (options.idempotencyKey) {
+      const canonical = state.idempotency.get(options.idempotencyKey);
+      if (canonical) return canonical.messageId;
+    }
+    return messageId;
   }
 
   private claimCandidate(
