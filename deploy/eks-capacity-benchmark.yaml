@@ -58,6 +58,8 @@ spec:
               value: http://ursula-gateway.ursula.svc.cluster.local:4437/__ursula/gateway/metrics
             - name: WORKFLOW_BENCH_BACKEND
               value: ursula-eks
+            - name: WORKFLOW_BENCH_PROFILE_URL
+              value: http://workflow-benchmark-app-headless.workflow-benchmark.svc.cluster.local:3000/api/bench/profile
             - name: BENCH_CAPACITY_ONLY
               value: "1"
             - name: BENCH_CAPACITY_RUN_COUNTS
