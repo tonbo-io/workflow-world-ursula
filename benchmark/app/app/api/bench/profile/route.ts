@@ -5,15 +5,16 @@ import {
 
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+export async function GET(): Promise<Response> {
+  const profile = getWorkflowProfile();
   return Response.json(
-    getWorkflowProfile()?.snapshot() ?? disabledWorkflowProfileSnapshot()
+    profile ? await profile.snapshot() : disabledWorkflowProfileSnapshot()
   );
 }
 
-export async function DELETE() {
+export async function DELETE(): Promise<Response> {
   const profile = getWorkflowProfile();
-  profile?.reset();
+  await profile?.reset();
   return Response.json({
     enabled: profile !== undefined,
     reset: true,

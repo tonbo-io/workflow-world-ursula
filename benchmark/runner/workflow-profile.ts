@@ -18,6 +18,22 @@ interface SpanProfile {
 }
 
 interface WorkflowProfileSnapshot {
+  cpu?: {
+    intervalMicros: number;
+    sampledTimeMs: number;
+    startedAt: string;
+    stoppedAt: string;
+    topSelf: Array<{
+      columnNumber: number;
+      functionName: string;
+      lineNumber: number;
+      selfSamples: number;
+      selfTimeMs: number;
+      url: string;
+    }>;
+    totalSamples: number;
+    wallTimeMs: number;
+  };
   enabled: boolean;
   pid: number;
   spans: Record<string, SpanProfile>;
