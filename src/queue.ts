@@ -123,6 +123,7 @@ export function createQueue(
   const shutdown = new AbortController();
   const wakeWaiters = new Set<() => void>();
   const queueWatchers = new Map<string, Promise<void>>();
+  const readyPartitions = new Set<string>();
   let wakeVersion = 0;
   let queueCursor = 0;
   let loop: Promise<void> | undefined;
@@ -186,14 +187,28 @@ export function createQueue(
     return journal;
   }
 
+  function partitionKey(
+    queueName: ValidQueueName,
+    partition: number
+  ): string {
+    return `${queueName}\u0000${partition}`;
+  }
+
+  function markReady(queueName: ValidQueueName, partition: number): void {
+    readyPartitions.add(partitionKey(queueName, partition));
+  }
+
   function ensureQueueWatcher(
     queueName: ValidQueueName,
     partition: number
   ): void {
-    const key = `${queueName}\u0000${partition}`;
+    const key = partitionKey(queueName, partition);
     if (queueWatchers.has(key)) return;
     const journal = journals[partition];
     if (!journal) return;
+    // A newly discovered partition may already contain work written before
+    // this process observed its registry record.
+    markReady(queueName, partition);
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: a durable watcher owns its long-poll, retry, wake, and shutdown lifecycle.
     const watcher = (async () => {
       while (!shutdown.signal.aborted) {
@@ -203,7 +218,10 @@ export function createQueue(
             longPollTimeoutMs,
             shutdown.signal
           );
-          if (changed) wake();
+          if (changed) {
+            markReady(queueName, partition);
+            wake();
+          }
         } catch (error) {
           if (shutdown.signal.aborted) return;
           console.error('Ursula queue wake watcher failed', {
@@ -376,9 +394,13 @@ export function createQueue(
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: queue discovery, capacity and per-run ownership checks belong in one dispatcher pass.
   async function pump(): Promise<ValidQueueName[]> {
     const queueNames = registry.current().filter(canDeliver);
+    const now = new Date();
     for (const queueName of queueNames) {
       for (const partition of registry.partitions(queueName)) {
         ensureQueueWatcher(queueName, partition);
+        const journal = journals[partition];
+        const deadline = journal?.nextLocalDeadline(queueName, now);
+        if (deadline && deadline <= now) markReady(queueName, partition);
       }
     }
     if (inFlight.size >= concurrency || queueNames.length === 0) {
@@ -395,6 +417,9 @@ export function createQueue(
     const work = orderedQueues.flatMap((queueName) =>
       registry
         .partitions(queueName)
+        .filter((partition) =>
+          readyPartitions.has(partitionKey(queueName, partition))
+        )
         .map((partition) => journals[partition])
         .filter((journal): journal is QueueJournal => Boolean(journal))
         .map((journal) => ({ queueName, journal }))
@@ -415,7 +440,10 @@ export function createQueue(
           new Date(),
           leaseDurationMs
         );
-        if (!lease) break;
+        if (!lease) {
+          readyPartitions.delete(partitionKey(queueName, journal.partition));
+          break;
+        }
         const logicalIndex = queueNames.indexOf(queueName);
         queueCursor = (logicalIndex + 1) % queueNames.length;
         const task = deliverChain(queueName, lease, handler)
@@ -425,6 +453,7 @@ export function createQueue(
           })
           .finally(() => {
             inFlight.delete(task);
+            markReady(queueName, lease.partition);
             wake();
           });
         inFlight.add(task);
@@ -496,6 +525,7 @@ export function createQueue(
       throw new Error(`Invalid Ursula queue partition ${partition}`);
     }
     const messageId = await journal.enqueue(queueName, message, options);
+    markReady(queueName, partition);
     wake();
     return { messageId };
   };
