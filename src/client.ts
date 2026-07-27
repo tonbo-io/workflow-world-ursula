@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 const JSON_CONTENT_TYPE = 'application/json';
 const DEFAULT_PAGE_SIZE = 1000;
 const SNAPSHOT_VISIBILITY_RETRY_DELAYS_MS = [10, 25, 50] as const;
-const TRANSIENT_WRITE_RETRY_DELAYS_MS = [5, 10, 25] as const;
+const TRANSIENT_REQUEST_RETRY_DELAYS_MS = [5, 10, 25] as const;
 type HeaderSource = ConstructorParameters<typeof Headers>[0];
 
 export interface UrsulaClientConfig {
@@ -237,35 +237,36 @@ export class UrsulaClient {
    * Retries Ursula's explicit leader-unknown response.
    *
    * A node returns 503 instead of redirecting when OpenRaft is between leaders
-   * or its current leader hint points back to itself. All callers use either
-   * an idempotent stream PUT or a producer-deduplicated append, so replaying
-   * the exact request cannot commit the logical write twice.
+   * or its current leader hint points back to itself. Reads are idempotent;
+   * writes use either an idempotent stream PUT or a producer-deduplicated
+   * append, so replaying the exact request cannot commit the logical write
+   * twice.
    */
-  private async write(url: URL, init: RequestInit): Promise<Response> {
+  private async request(url: URL, init: RequestInit): Promise<Response> {
     for (
       let attempt = 0;
-      attempt <= TRANSIENT_WRITE_RETRY_DELAYS_MS.length;
+      attempt <= TRANSIENT_REQUEST_RETRY_DELAYS_MS.length;
       attempt += 1
     ) {
       const response = await this.fetchImpl(url, init);
       if (
         response.status !== 503 ||
-        attempt === TRANSIENT_WRITE_RETRY_DELAYS_MS.length
+        attempt === TRANSIENT_REQUEST_RETRY_DELAYS_MS.length
       ) {
         return response;
       }
       // Drain the failed response before reusing the pooled connection.
       await response.arrayBuffer();
-      await delay(TRANSIENT_WRITE_RETRY_DELAYS_MS[attempt]);
+      await delay(TRANSIENT_REQUEST_RETRY_DELAYS_MS[attempt]);
     }
-    throw new Error('Unreachable Ursula write retry state');
+    throw new Error('Unreachable Ursula request retry state');
   }
 
   async ensureJsonStream(stream: string): Promise<void> {
     if (this.ensuredStreams.has(stream)) return;
     await this.success(
       'create stream',
-      await this.write(this.streamUrl(stream), {
+      await this.request(this.streamUrl(stream), {
         method: 'PUT',
         headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
       })
@@ -276,7 +277,7 @@ export class UrsulaClient {
   async head(stream: string): Promise<UrsulaHead> {
     const response = await this.success(
       'head stream',
-      await this.fetchImpl(this.streamUrl(stream), {
+      await this.request(this.streamUrl(stream), {
         method: 'HEAD',
         headers: this.headers(),
       })
@@ -311,7 +312,7 @@ export class UrsulaClient {
     if (options.createIfMissing && !this.ensuredStreams.has(stream)) {
       const createHeaders = new Headers(headers);
       createHeaders.delete('stream-record-match');
-      const created = await this.write(this.streamUrl(stream), {
+      const created = await this.request(this.streamUrl(stream), {
         method: 'PUT',
         headers: createHeaders,
         body,
@@ -345,7 +346,7 @@ export class UrsulaClient {
     }
     const response = await this.success(
       `append records to "${stream}"`,
-      await this.write(this.streamUrl(stream), {
+      await this.request(this.streamUrl(stream), {
         method: 'POST',
         headers,
         body,
@@ -374,7 +375,7 @@ export class UrsulaClient {
     url.searchParams.set('record', String(start));
     url.searchParams.set('max_records', String(limit));
     url.searchParams.set('record_view', 'envelope');
-    const response = await this.fetchImpl(url, { headers: this.headers() });
+    const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204) await this.success('read records', response);
     return {
       records:
@@ -396,7 +397,7 @@ export class UrsulaClient {
     const url = this.streamUrl(stream);
     url.searchParams.set('tail_records', String(count));
     url.searchParams.set('record_view', 'envelope');
-    const response = await this.fetchImpl(url, { headers: this.headers() });
+    const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204)
       await this.success('read tail records', response);
     const records =
@@ -425,7 +426,7 @@ export class UrsulaClient {
     url.searchParams.set('record_view', 'envelope');
     url.searchParams.set('live', 'long-poll');
     url.searchParams.set('timeout_ms', String(timeoutMs));
-    const response = await this.fetchImpl(url, {
+    const response = await this.request(url, {
       headers: this.headers(),
       signal,
     });
@@ -460,7 +461,7 @@ export class UrsulaClient {
       try {
         await this.success(
           'publish snapshot',
-          await this.fetchImpl(url, {
+          await this.request(url, {
             method: 'PUT',
             headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
             body: stringifyUrsulaJson(snapshot),
@@ -493,7 +494,7 @@ export class UrsulaClient {
     url.searchParams.set('record', String(record));
     await this.success(
       'advance retention',
-      await this.fetchImpl(url, {
+      await this.request(url, {
         method: 'PUT',
         headers: this.headers(),
       })
