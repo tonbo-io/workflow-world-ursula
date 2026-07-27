@@ -183,6 +183,16 @@ distributions and the top 50 self-time frames from every pod in
 setting; CPU-profiled results should not be compared with older unprofiled
 results as if the methodology were identical.
 
+The benchmark build also marks the installed `@workflow/world` package as
+side-effect-free before bundling. The package consists of declarations,
+schemas, constants, and pure helpers, but its published manifest currently
+omits this metadata. Without it, importing the `Run` serde registration entry
+causes esbuild to retain the whole World barrel, including Zod and every
+locale, in the code evaluated by every deterministic replay. A post-build guard
+requires the VM bundle to contain no Zod runtime and remain below 100 KiB. This
+is a symmetric Workflow runtime optimization applied to both Ursula and
+Postgres images, not an Ursula-only benchmark shortcut.
+
 The repository's EKS manifests implement this matrix directly:
 
 - `deploy/eks-benchmark.yaml` uses the Depot-built `main-ursula` image and
