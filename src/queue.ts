@@ -19,6 +19,7 @@ const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_LEASE_DURATION_MS = 60_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_CONCURRENCY = 64;
+const DEFAULT_CLAIM_BATCH_SIZE = 4;
 const DEFAULT_SHUTDOWN_GRACE_MS = 30_000;
 const DEFAULT_CROSS_INSTANCE_WAKE_TIMEOUT_MS = 25_000;
 
@@ -35,6 +36,8 @@ export interface UrsulaQueueConfig {
   leaseDurationMs?: number;
   retryDelayMs?: number;
   concurrency?: number;
+  /** Maximum independent messages leased from one queue in one CAS. */
+  claimBatchSize?: number;
   shutdownGraceMs?: number;
   /** Long-poll duration for cross-instance registry and queue wakeups. */
   longPollTimeoutMs?: number;
@@ -55,6 +58,15 @@ function positiveInteger(
     throw new Error(`${name} must be a positive integer`);
   }
   return result;
+}
+
+function initialQueueCursor(identity: string | undefined): number {
+  if (!identity) return 0;
+  let hash = 2166136261;
+  for (const character of identity) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  }
+  return hash >>> 0;
 }
 
 /**
@@ -88,6 +100,11 @@ export function createQueue(
     DEFAULT_CONCURRENCY,
     'Ursula queue concurrency'
   );
+  const claimBatchSize = positiveInteger(
+    config.claimBatchSize,
+    DEFAULT_CLAIM_BATCH_SIZE,
+    'Ursula queue claimBatchSize'
+  );
   const shutdownGraceMs = positiveInteger(
     config.shutdownGraceMs,
     DEFAULT_SHUTDOWN_GRACE_MS,
@@ -106,7 +123,9 @@ export function createQueue(
   const wakeWaiters = new Set<() => void>();
   const queueWatchers = new Map<ValidQueueName, Promise<void>>();
   let wakeVersion = 0;
-  let queueCursor = 0;
+  // Replicas discover queues in the same durable registry order. Starting
+  // every process at zero creates a synchronized CAS herd on the first queue.
+  let queueCursor = initialQueueCursor(process.env.HOSTNAME);
   let loop: Promise<void> | undefined;
   let registryWatcher: Promise<void> | undefined;
 
@@ -355,26 +374,23 @@ export function createQueue(
       // embedded/test runtimes that have no delivery origin.
       const handler = deliveryBaseUrl() ? undefined : handlerFor(queueName);
       if (!handler && !deliveryBaseUrl()) continue;
-      while (inFlight.size < concurrency) {
-        const leases = await journal.claimMany(
-          queueName,
-          new Date(),
-          leaseDurationMs,
-          concurrency - inFlight.size
-        );
-        if (leases.length === 0) break;
-        for (const lease of leases) {
-          const task = deliverChain(queueName, lease, handler)
-            .catch(() => {
-              // Delivery already persisted a retry when possible. A lost lease
-              // is safely recovered by expiry on another dispatcher.
-            })
-            .finally(() => {
-              inFlight.delete(task);
-              wake();
-            });
-          inFlight.add(task);
-        }
+      const leases = await journal.claimMany(
+        queueName,
+        new Date(),
+        leaseDurationMs,
+        Math.min(claimBatchSize, concurrency - inFlight.size)
+      );
+      for (const lease of leases) {
+        const task = deliverChain(queueName, lease, handler)
+          .catch(() => {
+            // Delivery already persisted a retry when possible. A lost lease
+            // is safely recovered by expiry on another dispatcher.
+          })
+          .finally(() => {
+            inFlight.delete(task);
+            wake();
+          });
+        inFlight.add(task);
       }
     }
     return queueNames;
