@@ -120,6 +120,22 @@ current run state and appends one record containing:
 - the final Step entity; and
 - background-lane lease release.
 
+The default record remains the explicit v1 object. With
+`WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS=1`, an exact
+owned `step_created` + `step_started` + `step_completed` transaction is written
+as a compact v2 tuple. The stream identity supplies `runId`, the record
+coordinate supplies `previousRecord`, and the tuple stores shared IDs, time,
+names, input, output, and telemetry once. Readers reconstruct the identical
+three World events and completed Step before applying the commit. Any extra
+field, retry/failure shape, mismatched entity, or schema extension falls back
+to v1 rather than being encoded lossily.
+
+Compact readers are unconditional, but compact writers are opt-in. A rolling
+deployment MUST first install reader support on every process with the option
+disabled, then enable writers in a second rollout. This is the same
+mixed-version rule as checkpoint schema evolution: an old reader must never
+observe a record it cannot decode.
+
 The execution claim, or Turbo's durable owner message, is the pre-body
 linearization and crash-recovery boundary. Claimed terminal transactions
 verify the same token and generation before their record-tail-guarded append.

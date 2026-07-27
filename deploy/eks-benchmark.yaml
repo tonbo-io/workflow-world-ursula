@@ -46,6 +46,10 @@ spec:
               value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
               value: "1"
+            # Enable only in a second rollout after every pod runs a reader
+            # that understands compact completed-step records.
+            - name: WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS
+              value: "0"
             - name: WORKFLOW_BENCH_PROFILE
               value: "0"
             - name: PORT
@@ -112,6 +116,8 @@ spec:
               value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
               value: "1"
+            - name: WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS
+              value: "0"
             - name: WORKFLOW_BENCH_PROFILE
               value: "0"
             - name: PORT

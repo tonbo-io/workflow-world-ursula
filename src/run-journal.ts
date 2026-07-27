@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { Event, Hook, Step, Wait, WorkflowRun } from '@workflow/world';
 import {
   EventSchema,
@@ -52,6 +53,43 @@ export interface RunJournalState {
   waits: Map<string, Wait>;
   executionLeases: Map<string, RunExecutionLease>;
   externalStateUpdatedAt?: number;
+}
+
+export interface RunJournalOptions {
+  /**
+   * Writes the common owned successful-step transaction as a compact tuple.
+   *
+   * Readers always understand the compact representation, so a rolling
+   * deployment must first ship reader support everywhere and enable this
+   * option only in a second rollout.
+   */
+  compactCompletedStepCommits?: boolean;
+}
+
+type CompactCompletedStepFields = [
+  2,
+  [string, string, string],
+  string,
+  Date | string,
+  string,
+  string,
+  number,
+  unknown,
+  unknown,
+  string,
+  [
+    number | null,
+    number | null,
+    number | null,
+    number | null,
+    string[] | null,
+  ],
+  number | null,
+];
+
+interface CompactCompletedStepCommit {
+  v: 2;
+  c: CompactCompletedStepFields;
 }
 
 interface RunCheckpoint {
@@ -255,7 +293,346 @@ function parseExecutionLease(value: unknown): RunExecutionLease {
   };
 }
 
-function parseCommit(value: unknown): RunCommit {
+function objectHasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>
+): boolean {
+  return Object.entries(value).every(
+    ([key, nested]) => nested === undefined || allowed.has(key)
+  );
+}
+
+function sameInstant(left: unknown, right: unknown): boolean {
+  const leftTime =
+    left instanceof Date ? left.getTime() : Date.parse(String(left));
+  const rightTime =
+    right instanceof Date ? right.getTime() : Date.parse(String(right));
+  return (
+    Number.isFinite(leftTime) &&
+    Number.isFinite(rightTime) &&
+    leftTime === rightTime
+  );
+}
+
+const EVENT_KEYS = new Set([
+  'correlationId',
+  'createdAt',
+  'eventData',
+  'eventId',
+  'eventType',
+  'runId',
+  'specVersion',
+]);
+const CREATED_STEP_DATA_KEYS = new Set(['input', 'stepName']);
+const STARTED_STEP_DATA_KEYS = new Set([
+  'ownerMessageId',
+  'stepName',
+  'workflowName',
+]);
+const COMPLETED_STEP_DATA_KEYS = new Set([
+  'eventCount',
+  'optimizations',
+  'result',
+  'stepCount',
+  'stepName',
+  'stso',
+  'ttfs',
+  'workflowName',
+]);
+const COMPLETED_STEP_KEYS = new Set([
+  'attempt',
+  'completedAt',
+  'createdAt',
+  'input',
+  'output',
+  'runId',
+  'specVersion',
+  'startedAt',
+  'status',
+  'stepId',
+  'stepName',
+  'updatedAt',
+]);
+const COMPACTABLE_COMMIT_KEYS = new Set([
+  'events',
+  'externalStateUpdatedAt',
+  'operationId',
+  'previousRecord',
+  'runId',
+  'steps',
+  'version',
+]);
+
+/**
+ * Losslessly recognizes the World-visible hot owned-step shape.
+ *
+ * The tuple omits data already implied by the stream coordinate and the
+ * transaction shape: run id, record number, event field names, and the
+ * materialized Step fields duplicated by the three lifecycle events. The
+ * request-only operation id is already represented by Ursula producer
+ * deduplication and is not retained in v2. Any schema extension or
+ * non-identical World field falls back to the v1 object.
+ */
+function compactCompletedStepCommit(
+  commit: RunCommit
+): CompactCompletedStepCommit | undefined {
+  if (
+    commit.events.length !== 3 ||
+    commit.run !== undefined ||
+    commit.steps?.length !== 1 ||
+    commit.hooks !== undefined ||
+    commit.waits !== undefined ||
+    commit.executionLeases !== undefined ||
+    !objectHasOnlyKeys(
+      commit as unknown as Record<string, unknown>,
+      COMPACTABLE_COMMIT_KEYS
+    )
+  ) {
+    return undefined;
+  }
+  const [created, started, completed] = commit.events;
+  const stepChange = commit.steps[0];
+  if (
+    created?.eventType !== 'step_created' ||
+    started?.eventType !== 'step_started' ||
+    completed?.eventType !== 'step_completed' ||
+    !stepChange ||
+    stepChange.value === null
+  ) {
+    return undefined;
+  }
+  const step = stepChange.value;
+  const createdData = created.eventData as Record<string, unknown>;
+  const startedData = started.eventData as Record<string, unknown>;
+  const completedData = completed.eventData as Record<string, unknown>;
+  if (
+    !objectHasOnlyKeys(created as unknown as Record<string, unknown>, EVENT_KEYS) ||
+    !objectHasOnlyKeys(started as unknown as Record<string, unknown>, EVENT_KEYS) ||
+    !objectHasOnlyKeys(
+      completed as unknown as Record<string, unknown>,
+      EVENT_KEYS
+    ) ||
+    !objectHasOnlyKeys(createdData, CREATED_STEP_DATA_KEYS) ||
+    !objectHasOnlyKeys(startedData, STARTED_STEP_DATA_KEYS) ||
+    !objectHasOnlyKeys(completedData, COMPLETED_STEP_DATA_KEYS) ||
+    !objectHasOnlyKeys(
+      step as unknown as Record<string, unknown>,
+      COMPLETED_STEP_KEYS
+    )
+  ) {
+    return undefined;
+  }
+
+  const stepId = created.correlationId;
+  const eventTime = created.createdAt;
+  const stepName = createdData.stepName;
+  const workflowName = startedData.workflowName;
+  const ownerMessageId = startedData.ownerMessageId;
+  const specVersion = created.specVersion;
+  if (
+    typeof stepId !== 'string' ||
+    typeof stepName !== 'string' ||
+    typeof workflowName !== 'string' ||
+    typeof ownerMessageId !== 'string' ||
+    typeof specVersion !== 'number' ||
+    started.correlationId !== stepId ||
+    completed.correlationId !== stepId ||
+    stepChange.id !== stepId ||
+    step.stepId !== stepId ||
+    created.runId !== commit.runId ||
+    started.runId !== commit.runId ||
+    completed.runId !== commit.runId ||
+    step.runId !== commit.runId ||
+    started.specVersion !== specVersion ||
+    completed.specVersion !== specVersion ||
+    step.specVersion !== specVersion ||
+    startedData.stepName !== stepName ||
+    completedData.stepName !== stepName ||
+    completedData.workflowName !== workflowName ||
+    step.stepName !== stepName ||
+    step.status !== 'completed' ||
+    step.attempt !== 1 ||
+    !sameInstant(started.createdAt, eventTime) ||
+    !sameInstant(completed.createdAt, eventTime) ||
+    !sameInstant(step.createdAt, eventTime) ||
+    !sameInstant(step.startedAt, eventTime) ||
+    !sameInstant(step.completedAt, eventTime) ||
+    !sameInstant(step.updatedAt, eventTime) ||
+    !isDeepStrictEqual(step.input, createdData.input) ||
+    !isDeepStrictEqual(step.output, completedData.result)
+  ) {
+    return undefined;
+  }
+
+  const optionalNumber = (nested: unknown): number | null =>
+    typeof nested === 'number' ? nested : null;
+  const optimizations = completedData.optimizations;
+  if (
+    createdData.input === undefined ||
+    completedData.result === undefined ||
+    [
+      completedData.ttfs,
+      completedData.stso,
+      completedData.stepCount,
+      completedData.eventCount,
+    ].some(
+      (nested) => nested !== undefined && typeof nested !== 'number'
+    ) ||
+    (optimizations !== undefined &&
+      (!Array.isArray(optimizations) ||
+        !optimizations.every((item) => typeof item === 'string')))
+  ) {
+    return undefined;
+  }
+
+  return {
+    v: 2,
+    c: [
+      2,
+      [created.eventId, started.eventId, completed.eventId],
+      stepId,
+      eventTime,
+      stepName,
+      workflowName,
+      specVersion,
+      createdData.input,
+      completedData.result,
+      ownerMessageId,
+      [
+        optionalNumber(completedData.ttfs),
+        optionalNumber(completedData.stso),
+        optionalNumber(completedData.stepCount),
+        optionalNumber(completedData.eventCount),
+        (optimizations as string[] | undefined) ?? null,
+      ],
+      commit.externalStateUpdatedAt ?? null,
+    ],
+  };
+}
+
+function parseCompactCompletedStepCommit(
+  value: unknown[],
+  runId: string,
+  record: number
+): RunCommit {
+  if (
+    value.length !== 12 ||
+    !Array.isArray(value[1]) ||
+    value[1].length !== 3 ||
+    !value[1].every((eventId) => typeof eventId === 'string') ||
+    typeof value[2] !== 'string' ||
+    !(typeof value[3] === 'string' || value[3] instanceof Date) ||
+    typeof value[4] !== 'string' ||
+    typeof value[5] !== 'string' ||
+    typeof value[6] !== 'number' ||
+    typeof value[9] !== 'string' ||
+    !Array.isArray(value[10]) ||
+    value[10].length !== 5 ||
+    (value[11] !== null && typeof value[11] !== 'number')
+  ) {
+    throw new Error('Invalid compact Ursula World completed-step commit');
+  }
+  const [
+    ,
+    eventIds,
+    stepId,
+    createdAt,
+    stepName,
+    workflowName,
+    specVersion,
+    input,
+    output,
+    ownerMessageId,
+    telemetry,
+    externalStateUpdatedAt,
+  ] = value as CompactCompletedStepFields;
+  const [ttfs, stso, stepCount, eventCount, optimizations] = telemetry;
+  if (
+    [ttfs, stso, stepCount, eventCount].some(
+      (nested) => nested !== null && typeof nested !== 'number'
+    ) ||
+    (optimizations !== null &&
+      (!Array.isArray(optimizations) ||
+        !optimizations.every((item) => typeof item === 'string')))
+  ) {
+    throw new Error('Invalid compact Ursula World completed-step telemetry');
+  }
+  const optional = <T>(nested: T | null): T | undefined =>
+    nested === null ? undefined : nested;
+  const common = { runId, createdAt, specVersion, correlationId: stepId };
+  const events = [
+    EventSchema.parse({
+      ...common,
+      eventId: eventIds[0],
+      eventType: 'step_created',
+      eventData: { input, stepName },
+    }),
+    EventSchema.parse({
+      ...common,
+      eventId: eventIds[1],
+      eventType: 'step_started',
+      eventData: { ownerMessageId, stepName, workflowName },
+    }),
+    EventSchema.parse({
+      ...common,
+      eventId: eventIds[2],
+      eventType: 'step_completed',
+      eventData: {
+        result: output,
+        stepName,
+        workflowName,
+        ...(optional(ttfs) === undefined ? {} : { ttfs }),
+        ...(optional(stso) === undefined ? {} : { stso }),
+        ...(optional(stepCount) === undefined ? {} : { stepCount }),
+        ...(optional(eventCount) === undefined ? {} : { eventCount }),
+        ...(optional(optimizations) === undefined ? {} : { optimizations }),
+      },
+    }),
+  ];
+  const step = StepSchema.parse({
+    runId,
+    stepId,
+    stepName,
+    status: 'completed',
+    input,
+    output,
+    attempt: 1,
+    startedAt: createdAt,
+    completedAt: createdAt,
+    createdAt,
+    updatedAt: createdAt,
+    specVersion,
+  });
+  return {
+    version: 1,
+    operationId: '',
+    runId,
+    previousRecord: record,
+    events,
+    steps: [{ id: stepId, value: step }],
+    ...(externalStateUpdatedAt === null ? {} : { externalStateUpdatedAt }),
+  };
+}
+
+function parseCommit(
+  value: unknown,
+  runId?: string,
+  record?: number
+): RunCommit {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { v?: unknown }).v === 2
+  ) {
+    if (runId === undefined || record === undefined) {
+      throw new Error('Compact Ursula World commit requires stream coordinates');
+    }
+    const fields = (value as { c?: unknown }).c;
+    if (!Array.isArray(fields)) {
+      throw new Error('Invalid compact Ursula World completed-step commit');
+    }
+    return parseCompactCompletedStepCommit(fields, runId, record);
+  }
   if (typeof value !== 'object' || value === null) {
     throw new Error('Invalid Ursula World run commit');
   }
@@ -382,8 +759,15 @@ export class RunJournal {
   private readonly checkpointTasks = new Map<string, Promise<void>>();
   private readonly cache = new Map<string, RunJournalState>();
   private readonly eventCache = new Map<string, EventCache>();
+  private readonly compactCompletedStepCommits: boolean;
 
-  constructor(private readonly client: UrsulaClient) {}
+  constructor(
+    private readonly client: UrsulaClient,
+    options: RunJournalOptions = {}
+  ) {
+    this.compactCompletedStepCommits =
+      options.compactCompletedStepCommits ?? false;
+  }
 
   private rememberState(runId: string, state: RunJournalState): void {
     this.cache.delete(runId);
@@ -530,7 +914,7 @@ export class RunJournal {
 
   private applyRecords(
     state: RunJournalState,
-    records: { record: number; value: RunCommit }[]
+    records: { record: number; value: unknown }[]
   ): void {
     for (const record of records) {
       if (record.record < state.nextRecord) continue;
@@ -539,7 +923,11 @@ export class RunJournal {
           `Run journal ${state.runId} is discontinuous at record ${state.nextRecord}`
         );
       }
-      applyCommit(state, parseCommit(record.value), record.record);
+      applyCommit(
+        state,
+        parseCommit(record.value, state.runId, record.record),
+        record.record
+      );
     }
   }
 
@@ -560,9 +948,9 @@ export class RunJournal {
       let cursor = cached.nextRecord;
       let catchUpAttempt = 0;
       while (true) {
-        let page: UrsulaReadResult<RunCommit>;
+        let page: UrsulaReadResult<unknown>;
         try {
-          page = await this.client.read<RunCommit>(stream, cursor);
+          page = await this.client.read<unknown>(stream, cursor);
         } catch (error) {
           if (
             isCursorBeyondLocalTail(error) &&
@@ -597,7 +985,7 @@ export class RunJournal {
     try {
       this.applyRecords(
         state,
-        await this.client.readAll<RunCommit>(stream, state.nextRecord)
+        await this.client.readAll<unknown>(stream, state.nextRecord)
       );
     } catch (error) {
       if (
@@ -636,9 +1024,9 @@ export class RunJournal {
     let cursor = cached.nextRecord;
     let catchUpAttempt = 0;
     while (true) {
-      let page: UrsulaReadResult<RunCommit>;
+      let page: UrsulaReadResult<unknown>;
       try {
-        page = await this.client.read<RunCommit>(streamId(runId), cursor);
+        page = await this.client.read<unknown>(streamId(runId), cursor);
       } catch (error) {
         if (
           isCursorBeyondLocalTail(error) &&
@@ -658,7 +1046,9 @@ export class RunJournal {
             `Run event journal ${runId} is discontinuous at record ${cached.nextRecord}`
           );
         }
-        cached.events.push(...parseCommit(record.value).events);
+        cached.events.push(
+          ...parseCommit(record.value, runId, record.record).events
+        );
         cached.nextRecord = record.record + 1;
       }
       if (page.records.length < 1000) return cached;
@@ -698,7 +1088,10 @@ export class RunJournal {
       runId: state.runId,
       previousRecord: state.nextRecord,
     };
-    await this.client.append(streamId(state.runId), value, {
+    const storedValue = this.compactCompletedStepCommits
+      ? (compactCompletedStepCommit(value) ?? value)
+      : value;
+    await this.client.append(streamId(state.runId), storedValue, {
       operationId: commit.operationId,
       expectedRecord: state.nextRecord,
       createIfMissing: state.nextRecord === 0,
