@@ -5,6 +5,7 @@ import type {
   UrsulaClient,
   UrsulaRecord,
 } from './client.js';
+import type { RunExecutionCoordinator } from './execution.js';
 import { createQueue } from './queue.js';
 
 class MemoryClient {
@@ -112,6 +113,43 @@ class MemoryClient {
 }
 
 describe('Ursula queue runtime', () => {
+  it('runs workflow deliveries inside the claimed run execution lease', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const run = vi.fn(
+      async (
+        _delivery: unknown,
+        task: () => Promise<unknown>
+      ): Promise<unknown> => task()
+    );
+    const executions = {
+      run,
+    } as unknown as RunExecutionCoordinator;
+    const queueName =
+      '__wkf_workflow_atomic_delivery' as ValidQueueName;
+    const queue = createQueue(
+      client,
+      {
+        pollIntervalMs: 5,
+        leaseDurationMs: 1_000,
+      },
+      executions
+    );
+    queue.createQueueHandler('__wkf_workflow_', async () => undefined);
+    await queue.queue(queueName, {
+      runId: 'wrun_atomic_delivery',
+    });
+    await queue.start();
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    await queue.close();
+
+    expect(run.mock.calls[0]?.[0]).toMatchObject({
+      runId: 'wrun_atomic_delivery',
+      lane: 'run',
+      ownerMessageId: expect.stringMatching(/^msg_/),
+      attempt: 1,
+    });
+  });
+
   it('recovers an enqueued message in a fresh dispatcher', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const queueName = '__wkf_workflow_recovery' as ValidQueueName;

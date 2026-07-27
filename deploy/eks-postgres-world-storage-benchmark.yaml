@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workflow-world-storage-postgres
+  namespace: workflow-benchmark-postgres
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: workflow-world-storage-postgres
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        workflow-benchmark-role: app
+      initContainers:
+        - name: bootstrap-postgres
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          command:
+            - /workspace/benchmark/runner/node_modules/.bin/bootstrap
+          env:
+            - name: WORKFLOW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
+      containers:
+        - name: runner
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              pnpm --filter workflow-benchmark-runner benchmark:world-storage
+              printf 'WORLD_STORAGE_RESULT_BASE64='
+              base64 -w 0 "$WORLD_STORAGE_OUTPUT_FILE"
+              printf '\n'
+          env:
+            - name: WORKFLOW_BENCH_BACKEND
+              value: postgres-world-storage
+            - name: WORKFLOW_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: workflow-postgres-benchmark
+                  key: url
+            - name: WORKFLOW_POSTGRES_MAX_POOL_SIZE
+              value: "128"
+            - name: WORLD_STORAGE_CONCURRENT_RUNS
+              value: "1,8,32,128"
+            - name: WORLD_STORAGE_STEPS_PER_RUN
+              value: "50"
+            - name: WORLD_STORAGE_ITERATIONS
+              value: "3"
+            - name: WORLD_STORAGE_OUTPUT_FILE
+              value: /results/world-storage-postgres.json
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}

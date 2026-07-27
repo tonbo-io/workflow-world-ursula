@@ -73,9 +73,18 @@ importers:
       '@tonbo-io/world-ursula':
         specifier: workspace:*
         version: link:../..
+      '@workflow/world':
+        specifier: 5.0.0-beta.22
+        version: 5.0.0-beta.22
+      '@workflow/world-postgres':
+        specifier: 5.0.0-beta.28
+        version: 5.0.0-beta.28(@types/pg@8.16.0)(typescript@6.0.3)
       pg:
         specifier: 8.20.0
         version: 8.20.0
+      ulid:
+        specifier: ~3.0.1
+        version: 3.0.2
       workflow:
         specifier: https://workflow-tarballs-341yziqn7.labs.vercel.dev/workflow.tgz
         version: https://workflow-tarballs-341yziqn7.labs.vercel.dev/workflow.tgz(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.28(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(@swc/cli@0.8.1(@swc/core@1.15.3)(chokidar@5.0.0))(@swc/core@1.15.3)(next@16.2.11(react-dom@19.2.7(react@19.2.8))(react@19.2.8))(react@19.2.8)(typescript@6.0.3)
@@ -4576,6 +4585,53 @@ snapshots:
       undici: 7.28.0
       zod: 4.3.6
 
+  '@workflow/world-postgres@5.0.0-beta.28(@types/pg@8.16.0)(typescript@6.0.3)':
+    dependencies:
+      '@vercel/queue': 0.4.0
+      '@workflow/errors': 5.0.0-beta.12
+      '@workflow/utils': 5.0.0-beta.6
+      '@workflow/world': 5.0.0-beta.22
+      '@workflow/world-local': 5.0.0-beta.30
+      cbor-x: 1.6.0
+      dotenv: 17.3.1
+      drizzle-orm: 0.45.2(@types/pg@8.16.0)(pg@8.20.0)
+      graphile-worker: 0.16.6(typescript@6.0.3)
+      pg: 8.20.0
+      ulid: 3.0.2
+      zod: 4.3.6
+    transitivePeerDependencies:
+      - '@aws-sdk/client-rds-data'
+      - '@cloudflare/workers-types'
+      - '@electric-sql/pglite'
+      - '@libsql/client'
+      - '@libsql/client-wasm'
+      - '@neondatabase/serverless'
+      - '@op-engineering/op-sqlite'
+      - '@opentelemetry/api'
+      - '@planetscale/database'
+      - '@prisma/client'
+      - '@tidbcloud/serverless'
+      - '@types/better-sqlite3'
+      - '@types/pg'
+      - '@types/sql.js'
+      - '@upstash/redis'
+      - '@vercel/postgres'
+      - '@xata.io/client'
+      - better-sqlite3
+      - bun-types
+      - expo-sqlite
+      - gel
+      - knex
+      - kysely
+      - mysql2
+      - pg-native
+      - postgres
+      - prisma
+      - sql.js
+      - sqlite3
+      - supports-color
+      - typescript
+
   '@workflow/world-postgres@5.0.0-beta.28(@types/pg@8.20.0)(typescript@6.0.3)':
     dependencies:
       '@vercel/queue': 0.4.0
@@ -5085,6 +5141,11 @@ snapshots:
   dotenv@17.3.1: {}
 
   dotenv@17.4.2: {}
+
+  drizzle-orm@0.45.2(@types/pg@8.16.0)(pg@8.20.0):
+    optionalDependencies:
+      '@types/pg': 8.16.0
+      pg: 8.20.0
 
   drizzle-orm@0.45.2(@types/pg@8.20.0)(pg@8.20.0):
     optionalDependencies:

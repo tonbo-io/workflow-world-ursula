@@ -25,6 +25,9 @@ message, delivery attempt, or hook-token claim.
    redelivery.
 7. Delayed messages are not visible before their `availableAt`.
 8. Every derived index is rebuildable from authoritative Ursula records.
+9. One active execution lease fences every speculative step transition in its
+   lane; a stale handler cannot commit after a newer lease generation takes
+   over.
 
 ## Stream layout
 
@@ -53,6 +56,7 @@ interface RunCommit {
   steps?: Record<string, Step | null>;
   hooks?: Record<string, Hook | null>;
   waits?: Record<string, Wait | null>;
+  executionLeases?: Record<string, RunExecutionLease | null>;
   externalStateUpdatedAt?: number;
 }
 ```
@@ -86,6 +90,55 @@ An incremental cursor may briefly be ahead of a lagging Ursula follower even
 though the leader already acknowledged the source commit. The adapter retries
 `InvalidRecordBoundaries` on the same cursor during that bounded catch-up
 window; it never treats a follower's lower local tail as authoritative state.
+
+## Atomic step transactions
+
+Workflow's public World contract exposes `step_started` and the terminal
+`step_completed`, `step_failed`, or `step_retrying` mutation as separate
+awaited calls. Persisting both literally costs two Raft commits per logical
+step even when one queue delivery owns the entire inline execution.
+
+For ordinary queue delivery, the Ursula adapter claims an execution lane in
+the run journal before entering the Workflow handler. The claim contains a
+unique fencing token, owner message ID, attempt, expiry, and monotonically
+increasing generation. The `run` lane covers inline orchestration; a
+background step uses `step:<stepId>`, so independent parallel steps do not
+serialize on one lease. With
+`WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1`, Turbo's optimistic
+lazy inline start can use its owning queue message as the transaction fence
+without paying a separate execution-claim append. This remains opt-in because
+the current World interface does not tell a backend whether a lazy start is
+running under Turbo's single-handler guarantee.
+
+Inside that claimed handler, `step_started` is materialized speculatively but
+not appended. The terminal mutation replays the staged start against the
+current run state and appends one record containing:
+
+- `step_created` when the start was lazy;
+- `step_started`;
+- the terminal step event;
+- the final Step entity; and
+- background-lane lease release.
+
+The execution claim, or Turbo's durable owner message, is the pre-body
+linearization and crash-recovery boundary. Claimed terminal transactions
+verify the same token and generation before their record-tail-guarded append.
+If the handler dies, no speculative step event is visible and queue redelivery
+can claim a newer generation or re-run the owned lazy step. If an old claimed
+handler later returns, the generation check rejects its terminal write.
+External run events committed after the claim do not revoke the owner;
+terminal materialization rebases on them under `Stream-Record-Match`.
+
+For a Turbo invocation that executes `N` owned lazy steps, the run write cost
+is `N` atomic step appends instead of `2N` step appends. A non-Turbo queue
+invocation pays one execution-claim append plus `N` atomic step appends.
+Transports that provide neither a delivery lease nor an owned lazy start fall
+back to the literal two-append contract.
+
+The queue journal still owns ready-message discovery, delivery attempts,
+delays, and acknowledgement. A later phase can move continuation readiness
+into the run transaction and make the queue a rebuildable projection, but that
+requires a bucket changefeed or equivalent durable projection repair path.
 
 ## Global indexes
 

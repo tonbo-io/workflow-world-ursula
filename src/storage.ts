@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+  EntityConflictError,
   HookNotFoundError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
   AnyEventRequest,
+  CreateEventParams,
   Event,
   EventResult,
   Hook,
@@ -27,10 +29,20 @@ import {
   UrsulaClient,
   type UrsulaClientConfig,
 } from './client.js';
+import {
+  RunExecutionCoordinator,
+  type StagedStepStart,
+} from './execution.js';
 import { HookClaims } from './hook-claims.js';
 import { materializeEvent } from './reducer.js';
 import { RunRegistry } from './registry.js';
-import { RunJournal, type RunJournalState } from './run-journal.js';
+import {
+  RunJournal,
+  type EntityChange,
+  type RunCommit,
+  type RunExecutionLease,
+  type RunJournalState,
+} from './run-journal.js';
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
@@ -38,6 +50,69 @@ const MAX_COMMIT_RETRIES = 16;
 const QUERY_READ_CONCURRENCY = 16;
 const STEP_VISIBILITY_RETRIES = 8;
 const STEP_VISIBILITY_BASE_DELAY_MS = 5;
+
+type PendingRunCommit = Omit<
+  RunCommit,
+  'version' | 'runId' | 'previousRecord'
+>;
+
+function mergeChanges<T>(
+  first: EntityChange<T>[] | undefined,
+  second: EntityChange<T>[] | undefined
+): EntityChange<T>[] | undefined {
+  if (!first && !second) return;
+  const merged = new Map<string, T | null>();
+  for (const change of first ?? []) merged.set(change.id, change.value);
+  for (const change of second ?? []) merged.set(change.id, change.value);
+  return [...merged].map(([id, value]) => ({ id, value }));
+}
+
+function combineStepCommits(
+  operationId: string,
+  started: PendingRunCommit,
+  terminal: PendingRunCommit
+): PendingRunCommit {
+  return {
+    operationId,
+    events: [...started.events, ...terminal.events],
+    ...(terminal.run ?? started.run
+      ? { run: terminal.run ?? started.run }
+      : {}),
+    ...(mergeChanges(started.steps, terminal.steps)
+      ? { steps: mergeChanges(started.steps, terminal.steps) }
+      : {}),
+    ...(mergeChanges(started.hooks, terminal.hooks)
+      ? { hooks: mergeChanges(started.hooks, terminal.hooks) }
+      : {}),
+    ...(mergeChanges(started.waits, terminal.waits)
+      ? { waits: mergeChanges(started.waits, terminal.waits) }
+      : {}),
+    ...(mergeChanges(started.executionLeases, terminal.executionLeases)
+      ? {
+          executionLeases: mergeChanges(
+            started.executionLeases,
+            terminal.executionLeases
+          ),
+        }
+      : {}),
+    ...(terminal.externalStateUpdatedAt !== undefined
+      ? { externalStateUpdatedAt: terminal.externalStateUpdatedAt }
+      : started.externalStateUpdatedAt !== undefined
+        ? { externalStateUpdatedAt: started.externalStateUpdatedAt }
+        : {}),
+  };
+}
+
+function ownsExecutionLease(
+  state: RunJournalState,
+  lease: RunExecutionLease
+): boolean {
+  const current = state.executionLeases.get(lease.lane);
+  return (
+    current?.token === lease.token &&
+    current.generation === lease.generation
+  );
+}
 
 async function mapWithConcurrency<T, R>(
   values: readonly T[],
@@ -189,11 +264,16 @@ export interface UrsulaStorage {
 }
 
 export function createStorage(
-  config: UrsulaClientConfig | UrsulaClient
+  config: UrsulaClientConfig | UrsulaClient,
+  options: {
+    journal?: RunJournal;
+    executions?: RunExecutionCoordinator;
+  } = {}
 ): UrsulaStorage {
   const client =
     config instanceof UrsulaClient ? config : new UrsulaClient(config);
-  const journal = new RunJournal(client);
+  const journal = options.journal ?? new RunJournal(client);
+  const executions = options.executions;
   const registry = new RunRegistry(client);
   const hookClaims = new HookClaims(client);
 
@@ -312,6 +392,160 @@ export function createStorage(
     return states.filter((state): state is RunJournalState => state !== null);
   }
 
+  async function stageStepStart(
+    runId: string,
+    request: AnyEventRequest & { eventType: 'step_started' },
+    params: CreateEventParams | undefined,
+    callId: string
+  ): Promise<EventResult | undefined> {
+    const coordinator = executions;
+    const lease = coordinator?.current(runId);
+    const stepId = request.correlationId;
+    const ownedLazyStart =
+      coordinator?.allowsOwnedLazyStarts() === true &&
+      request.eventData?.input !== undefined &&
+      request.eventData.ownerMessageId !== undefined;
+    if (!coordinator || (!lease && !ownedLazyStart) || !stepId) return;
+    const existing = coordinator.staged(runId, stepId);
+    if (existing) return existing.result;
+    const state = await journal.loadForMutation(runId);
+    if (lease && !ownsExecutionLease(state, lease)) {
+      throw new EntityConflictError(
+        `Execution lease for run "${runId}" changed ownership`
+      );
+    }
+    const operationId = mutationOperationId(
+      state,
+      request,
+      callId,
+      params?.requestId
+    );
+    const eventId = `evnt_${ulid()}`;
+    const syntheticEventId = `evnt_${ulid()}`;
+    const now = new Date();
+    const materialized = materializeEvent(state, request, {
+      eventId,
+      syntheticEventId,
+      operationId,
+      now,
+      params,
+    });
+    if (!materialized.commit) return materialized.result;
+    const staged: StagedStepStart = {
+      request,
+      params,
+      callId,
+      eventId,
+      syntheticEventId,
+      now,
+      result: materialized.result,
+    };
+    coordinator.stage(runId, stepId, staged);
+    return staged.result;
+  }
+
+  async function commitStagedStep(
+    runId: string,
+    request: AnyEventRequest,
+    params: CreateEventParams | undefined,
+    callId: string
+  ): Promise<EventResult | undefined> {
+    const coordinator = executions;
+    const stepId =
+      'correlationId' in request ? request.correlationId : undefined;
+    const lease = coordinator?.current(runId);
+    const staged = stepId ? coordinator?.staged(runId, stepId) : undefined;
+    if (!coordinator || !stepId || !staged) return;
+    const terminalEventId = `evnt_${ulid()}`;
+    const terminalSyntheticEventId = `evnt_${ulid()}`;
+    const terminalNow = new Date();
+    return coordinator.exclusive(runId, async () => {
+      for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
+        const state = await journal.loadForMutation(runId);
+        if (lease && !ownsExecutionLease(state, lease)) {
+          throw new EntityConflictError(
+            `Execution lease for run "${runId}" changed ownership`
+          );
+        }
+        const startOperationId = mutationOperationId(
+          state,
+          staged.request,
+          staged.callId,
+          staged.params?.requestId
+        );
+        const startParams = staged.params
+          ? { ...staged.params, stateUpdatedAt: undefined }
+          : undefined;
+        const started = materializeEvent(state, staged.request, {
+          eventId: staged.eventId,
+          syntheticEventId: staged.syntheticEventId,
+          operationId: startOperationId,
+          now: staged.now,
+          params: startParams,
+        });
+        if (!started.commit) {
+          throw new EntityConflictError(
+            `Step "${stepId}" no longer has a start transition`
+          );
+        }
+        const preview = journal.preview(state, started.commit);
+        const terminalOperationId = mutationOperationId(
+          preview,
+          request,
+          callId,
+          params?.requestId
+        );
+        const terminal = materializeEvent(preview, request, {
+          eventId: terminalEventId,
+          syntheticEventId: terminalSyntheticEventId,
+          operationId: terminalOperationId,
+          now: terminalNow,
+          params,
+        });
+        if (!terminal.commit) return terminal.result;
+        const owner =
+          lease?.token ??
+          staged.request.eventData?.ownerMessageId ??
+          staged.callId;
+        const operationId = `run-step-transaction:${runId}:${owner}:${stepId}:${requestDigest(request)}`;
+        const commit = combineStepCommits(
+          operationId,
+          started.commit,
+          terminal.commit
+        );
+        if (lease?.lane.startsWith('step:')) {
+          commit.executionLeases = mergeChanges(commit.executionLeases, [
+            { id: lease.lane, value: null },
+          ]);
+        }
+        try {
+          await journal.append(state, commit);
+          coordinator.finish(runId, stepId);
+          return withEventPage(
+            terminal.result,
+            runId,
+            journal,
+            request,
+            params,
+            state.nextRecord
+          );
+        } catch (error) {
+          if (
+            isUrsulaRequestError(error, 412) &&
+            attempt + 1 < MAX_COMMIT_RETRIES
+          ) {
+            journal.evict(runId);
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new WorkflowWorldError(
+        `Step "${stepId}" remained contended after ${MAX_COMMIT_RETRIES} attempts`
+      );
+    });
+  }
+
   const storage: Storage = {
     runs: {
       async get(id, params) {
@@ -395,6 +629,27 @@ export function createStorage(
           throw new WorkflowWorldError(
             'runId is required for non-run_created events'
           );
+        }
+        if (data.eventType === 'step_started') {
+          const staged = await stageStepStart(
+            effectiveRunId,
+            data,
+            params,
+            callId
+          );
+          if (staged) return staged;
+        } else if (
+          data.eventType === 'step_completed' ||
+          data.eventType === 'step_failed' ||
+          data.eventType === 'step_retrying'
+        ) {
+          const committed = await commitStagedStep(
+            effectiveRunId,
+            data,
+            params,
+            callId
+          );
+          if (committed) return committed;
         }
         const lazyRunStart =
           data.eventType === 'run_started' &&

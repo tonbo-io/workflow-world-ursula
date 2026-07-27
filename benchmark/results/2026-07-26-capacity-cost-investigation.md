@@ -380,6 +380,52 @@ The follow-up split each logical queue into fixed physical journals by execution
 
 Eight partitions improved throughput by 6.7% and run-duration p99 by 20.0% over the contemporaneous one-partition control, but TTFS p99 worsened by 16.3%. Sixty-four partitions added only 0.6% throughput over eight while worsening both tail metrics and multiplying active watchers. The adapter therefore defaults to eight, not 64. Partitioning is a bounded coordination improvement and removes the enqueue admission ceiling; it is not evidence for the earlier 300 steps/s target. The remaining capacity and TTFS limit is now dominated by the Workflow application/dispatcher path rather than voter CPU or one queue-tail CAS.
 
+### One-record step transaction experiment
+
+The next experiment changed the authoritative run layout instead of tuning queue parameters. An owned step stages `step_started` in memory, then one record-tail-guarded append commits `step_created` when needed, `step_started`, the terminal event, and the final Step entity together. Ordinary queue delivery first commits a fenced execution-lane claim. Turbo can avoid that claim by reusing its owning queue message, but this path is explicitly experimental because the current World interface does not expose whether a lazy start is running under Turbo's single-handler guarantee.
+
+The exact `100 runs × 20 steps × 3 iterations`, eight-partition ARM comparison produced:
+
+| Variant | Accepted appends | Appends / logical step | Throughput | Run p99 | TTFS p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Contemporaneous literal lifecycle baseline | 14,160 | 2.36 | 87.2 steps/s | 22.531 s | 6.966 s |
+| One-record owned step, per-run commit ordering | 8,163 | 1.36 | 89.6 steps/s | 23.026 s | 10.621 s |
+
+The structural write goal was achieved: accepted appends fell by 42.4%, almost exactly one removed append per logical step. Throughput improved only 2.8%, while the sampled tail metrics did not improve. This falsifies the stronger hypothesis that two run-journal Raft commits were the dominant Workflow capacity blocker at this load point. The voters remained lightly loaded and application/dispatcher scheduling still determined completion and fairness.
+
+Two failed intermediate runs are excluded from the table but produced useful guards. A queue-only execution context left Turbo on the old path and still emitted 2.36 appends per step. The first Turbo fallback then used one process-wide commit mutex, reducing throughput to 68.2 steps/s; changing that mutex to per-run ordering restored concurrency, and a regression test now proves different runs do not serialize.
+
+This experiment should not become a default compatibility behavior until the upstream World contract exposes an explicit atomic-step capability or transaction method. Without that signal, an adapter cannot distinguish Turbo's optimistic single-owner lazy start from a conservative lazy start whose successful `step_started` call is itself the ownership gate. The safe default therefore remains the literal two-append contract outside a fenced queue-delivery context.
+
+### World-storage isolation: why the Workflow result looked tied
+
+The one-record experiment removed 42.4% of Ursula appends but barely moved the complete Workflow benchmark. A call-chain audit then corrected an important assumption: a sequential inline Workflow does not enqueue one continuation after every step. One queue delivery repeatedly executes `terminal append → inline replay → next step` until suspension or timeout. Queue ack/outbox fusion therefore cannot explain or fix the `100 × 20` result.
+
+A new isolation runner measures the storage contract shared by both Worlds without Workflow replay, dispatcher scheduling, application HTTP routing, or user code. Each run is created and started before the measurement window. Every timed logical step performs the same two public World mutations, `step_started` followed by `step_completed`. The runner uses valid ULID identifiers, runs from the same isolated `m7g.xlarge` ARM EKS node, and tests the production-shaped backends serially:
+
+- Ursula 0.3.22: three `m7g.large` voters across three AZs, memory WAL, S3 cold tier, and a three-replica gateway;
+- RDS PostgreSQL 17: Multi-AZ `db.m7g.large`, 100 GiB gp3, TLS, and a 128-connection client pool.
+
+| Concurrent runs | Ursula steps/s | PostgreSQL steps/s | Ursula advantage | Ursula mutation p50 / p99 | PostgreSQL mutation p50 / p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 130.6 | 96.3 | 1.36× | 3.66 / 8.97 ms | 5.11 / 9.70 ms |
+| 8 | 641.1 | 393.9 | 1.63× | 5.21 / 12.97 ms | 8.53 / 20.12 ms |
+| 32 | 969.5 | 497.3 | 1.95× | 15.22 / 27.53 ms | 24.93 / 63.26 ms |
+| 128 | 918.2 | 500.9 | 1.83× | 68.26 / 153.90 ms | 105.03 / 247.39 ms |
+
+This resolves the first-principles question: Ursula's specialized append path does beat the general OLTP backend when storage is the limiting layer. It reaches almost twice the logical-step throughput and keeps substantially lower tails at the useful 32-run point. The complete Workflow benchmark looked tied because its approximately 87–90 steps/s is only about 9% of the isolated Ursula storage capacity; deterministic replay and the application/runtime tier dominate there.
+
+The high-concurrency Ursula curve still has a real knee. Throughput peaks near 32 runs and falls 5.3% at 128 while mutation p99 rises 5.6×. The measurement rules out several old explanations:
+
+- accepted appends equal exactly two per logical step, so run setup is not contaminating the counters;
+- the gateway reports a 100% leader-cache hit ratio during timed writes, so follower redirects are not the cause;
+- the three voters averaged only about 13.8–20.9% CPU over the run minute, and the generator node averaged about 9.9%, so aggregate CPU is not saturated;
+- per-replica mutation apply and group-engine time increase with concurrency, while standard-append coalescing remains sparse until the 128-run level.
+
+The next backend investigation should therefore profile the 32→128 knee inside the per-core group/OpenRaft response path instead of adding more adapter-level step semantics. Separately, the next end-to-end experiment should scale the Workflow application/runtime tier until it consumes a meaningful fraction of the measured approximately 970 steps/s storage capacity.
+
+At the measured peak and current on-demand prices, backend compute normalizes to approximately `$0.070 / 1M logical steps` for three shared-EKS Ursula `m7g.large` voters, versus approximately `$0.206 / 1M logical steps` for Multi-AZ RDS including its provisioned 100 GiB gp3 baseline. This narrow calculation excludes Ursula S3 requests/retention and shared application compute; it establishes storage-engine efficiency, not the final service bill.
+
 ### Benchmark infrastructure caveats
 
 The benchmark image now activates and caches pnpm in both build and runtime stages. Before that fix, a newly scaled private-subnet node attempted a Corepack npm download and crash-looped while an older node's cache hid the problem.
@@ -514,6 +560,12 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Remove the O(stream-count) append scan, offload inline snapshot encoding, stagger automatic snapshots, and rerun a four-generator PostgreSQL comparison.
 - [x] Test CAS-free and locally batched enqueue at the 1,000-run level; revert both after they moved contention to consumer transitions and reduced throughput.
 - [x] Partition queue journals by execution lane, replace empty scans with a watcher-driven ready set, and rerun the capacity sweep.
+- [x] Prototype one-record owned step transactions and verify the expected 42.4% append reduction on EKS.
+- [x] Add a fair public-World storage isolation runner and compare Ursula with Multi-AZ PostgreSQL from the same EKS ARM node.
+- [x] Confirm that Ursula wins the isolated World mutation path at every tested concurrency, peaking at 1.95× PostgreSQL throughput.
+- [ ] Profile the Ursula 32→128 concurrency knee inside the per-core group/OpenRaft response path.
+- [ ] Scale the Workflow application/runtime tier until the end-to-end run reaches a material fraction of isolated storage capacity.
+- [ ] Propose an explicit atomic-step capability/transaction method upstream; keep Turbo owner-based staging experimental until the runtime provides that signal.
 - [ ] Replace the interim active-partition registry/watchers with a bucket changefeed only if idle connection and discovery cost justify the Ursula server primitive; it is not expected to fix loaded throughput.
 - [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Run a multi-hour mixed-load soak and measure snapshot/reference version churn, pack fill ratio, and shared-pack GC.
@@ -539,4 +591,5 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`ursula-v0314-v0315-s3-inventory.json`](./ursula-v0314-v0315-s3-inventory.json)
 - [`postgres-rds-capacity-arm-pool66-failure.json`](./postgres-rds-capacity-arm-pool66-failure.json)
 - [`postgres-rds-capacity-arm-pool32.json`](./postgres-rds-capacity-arm-pool32.json)
+- [`world-storage-comparison-2026-07-27.json`](./world-storage-comparison-2026-07-27.json)
 - [`2026-07-26-eks-comparison.md`](./2026-07-26-eks-comparison.md)

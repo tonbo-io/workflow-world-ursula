@@ -35,6 +35,8 @@ spec:
               value: eks-us-east-1
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
               value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
+            - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
+              value: "1"
             - name: PORT
               value: "3000"
           ports:

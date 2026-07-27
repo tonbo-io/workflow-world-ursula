@@ -1,13 +1,21 @@
 import type { World } from '@workflow/world';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { UrsulaClient } from './client.js';
+import { RunExecutionCoordinator } from './execution.js';
 import { createQueue, type UrsulaQueueConfig } from './queue.js';
+import { RunJournal } from './run-journal.js';
 import { createStorage } from './storage.js';
 import { createStreamer, type UrsulaStreamerConfig } from './streamer.js';
 
 export interface UrsulaWorldConfig
   extends UrsulaStreamerConfig,
-    UrsulaQueueConfig {}
+    UrsulaQueueConfig {
+  /**
+   * Experimental optimization for Workflow's optimistic owned-lazy step path.
+   * The runtime must guarantee one active handler for the owning queue message.
+   */
+  experimentalOwnedStepTransactions?: boolean;
+}
 
 function positiveInteger(
   value: string | undefined,
@@ -78,6 +86,8 @@ function environmentConfig(): UrsulaWorldConfig {
       process.env.WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS,
       'WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS'
     ),
+    experimentalOwnedStepTransactions:
+      process.env.WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS === '1',
   };
 }
 
@@ -108,8 +118,12 @@ export function createWorld(
   config: UrsulaWorldConfig = environmentConfig()
 ): World {
   const client = new UrsulaClient(config);
-  const { storage } = createStorage(client);
-  const queue = createQueue(client, config);
+  const journal = new RunJournal(client);
+  const executions = new RunExecutionCoordinator(journal, {
+    allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
+  });
+  const { storage } = createStorage(client, { journal, executions });
+  const queue = createQueue(client, config, executions);
   return {
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {
