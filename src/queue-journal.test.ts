@@ -426,7 +426,7 @@ describe('QueueJournal', () => {
     }
   });
 
-  it('serializes concurrent local transitions before queue CAS', async () => {
+  it('batches concurrent local enqueues into bounded appends', async () => {
     const memory = new MemoryClient();
     memory.yieldBeforeAppend = true;
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
@@ -442,7 +442,7 @@ describe('QueueJournal', () => {
     );
 
     expect(new Set(messageIds)).toHaveLength(100);
-    expect(memory.appendedBatchSizes).toHaveLength(100);
+    expect(memory.appendedBatchSizes).toEqual([64, 36]);
   });
 
   it('refreshes only the missing suffix after cross-instance queue contention', async () => {
