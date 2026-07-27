@@ -18,6 +18,7 @@ import {
 
 const MAX_CAS_RETRIES = 32;
 const MAX_RETRY_DELAY_MS = 50;
+const MAX_ENQUEUE_BATCH_SIZE = 64;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
@@ -114,6 +115,12 @@ interface QueueCheckpoint {
 export interface QueueLease {
   message: QueueMessageState;
   leaseId: string;
+}
+
+interface PendingEnqueue {
+  transition: Extract<QueueTransition, { type: 'enqueued' }>;
+  resolve(messageId: MessageId): void;
+  reject(error: unknown): void;
 }
 
 function queueStream(queueName: ValidQueueName): string {
@@ -248,6 +255,10 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
   private readonly appendTurns = new Map<ValidQueueName, Promise<void>>();
+  private readonly pendingEnqueues = new Map<
+    ValidQueueName,
+    PendingEnqueue[]
+  >();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(private readonly client: UrsulaClient) {}
@@ -538,15 +549,7 @@ export class QueueJournal {
   ): Promise<MessageId> {
     QueuePayloadSchema.parse(message);
     const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
-    const state = await this.loadForMutation(queueName, {
-      createIfMissing: true,
-    });
     const now = new Date();
-    pruneIdempotency(state, now);
-    if (options.idempotencyKey) {
-      const existing = state.idempotency.get(options.idempotencyKey);
-      if (existing) return existing.messageId;
-    }
     const availableAt = new Date(
       now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
     );
@@ -561,26 +564,94 @@ export class QueueJournal {
       availableAt: availableAt.toISOString(),
       createdAt: now.toISOString(),
     };
-    const previousNextRecord = state.nextRecord;
-    const receipt = await this.client.append(
-      queueStream(queueName),
-      transition,
-      {
-        operationId: `queue-enqueue:${queueName}:${messageId}`,
+    return new Promise<MessageId>((resolve, reject) => {
+      const pending = this.pendingEnqueues.get(queueName);
+      if (pending) {
+        pending.push({ transition, resolve, reject });
+        return;
       }
-    );
-    if (state.nextRecord === receipt.startRecord) {
-      applyTransition(state, transition);
-      state.nextRecord = receipt.nextRecord;
-    } else if (state.nextRecord < receipt.nextRecord) {
-      await this.load(queueName);
+      this.pendingEnqueues.set(queueName, [{ transition, resolve, reject }]);
+      queueMicrotask(() => {
+        void this.flushEnqueues(queueName);
+      });
+    });
+  }
+
+  private async flushEnqueues(queueName: ValidQueueName): Promise<void> {
+    const pending = this.pendingEnqueues.get(queueName);
+    if (!pending) return;
+    this.pendingEnqueues.delete(queueName);
+    for (
+      let offset = 0;
+      offset < pending.length;
+      offset += MAX_ENQUEUE_BATCH_SIZE
+    ) {
+      await this.flushEnqueueBatch(
+        queueName,
+        pending.slice(offset, offset + MAX_ENQUEUE_BATCH_SIZE)
+      );
     }
-    this.scheduleCheckpoint(queueName, state, previousNextRecord);
-    if (options.idempotencyKey) {
-      const canonical = state.idempotency.get(options.idempotencyKey);
-      if (canonical) return canonical.messageId;
+  }
+
+  private async flushEnqueueBatch(
+    queueName: ValidQueueName,
+    pending: PendingEnqueue[]
+  ): Promise<void> {
+    try {
+      const state = await this.loadForMutation(queueName, {
+        createIfMissing: true,
+      });
+      pruneIdempotency(state, new Date());
+      const seenKeys = new Set<string>();
+      const transitions = pending
+        .map(({ transition }) => transition)
+        .filter((transition) => {
+          const key = transition.idempotencyKey;
+          if (!key) return true;
+          if (state.idempotency.has(key) || seenKeys.has(key)) return false;
+          seenKeys.add(key);
+          return true;
+        });
+      if (transitions.length === 0) {
+        for (const item of pending) {
+          const key = item.transition.idempotencyKey;
+          const canonical = key ? state.idempotency.get(key) : undefined;
+          item.resolve(canonical?.messageId ?? item.transition.messageId);
+        }
+        return;
+      }
+      const previousNextRecord = state.nextRecord;
+      const receipt = await this.client.append(
+        queueStream(queueName),
+        transitions,
+        {
+          operationId: `queue-enqueue-batch:${queueName}:${transitions
+            .map(({ messageId: id }) => id)
+            .join(',')}`,
+        }
+      );
+      if (state.nextRecord === receipt.startRecord) {
+        for (const transition of transitions) {
+          applyTransition(state, transition);
+        }
+        state.nextRecord = receipt.nextRecord;
+      } else if (state.nextRecord < receipt.nextRecord) {
+        await this.load(queueName);
+      }
+      this.scheduleCheckpoint(queueName, state, previousNextRecord);
+      for (const item of pending) {
+        const key = item.transition.idempotencyKey;
+        const canonical = key ? state.idempotency.get(key) : undefined;
+        if (key && !canonical) {
+          throw new Error(
+            `Queue "${queueName}" lost idempotency state for "${key}"`
+          );
+        }
+        item.resolve(canonical?.messageId ?? item.transition.messageId);
+      }
+    } catch (error) {
+      for (const item of pending) item.reject(error);
     }
-    return messageId;
   }
 
   private claimCandidate(
