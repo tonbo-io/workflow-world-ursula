@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-28
 
-Status: Ursula 0.3.28 compresses finite JSON/NDJSON responses while explicitly leaving SSE uncompressed. On the current fresh-bucket three-sample comparison, Ursula delivers 614.0 steps/s versus PostgreSQL's 460.5 steps/s, with 26.4% lower run p99 and 20.2% lower TTFS p99, but the throughput advantage is only 1.333× rather than the required 1.5×. Cross-AZ traffic falls from 24.250 to approximately 12.831 GB per million steps and total measured cost falls from approximately `$0.565–0.568` to `$0.336 / 1M` steps. This is another meaningful cost improvement, but PostgreSQL still costs approximately `$0.233 / 1M`; Raft replication now accounts for about two thirds of gross cross-AZ bytes under load and almost all idle cross-AZ traffic.
+Status: The Workflow adapter now writes its common owned successful-step transaction as a lossless compact tuple after a reader-first rollout. The current three-sample median is 601.4 steps/s versus PostgreSQL's 460.5 steps/s, with 24.1% lower run p99 and 26.8% lower TTFS p99, but the throughput advantage is only 1.306× rather than the required 1.5×. Compact records reduce total cross-AZ traffic from 12.831 to 10.891 GB per million steps and reduce generated cold-tier bytes from approximately 2.658 to 0.814 GB per million steps. Total measured cost falls from approximately `$0.336` to `$0.276 / 1M` steps, but PostgreSQL still costs approximately `$0.233 / 1M`; voter-to-voter Raft traffic is now 72.9% of the loaded diagnostic's gross cross-AZ bytes.
 
 ## Goal
 
@@ -18,7 +18,7 @@ The comparison must answer three different questions:
 
 | Component | Configuration |
 | --- | --- |
-| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.28 |
+| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.28 plus compact Workflow journal |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
 | Application tier | Current comparison uses eight one-core pods on two isolated `m7g.xlarge` ARM EKS workers; Ursula uses three request-only plus five dispatcher pods, while PostgreSQL uses eight combined workers |
 | Region | `us-east-1`, same VPC |
@@ -200,6 +200,84 @@ The independent change reduced Ursula's measured total by approximately 40.5%, s
 2. Separate the approximately 256-group heartbeat/control-plane floor from replicated workflow payload. A viable change must report both idle bytes/s and load-dependent voter→voter GB per million steps.
 3. Reduce the bytes replicated per logical step, not only request count. The next design experiment should compact the authoritative Workflow commit representation or otherwise avoid repeating verbose JSON/entity structure across both full followers.
 4. Do not weaken the durability comparator silently. Any two-full-copy plus witness design must prove that a committed append always resides on two data-bearing AZs before acknowledgement and must document its availability semantics against RDS Multi-AZ.
+5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps.
+
+## 2026-07-28 compact owned-step journal iteration
+
+This iteration changed the authoritative Workflow representation rather than the Durable Streams or World contract. A successful owned step still commits one guarded Ursula record containing the same three lifecycle events and materialized `Step`, but the stored tuple omits field names and values implied by the run stream, record coordinate, and exact transaction shape. Any non-matching shape falls back to the original v1 object, and every reader understands both representations.
+
+The first deployment did not match live data. Its matcher assumed identical lifecycle timestamps and an older fixed telemetry set, while the actual Workflow record used distinct created/started/completed times plus `finalSchedulingReplay` and `rsfs`. A raw-stream inspection proved the fallback before formal measurement, so that warm-up was rejected. PR #81 added tuple-v3 with three timestamps and a lossless telemetry extras object while retaining tuple-v2 reads.
+
+Deployment used immutable artifacts and explicit compatibility stages:
+
+- adapter PRs: [#80](https://github.com/tonbo-io/workflow-world-ursula/pull/80) and [#81](https://github.com/tonbo-io/workflow-world-ursula/pull/81);
+- benchmark image index: `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:574d8cfc960859e32276b8fb172c69db5f0416b9c53f752c94868a080e5712dc`;
+- ARM64 image: `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:79168a65bcb7471ca05207d1ebd1547531ee3db64548f04ec41b4c2c3d195202`;
+- stage 0 rolled every old instance with compact writes disabled;
+- stage 1 rolled all three request pods and five dispatchers to the new reader with writes still disabled and verified that every old ReplicaSet was at zero;
+- stage 2 enabled tuple-v3 and selected `workflow-benchmark-v0330-compact3-d1-20260728`;
+- all eight instances were ready with zero restarts and were balanced four-per-worker before the packet meter was rebuilt.
+
+A one-step smoke read the authoritative stream directly and found `{"v":2,"c":[3,...]}`. The live compact record was 694 JSON bytes and preserved all three timestamps plus `finalSchedulingReplay`, `optimizations`, `rsfs`, and `ttfs`; the comparable v1 hot-step sample was approximately 2,306 bytes.
+
+### Performance
+
+One `500 runs × 50 steps` warm-up delivered 598.6 steps/s and is excluded from the median. The three independent formal jobs used the unchanged old runner digest so only app/dispatcher storage code changed.
+
+| Metric | Compact samples | Compact median | PostgreSQL median | Comparison |
+| --- | ---: | ---: | ---: | ---: |
+| Throughput | 599.6, 601.4, 619.9 steps/s | **601.4 steps/s** | 460.5 steps/s | **1.306×** |
+| Run-duration p99 | 40.405, 40.508, 38.912 s | **40.405 s** | 53.254 s | **24.1% lower** |
+| TTFS p99 | 29.999, 32.035, 31.365 s | **31.365 s** | 42.860 s | **26.8% lower** |
+
+The p99 requirement remains met. Throughput is 2.1% below the 0.3.28 median and 12.9% below the required 690.8 steps/s, so representation compaction is a cost win rather than the missing throughput breakthrough.
+
+### Network effect
+
+The exact sender-side meter was regenerated after the final rollout and retained one `POSTROUTING` jump per node. Its idle rate was 1,521,763 bytes/s. Each formal job recorded counters before creation and after completion; the equal-duration idle bytes were removed before normalizing the remaining 25,000-step load.
+
+| Cross-AZ wire bytes / 1M steps | Ursula 0.3.28 | Compact journal | Change |
+| --- | ---: | ---: | ---: |
+| Load-dependent median | 10.361 GB | 8.361 GB | **−19.3%** |
+| Always-on idle normalized at median throughput | 2.470 GB | 2.530 GB | +2.4% |
+| **Total** | **12.831 GB** | **10.891 GB** | **−15.1%** |
+
+The load-dependent samples were 8.361, 8.457, and 8.313 GB per million steps. A separate diagnostic, excluded from the performance median, delivered 628.5 steps/s and split its 291.3 MB gross cross-AZ bytes as follows:
+
+| Gross cross-AZ path | Bytes | Share |
+| --- | ---: | ---: |
+| Voter → voter Raft | 212.4 MB | 72.93% |
+| Voter → gateway | 42.7 MB | 14.67% |
+| Gateway → voter | 35.6 MB | 12.24% |
+| Cross-zone application/dispatcher | 0.49 MB | 0.17% |
+
+The tuple reduced the HTTP request/response path and variable Raft payload, but it cannot remove empty per-group Raft control traffic. The idle floor alone now costs approximately `$0.051 / 1M` steps at the measured throughput.
+
+### Cold bytes and total cost
+
+Cold uploads are thresholded 8 MiB pack events, so a short run's S3 counter is not the same thing as bytes generated. The compact warm-up triggered no upload, the first and third formal jobs each triggered one approximately 8 MiB pack, and the second triggered none. To include pending data, the measurement sums cluster-unique `cold_flush_upload_bytes` and leader-owned `cold_hot_bytes` before the warm-up and after the third formal job:
+
+- physical uploads: +16,767,330 bytes and +2 packs;
+- pending hot bytes: +64,646,181 bytes;
+- generated cold-tier data: +81,413,511 bytes over 100,000 steps, or approximately 0.814 GB per million steps.
+
+This is 69.4% below the earlier 2.658 GB per million physical-upload result and agrees with the sampled record-size reduction. Using eventual approximately 8 MiB packs, Standard S3 storage, PUT pricing, and the existing first-month average-retention convention gives approximately `$0.0099 / 1M` steps.
+
+| Cost / 1M steps | Ursula 0.3.28 | Compact journal | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| 40%-allocated backend compute/storage | `$0.0473` | `$0.0483` | `$0.0889` |
+| Cross-AZ transfer | `$0.2566` | `$0.2178` | `$0.1445` |
+| S3 packed payload, PUTs, first-month average retention | `$0.0322` | approximately `$0.0099` | included in RDS |
+| **Measured total before operations** | **`$0.336`** | **approximately `$0.276`** | **`$0.233`** |
+
+This independent change reduces the measured Ursula total by approximately 17.9%, so it is a meaningful reproducible improvement and resets the no-progress counter. The objective remains unmet: Ursula is approximately 18.5% more expensive than PostgreSQL and approximately 69% above the `$0.163 / 1M` target.
+
+### Next gates
+
+1. Treat voter-to-voter Raft traffic as the next structural cost blocker. It is 72.9% of loaded gross bytes and almost the entire idle floor.
+2. Distinguish empty per-group heartbeat/control bytes from append replication bytes. Aggregating empty heartbeats per peer or reducing active group control traffic must preserve independent group elections and report failover impact.
+3. Do not claim zero S3 cost from a below-threshold run. Future iterations must report uploaded and pending hot bytes together or use a long enough steady-state window.
+4. A two-data-replica plus witness topology is admissible only if acknowledgement proves two data-bearing AZ copies and the cluster refuses durability-weak writes after losing either data replica.
 5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps.
 
 ## 2026-07-27 structural Workflow rerun
