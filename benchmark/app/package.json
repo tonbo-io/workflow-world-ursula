@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
+    "prebuild": "node ../prepare-workflow-world-package.mjs",
     "build": "next build",
+    "postbuild": "node ../verify-workflow-bundle.mjs",
     "start": "next start --hostname 0.0.0.0 --port 3000",
     "test": "vitest run lib",
     "typecheck": "tsc --noEmit"

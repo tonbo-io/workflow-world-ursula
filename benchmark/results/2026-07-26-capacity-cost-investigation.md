@@ -449,7 +449,19 @@ The first benchmark-only OpenTelemetry profile captured every app replica. Its d
 
 This falsifies the idea that more Ursula server tuning alone can produce the complete-Workflow 1.5× target at this load point. The specialized storage layer already wins the isolated World contract by 1.95× at 32 concurrent runs, but the Workflow handler re-enters `runWorkflow` after every durable step boundary and replays the deterministic program. PostgreSQL's longer storage waits leave more application CPU headroom and overlap across runs; when the common runtime reaches its CPU ceiling, both backends converge near 81 steps/s.
 
-The next measurement adds a low-overhead V8 CPU sampler to the existing per-pod profile endpoint. It starts immediately before the suite and retains only the top self-time frames, not payloads or raw profiles. That result must distinguish VM/context construction, event-log/reducer scans, Promise scheduling, and adapter I/O before a runtime change is selected. The likely structural direction is a replay-prefix or resumable-executor optimization in Workflow core; arbitrary JavaScript stacks cannot simply be serialized by a World adapter, so this must remain an explicit runtime capability rather than an Ursula-only correctness shortcut.
+The follow-up low-overhead V8 profile sampled all eight pods for both backends at 5 ms. It reproduced the tied complete-Workflow result: Ursula delivered 81.5 steps/s with a 60.942 s run p99, while PostgreSQL delivered 84.2 steps/s with a 59.065 s p99. Across the whole suite, the top-frame summaries attributed approximately:
+
+| Aggregated self time across 8 pods | Ursula | PostgreSQL |
+| --- | ---: | ---: |
+| Workflow VM bundle frames | 121.9 CPU-s | 111.0 CPU-s |
+| Garbage collection | 134.4 CPU-s | 128.6 CPU-s |
+| `node:vm` context creation | 2.8 CPU-s | 3.3 CPU-s |
+
+The dominant bundle frames are not the benchmark's no-op function. They are top-level module initialization: Zod schema constructors, export wiring, and related initialization repeated when the same compiled `vm.Script` is evaluated in each fresh replay context. The generated Workflow VM bundle was 624,177 bytes and contained the complete Zod 4 runtime, every locale, and all `@workflow/world` schemas. This happens because the builder correctly imports the `Run` serde registration entry in both contexts, but the published `@workflow/world` package does not declare its modules side-effect-free; esbuild therefore retains every re-exported schema module even though the registration path only uses lightweight constants and helpers.
+
+Adding only `"sideEffects": false` to the installed `@workflow/world` manifest reduced the generated bundle from 624,177 to 32,584 bytes, a 94.8% reduction, and removed Zod completely. This is a build-graph fix rather than a durable-execution shortcut: it does not cache mutable VM state, serialize a JavaScript stack, change replay inputs, or alter any World operation. It applies symmetrically to Ursula and PostgreSQL. The benchmark carries a temporary reproducible pre-build metadata patch plus a post-build size/Zod guard while the same change is proposed upstream.
+
+This result replaces the earlier replay-prefix hypothesis as the first runtime experiment. Reusing a mutable VM context remains unsafe without a much larger design because module globals, pending promises, clocks, and deterministic hooks belong to one replay. Tree-shaking unused pure modules removes the measured initialization waste while preserving a fresh context and the existing replay correctness model. If the EKS rerun does not materially increase both backends' complete throughput or reveal more of Ursula's 1.95× isolated storage advantage, the next profile will identify the remaining reducer/VM cost before any continuation design is attempted.
 
 ### Benchmark infrastructure caveats
 
@@ -592,8 +604,9 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Scale the Workflow application/runtime tier until the end-to-end run reaches a material fraction of isolated storage capacity.
 - [x] Repeat the complete Workflow comparison with eight one-core app replicas evenly spread over two ARM nodes.
 - [x] Add per-pod Workflow span aggregation and prove the full run converges at the shared replay/application-CPU ceiling.
-- [ ] Capture low-frequency V8 CPU self-time from every app pod for both backends and identify the replay hotspot.
-- [ ] Implement and benchmark the selected replay-prefix/resumable-runtime optimization without weakening durable step semantics.
+- [x] Capture low-frequency V8 CPU self-time from every app pod for both backends and identify repeated workflow-bundle initialization as the replay hotspot.
+- [ ] Benchmark the 94.8% smaller tree-shaken Workflow VM bundle on both backends without weakening durable step semantics.
+- [ ] Upstream the `@workflow/world` side-effect metadata and remove the temporary benchmark pre-build patch after an official package contains it.
 - [ ] Propose an explicit atomic-step capability/transaction method upstream; keep Turbo owner-based staging experimental until the runtime provides that signal.
 - [ ] Replace the interim active-partition registry/watchers with a bucket changefeed only if idle connection and discovery cost justify the Ursula server primitive; it is not expected to fix loaded throughput.
 - [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
@@ -625,4 +638,6 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`postgres-rds-v0322-workflow-profile.json`](./postgres-rds-v0322-workflow-profile.json)
 - [`ursula-v0322-workflow-profile-8app.json`](./ursula-v0322-workflow-profile-8app.json)
 - [`postgres-rds-v0322-workflow-profile-8app.json`](./postgres-rds-v0322-workflow-profile-8app.json)
+- [`ursula-v0322-workflow-cpu-8app.json`](./ursula-v0322-workflow-cpu-8app.json)
+- [`postgres-rds-v0322-workflow-cpu-8app.json`](./postgres-rds-v0322-workflow-cpu-8app.json)
 - [`2026-07-26-eks-comparison.md`](./2026-07-26-eks-comparison.md)
