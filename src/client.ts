@@ -143,7 +143,16 @@ function jsonReplacer(
   return value;
 }
 
-function jsonReviver(_key: string, value: unknown): unknown {
+function reviveUrsulaJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const nested = value[index];
+      if (typeof nested === 'object' && nested !== null) {
+        value[index] = reviveUrsulaJson(nested);
+      }
+    }
+    return value;
+  }
   if (
     typeof value === 'object' &&
     value !== null &&
@@ -154,6 +163,14 @@ function jsonReviver(_key: string, value: unknown): unknown {
       Buffer.from((value as { data: string }).data, 'base64')
     );
   }
+  if (typeof value === 'object' && value !== null) {
+    const object = value as Record<string, unknown>;
+    for (const [key, nested] of Object.entries(object)) {
+      if (typeof nested === 'object' && nested !== null) {
+        object[key] = reviveUrsulaJson(nested);
+      }
+    }
+  }
   return value;
 }
 
@@ -162,25 +179,28 @@ export function stringifyUrsulaJson(value: unknown): string {
 }
 
 export function parseUrsulaJson<T>(value: string): T {
-  return JSON.parse(value, jsonReviver) as T;
+  return reviveUrsulaJson(JSON.parse(value)) as T;
+}
+
+function parseRecord<T>(line: string): UrsulaRecord<T> {
+  const parsed = parseUrsulaJson<Partial<UrsulaRecord<T>>>(line);
+  if (
+    !Number.isSafeInteger(parsed.record) ||
+    (parsed.record as number) < 0 ||
+    !Object.hasOwn(parsed, 'value')
+  ) {
+    throw new Error('Invalid record envelope returned by Ursula');
+  }
+  return parsed as UrsulaRecord<T>;
 }
 
 function parseRecords<T>(body: string): UrsulaRecord<T>[] {
   if (!body.trim()) return [];
+  if (!body.includes('\n')) return [parseRecord<T>(body)];
   return body
     .split('\n')
     .filter(Boolean)
-    .map((line) => {
-      const parsed = parseUrsulaJson<Partial<UrsulaRecord<T>>>(line);
-      if (
-        !Number.isSafeInteger(parsed.record) ||
-        (parsed.record as number) < 0 ||
-        !Object.hasOwn(parsed, 'value')
-      ) {
-        throw new Error('Invalid record envelope returned by Ursula');
-      }
-      return parsed as UrsulaRecord<T>;
-    });
+    .map((line) => parseRecord<T>(line));
 }
 
 /**
