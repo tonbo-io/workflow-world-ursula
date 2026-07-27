@@ -37,6 +37,8 @@ spec:
               value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
               value: "1"
+            - name: WORKFLOW_BENCH_PROFILE
+              value: "1"
             - name: PORT
               value: "3000"
           ports:
@@ -61,6 +63,20 @@ metadata:
   name: workflow-benchmark-app
   namespace: workflow-benchmark
 spec:
+  selector:
+    app: workflow-benchmark-app
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workflow-benchmark-app-headless
+  namespace: workflow-benchmark
+spec:
+  clusterIP: None
   selector:
     app: workflow-benchmark-app
   ports:
@@ -142,6 +158,8 @@ spec:
               value: http://ursula-gateway.ursula.svc.cluster.local:4437/__ursula/gateway/metrics
             - name: WORKFLOW_BENCH_BACKEND
               value: ursula-eks
+            - name: WORKFLOW_BENCH_PROFILE_URL
+              value: http://workflow-benchmark-app-headless.workflow-benchmark.svc.cluster.local:3000/api/bench/profile
             - name: BENCH_OUTPUT_FILE
               value: /results/bench-results-eks-nextjs-ursula.json
           resources:
