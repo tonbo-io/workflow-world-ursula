@@ -212,6 +212,17 @@ one long-lived watcher per active partition rather than eagerly opening every
 possible partition on every replica. A local enqueue or completed delivery
 wakes the pump immediately. Polling is used only as error backoff.
 
+Small deployments use the zero-configuration topology in which every process
+can dispatch. Larger deployments SHOULD separate request serving from queue
+dispatch: request replicas set
+`WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED=0`, while a smaller redundant pool
+keeps dispatch enabled and sends deliveries through the shared Workflow HTTP
+origin. Request replicas still enqueue and execute delivered handlers; they
+simply do not duplicate every registry and partition long poll. The dispatcher
+pool is stateless. If all dispatchers disappear, delivery pauses until one
+restarts, then pending messages or expired leases are recovered from Ursula.
+At-least-once redelivery and execution fencing remain unchanged.
+
 Every 256 transitions in one partition, the adapter writes a checkpoint
 containing that partition's active messages and live 24-hour idempotency
 window, publishes it as the partition stream's Ursula snapshot, then advances

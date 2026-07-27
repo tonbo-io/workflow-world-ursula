@@ -320,6 +320,39 @@ describe('Ursula queue runtime', () => {
     ).toEqual([]);
   });
 
+  it('lets request-serving replicas enqueue without starting a dispatcher', async () => {
+    const memory = new MemoryClient();
+    const client = memory as unknown as UrsulaClient;
+    const queueName =
+      '__wkf_workflow_dedicated_dispatcher' as ValidQueueName;
+    const requestReplica = createQueue(client, {
+      dispatcherEnabled: false,
+      pollIntervalMs: 10_000,
+    });
+    const localHandler = vi.fn().mockResolvedValue(undefined);
+    requestReplica.createQueueHandler('__wkf_workflow_', localHandler);
+    await requestReplica.start();
+    await requestReplica.queue(queueName, {
+      runId: 'run-dedicated-dispatcher',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(localHandler).not.toHaveBeenCalled();
+    expect(memory.waitedStreams).toEqual([]);
+
+    const dispatcher = createQueue(client, {
+      pollIntervalMs: 10_000,
+      leaseDurationMs: 1_000,
+    });
+    const remoteHandler = vi.fn().mockResolvedValue(undefined);
+    dispatcher.createQueueHandler('__wkf_workflow_', remoteHandler);
+    await dispatcher.start();
+    await vi.waitFor(() => expect(remoteHandler).toHaveBeenCalledOnce(), {
+      timeout: 500,
+    });
+    await Promise.all([requestReplica.close(), dispatcher.close()]);
+  });
+
   it('rotates the first queue considered when capacity is saturated', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const firstQueue = '__wkf_workflow_fair_first' as ValidQueueName;
