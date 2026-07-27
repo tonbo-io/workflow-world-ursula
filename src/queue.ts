@@ -36,6 +36,14 @@ type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 export interface UrsulaQueueConfig {
   deploymentId?: string;
   /**
+   * Whether this process claims and delivers queue messages.
+   *
+   * Keep enabled for the zero-configuration single-process topology. Larger
+   * deployments can disable dispatch on request-serving replicas and run a
+   * smaller redundant dispatcher pool; all replicas can still enqueue.
+   */
+  dispatcherEnabled?: boolean;
+  /**
    * HTTP origin that serves Workflow's `/.well-known/workflow/v1/*` routes.
    * Defaults to WORKFLOW_URSULA_QUEUE_DELIVERY_URL, then localhost:$PORT.
    */
@@ -653,6 +661,7 @@ export function createQueue(
       );
     },
     async start() {
+      if (config.dispatcherEnabled === false) return;
       if (!registryWatcher) registryWatcher = watchRegistry();
       if (!loop) loop = run();
     },

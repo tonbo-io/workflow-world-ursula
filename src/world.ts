@@ -41,6 +41,17 @@ function nonNegativeInteger(
   return parsed;
 }
 
+function boolean(
+  value: string | undefined,
+  fallback: boolean,
+  name: string
+): boolean {
+  if (value === undefined || value === '') return fallback;
+  if (value === '1' || value === 'true') return true;
+  if (value === '0' || value === 'false') return false;
+  throw new Error(`${name} must be 1, 0, true, or false`);
+}
+
 function environmentConfig(): UrsulaWorldConfig {
   const baseUrl = process.env.WORKFLOW_URSULA_URL;
   if (!baseUrl) {
@@ -53,6 +64,11 @@ function environmentConfig(): UrsulaWorldConfig {
     bucket: process.env.WORKFLOW_URSULA_BUCKET,
     token: process.env.WORKFLOW_URSULA_TOKEN,
     deploymentId: process.env.WORKFLOW_URSULA_DEPLOYMENT_ID,
+    dispatcherEnabled: boolean(
+      process.env.WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED,
+      true,
+      'WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED'
+    ),
     deliveryBaseUrl: process.env.WORKFLOW_URSULA_QUEUE_DELIVERY_URL,
     longPollTimeoutMs: positiveInteger(
       process.env.WORKFLOW_URSULA_LONG_POLL_TIMEOUT_MS,

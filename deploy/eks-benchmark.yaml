@@ -9,7 +9,7 @@ metadata:
   name: workflow-benchmark-app
   namespace: workflow-benchmark
 spec:
-  replicas: 8
+  replicas: 6
   selector:
     matchLabels:
       app: workflow-benchmark-app
@@ -40,6 +40,74 @@ spec:
               value: workflow-benchmark-v0322-profile-8app
             - name: WORKFLOW_URSULA_DEPLOYMENT_ID
               value: eks-us-east-1
+            - name: WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED
+              value: "0"
+            - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
+              value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
+            - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
+              value: "1"
+            - name: WORKFLOW_BENCH_PROFILE
+              value: "1"
+            - name: PORT
+              value: "3000"
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "600m"
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-benchmark-dispatcher
+  namespace: workflow-benchmark
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: workflow-benchmark-app
+      workflow-benchmark-role: dispatcher
+  template:
+    metadata:
+      labels:
+        app: workflow-benchmark-app
+        workflow-benchmark-role: dispatcher
+    spec:
+      nodeSelector:
+        workflow-benchmark-role: app
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: workflow-benchmark-app
+              workflow-benchmark-role: dispatcher
+      containers:
+        - name: app
+          image: ghcr.io/tonbo-io/workflow-world-ursula-benchmark:main-ursula
+          imagePullPolicy: Always
+          env:
+            - name: WORKFLOW_TARGET_WORLD
+              value: "@tonbo-io/world-ursula"
+            - name: WORKFLOW_URSULA_URL
+              value: http://ursula-gateway.ursula.svc.cluster.local:4437
+            - name: WORKFLOW_URSULA_BUCKET
+              value: workflow-benchmark-v0322-profile-8app
+            - name: WORKFLOW_URSULA_DEPLOYMENT_ID
+              value: eks-us-east-1
+            - name: WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED
+              value: "1"
             - name: WORKFLOW_URSULA_QUEUE_DELIVERY_URL
               value: http://workflow-benchmark-app.workflow-benchmark.svc.cluster.local:3000
             - name: WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS
