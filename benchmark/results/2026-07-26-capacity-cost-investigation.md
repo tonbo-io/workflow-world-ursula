@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-28
 
-Status: The Workflow adapter now writes its common owned successful-step transaction as a lossless compact tuple after a reader-first rollout. The current three-sample median is 601.4 steps/s versus PostgreSQL's 460.5 steps/s, with 24.1% lower run p99 and 26.8% lower TTFS p99, but the throughput advantage is only 1.306× rather than the required 1.5×. Compact records reduce total cross-AZ traffic from 12.831 to 10.891 GB per million steps and reduce generated cold-tier bytes from approximately 2.658 to 0.814 GB per million steps. Total measured cost falls from approximately `$0.336` to `$0.276 / 1M` steps, but PostgreSQL still costs approximately `$0.233 / 1M`; voter-to-voter Raft traffic is now 72.9% of the loaded diagnostic's gross cross-AZ bytes.
+Status: Ursula 0.3.29 shares one generation-aware HTTP/2 Raft channel per peer endpoint instead of opening one channel per Raft group and peer. The current three-sample median is 620.5 steps/s versus PostgreSQL's 460.5 steps/s, with 27.0% lower run p99 and 24.6% lower TTFS p99, but the throughput advantage is only 1.347× rather than the required 1.5×. The change reduced established voter-to-voter connections from approximately 1,038 to 29 and reduced total cross-AZ traffic from 10.891 to 9.650 GB per million steps. A corrected S3 measurement now includes Raft snapshot objects and reference writes as well as packed stream data: Ursula costs approximately `$0.280 / 1M` steps versus PostgreSQL's approximately `$0.233 / 1M`, while the 30%-lower target is at most `$0.163 / 1M`.
 
 ## Goal
 
@@ -18,13 +18,90 @@ The comparison must answer three different questions:
 
 | Component | Configuration |
 | --- | --- |
-| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.28 plus compact Workflow journal |
+| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.29 plus compact Workflow journal |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
 | Application tier | Current comparison uses eight one-core pods on two isolated `m7g.xlarge` ARM EKS workers; Ursula uses three request-only plus five dispatcher pods, while PostgreSQL uses eight combined workers |
 | Region | `us-east-1`, same VPC |
 | Workload | Vercel Workflow-compatible sequential no-op steps through the same benchmark application |
 
 Application compute is common to both backends and is excluded from backend price comparisons, but its CPU and memory must still be sampled to prove it did not become the load generator bottleneck.
+
+## 2026-07-28 Ursula 0.3.29 shared Raft channel iteration
+
+This iteration changed Raft transport ownership rather than consensus or Workflow semantics. Previously, every OpenRaft group/peer network instance opened its own tonic HTTP/2 channel. A live pre-change conntrack snapshot found 171–175 established connections on each of the six directed voter paths, approximately 1,038 voter-to-voter connections in total. Ursula 0.3.29 keeps one process-wide channel and reconnect generation per peer endpoint. Individual groups still issue independent OpenRaft RPCs and retain independent elections, timeouts, logs, and state machines.
+
+The immutable release and rollout evidence is:
+
+- Ursula transport PR: [tonbo-io/ursula#224](https://github.com/tonbo-io/ursula/pull/224);
+- release PR and tag: [tonbo-io/ursula#225](https://github.com/tonbo-io/ursula/pull/225), `v0.3.29`;
+- image index: `ghcr.io/tonbo-io/ursula:0.3.29@sha256:d3d6de71aab471129c76253053722f62a72fa12b8993b79ad45f432410dca8a6`;
+- ARM64 image: `ghcr.io/tonbo-io/ursula@sha256:1b1103ca771c00638b52361c27f34c9e7f8382c32cb96c460f314ab28b301eb9`;
+- Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula:0.3.29@sha256:e4122918fe198b3f32b18f235af00cbcf9e8f9a4d193fa8d087284a24ea7b501`;
+- benchmark runner remained `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:0606f4c4a9e8c6559403dcf1e1b1e7014ef3ece892135f5a1a5fc000566ec7a1`;
+- adapter image remained `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:574d8cfc960859e32276b8fb172c69db5f0416b9c53f752c94868a080e5712dc`;
+- cloud PR [tonbo-io/cloud#40](https://github.com/tonbo-io/cloud/pull/40) was merged by the release workflow;
+- Argo ran the memory-WAL `OnDelete` sequence for nodes 3, 2, and 1. Each voter was strictly verified, drained, armed with `prepare-restart`, replaced, caught up, undrained, and verified again. The application finished `Synced / Healthy / Succeeded`, with all voters, gateways, and indexers on 0.3.29 and zero pod restarts.
+
+After the rollout, the six voter endpoints contained 58 established conntrack endpoint entries, or 29 unique TCP connections after removing the source/destination duplicate. Stable ten-minute voter logs contained no reconnect, transport, unavailable, warning, or error events. The approximately 97.2% connection reduction therefore did not trade steady-state health for fewer sockets.
+
+The benchmark used the fresh `workflow-benchmark-v0331-raftch-d1` bucket, three request pods plus five dispatcher pods balanced four-per-worker over the unchanged two application nodes, one excluded warm-up, and three formal jobs. A first bucket name exceeded Ursula's combined bucket/stream identifier limit by one byte and was rejected before workload execution. An initial packet-meter layout was also rejected because installing every source/destination pair on every node counted the same packet at both endpoints. Neither attempt is a benchmark iteration.
+
+### Performance
+
+The excluded warm-up delivered 615.2 steps/s. Each formal job ran `500 runs × 50 sequential steps`, used eight queue shards, disabled profiling, and retained the compact completed-step representation.
+
+| Metric | Ursula 0.3.29 samples | Ursula median | PostgreSQL median | Comparison |
+| --- | ---: | ---: | ---: | ---: |
+| Throughput | 620.5, 609.8, 636.5 steps/s | **620.5 steps/s** | 460.5 steps/s | **1.347×** |
+| Run-duration p99 | 38.894, 39.811, 37.889 s | **38.894 s** | 53.254 s | **27.0% lower** |
+| TTFS p99 | 32.315, 32.106, 32.297 s | **32.297 s** | 42.860 s | **24.6% lower** |
+
+The p99 requirement remains met. Reaching 1.5× PostgreSQL still requires 690.8 steps/s, another 11.3% over the current median. Compared with the compact-journal median, throughput improved by 3.2% and run p99 improved by 3.7%; TTFS moved by approximately 3% in the other direction and is treated as noise rather than a regression.
+
+### Network effect
+
+The corrected source-side meter installed exactly one `POSTROUTING` jump per node and counted a packet only on the node hosting its current source pod. It covered all three voters, three gateways, two indexers, three request pods, and five dispatchers after their final rollouts. The equal-window idle sample was 1,259,003 bytes/s, 17.3% below the compact-journal baseline's 1,521,763 bytes/s.
+
+| Cross-AZ wire bytes / 1M steps | Compact journal | Shared Raft channels | Change |
+| --- | ---: | ---: | ---: |
+| Load-dependent median | 8.361 GB | 7.621 GB | **−8.9%** |
+| Always-on idle normalized at median throughput | 2.530 GB | 2.029 GB | **−19.8%** |
+| **Total** | **10.891 GB** | **9.650 GB** | **−11.4%** |
+
+The three total samples were 9.650, 9.797, and 9.574 GB per million steps after node-specific idle subtraction and normalization. Sharing channels removes duplicate TCP/TLS/HTTP2 control traffic and connection churn, but it does not batch the 256 independent groups' empty heartbeats or append RPC envelopes. Per-peer cross-group RPC coalescing is therefore the remaining transport-level structural lever.
+
+### Packed data, Raft snapshots, and corrected cost
+
+The formal runner did not capture the `cold_hot_bytes` gauge, and the absolute post-rollout gauge included restored historical buckets. A separate same-configuration 25,000-step storage sample therefore captured all three leaders immediately before and after the job:
+
+- pending hot stream data: +20,354,713 bytes;
+- physical cold uploads: no change during the below-threshold sample;
+- generated stream data: 0.814 GB per million steps, independently reproducing the compact-journal result;
+- snapshot builds after the quiescent baseline: 54, comprising three voters for 18 affected groups;
+- successful unique immutable snapshot objects: 29 objects and 19,390,759 bytes;
+- node reference writes: 54.
+
+The snapshot object keys are content addressed, so equal voter snapshots share storage, but every build still attempts the object create and then writes its node reference. Conservatively charging all 54 conditional object attempts plus 54 reference PUTs yields 4,320 snapshot PUT requests per million steps. Unique snapshot payload normalizes to 0.776 GB per million steps. At Standard S3 pricing and the existing first-month average-retention convention, packed stream data costs approximately `$0.0099 / 1M` steps and snapshot payload plus requests costs approximately `$0.0305 / 1M`.
+
+| Cost / 1M steps | Compact journal, previously reported | Shared Raft channels | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| 40%-allocated backend compute/storage | `$0.0483` | `$0.0468` | `$0.0889` |
+| Cross-AZ transfer | `$0.2178` | `$0.1930` | `$0.1445` |
+| S3 packed stream data | approximately `$0.0099` | approximately `$0.0099` | included in RDS |
+| S3 Raft snapshots and references | omitted | approximately `$0.0305` | included in RDS |
+| **Measured total before operations** | **`$0.276`** | **approximately `$0.280`** | **`$0.233`** |
+
+The apparent `$0.276 → $0.280` increase is a cost-classification correction, not a runtime regression: the previous total omitted Raft snapshot churn. Applying the same measured snapshot rate to the compact-journal baseline produces approximately `$0.307 / 1M`; on that like-for-like basis, shared channels reduce total measured cost by approximately 8.6%. This is meaningful, reproducible progress and resets the no-progress counter.
+
+The objective remains unmet. Ursula costs approximately 20.2% more than PostgreSQL before operations and approximately 71.8% more than the `$0.163 / 1M` target. Operations and backup sensitivity are still unpriced, so this result cannot be used to claim total-cost completion.
+
+### Next gates
+
+1. Batch independent per-group Raft heartbeat and append RPC envelopes onto the shared peer channel without coupling group elections or changing acknowledgement semantics.
+2. Preserve rolling compatibility: a new voter must fall back to unary RPCs when its peer does not expose the batch transport.
+3. Add transport counters for batch size, encoded bytes, fallback, and per-item latency before measuring the next iteration.
+4. Treat snapshot request churn as a second structural cost floor. Snapshot scheduling or reference publication should avoid three paid object-create attempts when the deterministic snapshot body is identical.
+5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps including operations.
 
 ## 2026-07-28 Ursula 0.3.26 reproducible cost iteration
 
