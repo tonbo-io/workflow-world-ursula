@@ -5,9 +5,12 @@
   "scripts": {
     "build": "next build",
     "start": "next start --hostname 0.0.0.0 --port 3000",
+    "test": "vitest run lib",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/sdk-trace-node": "2.10.0",
     "@tonbo-io/world-ursula": "workspace:*",
     "@workflow/world-postgres": "5.0.0-beta.28",
     "next": "16.2.11",
@@ -19,6 +22,7 @@
     "@types/node": "22.19.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   }
 }

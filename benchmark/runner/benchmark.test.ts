@@ -95,6 +95,10 @@ import {
   deriveBackendMetrics,
   diffBackendMetrics,
 } from './backend-metrics.js';
+import {
+  captureWorkflowProfiles,
+  resetWorkflowProfiles,
+} from './workflow-profile.js';
 
 const deploymentUrl = process.env.DEPLOYMENT_URL;
 if (!deploymentUrl) {
@@ -851,6 +855,7 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
       );
       timingsFromReturnValue(returnValue, runId);
       console.log(`[bench] preflight ok (run ${runId})`);
+      await resetWorkflowProfiles();
     } catch (error) {
       throw new Error(
         `Benchmark preflight failed — the deployment accepted the run but did not execute it to completion; aborting all scenarios. ${(error as Error).message}`
@@ -1093,6 +1098,7 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
     const appName = process.env.APP_NAME || 'unknown';
     const backend = getBackend();
     const backendMetricsAfter = await captureBackendMetrics();
+    const runtimeProfile = await captureWorkflowProfiles();
     const outputPath = path.resolve(
       process.cwd(),
       process.env.BENCH_OUTPUT_FILE ??
@@ -1137,6 +1143,7 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
           diffBackendMetrics(backendMetricsBefore, backendMetricsAfter)
         ),
       },
+      runtimeProfile,
     };
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
     console.log(`[bench] Results written to ${outputPath}`);
@@ -1206,6 +1213,7 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
     );
     timingsFromReturnValue(returnValue, runId);
     console.log(`[bench] capacity preflight ok (run ${runId})`);
+    await resetWorkflowProfiles();
   }, PREFLIGHT_TIMEOUT_MS + 60_000);
 
   test('concurrency saturation curve', { timeout: 3 * 60 * 60_000 }, async () => {
@@ -1281,10 +1289,11 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
     }
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     if (capacityLevels.length === 0 && !capacityFailure) return;
     const appName = process.env.APP_NAME || 'unknown';
     const backend = getBackend();
+    const runtimeProfile = await captureWorkflowProfiles();
     const outputPath = path.resolve(
       process.cwd(),
       process.env.BENCH_OUTPUT_FILE ??
@@ -1307,6 +1316,7 @@ describe.skipIf(!CAPACITY_ONLY)('workflow capacity sweep', () => {
       },
       levels: capacityLevels,
       failure: capacityFailure,
+      runtimeProfile,
     };
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));
     console.log(`[bench] Capacity results written to ${outputPath}`);
