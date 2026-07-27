@@ -166,7 +166,7 @@ if (CATCHUP_RESUME_START_INDEX >= CATCHUP_CHUNK_COUNT) {
 // renderer keys baseline deltas on this, so old-methodology baselines on `main`
 // are not diffed against new-methodology runs (deltas stay blank until `main`
 // has produced a same-version baseline). v2 = in-deployment trigger.
-const BENCH_METHODOLOGY_VERSION = 2;
+const BENCH_METHODOLOGY_VERSION = 3;
 
 // Per-metric latency targets (ms) rendered as 🟢/🔴 marks in the PR comment.
 // Provisional: now that the proxy leg is out of every window, these will be

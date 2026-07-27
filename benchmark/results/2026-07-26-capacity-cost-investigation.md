@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-27
 
-Status: the Workflow-level capacity sweep, raw-storage isolation benchmark, and first high-cardinality server follow-ups are complete. Ursula 0.3.22 removes the aged-state throughput collapse and beats the distributed PostgreSQL warm-append comparison, while new-stream tail latency and production cold-storage economics remain open. The temporary RDS comparator and benchmark EKS workloads have been destroyed, and the ARM application node group has been returned to one node. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
+Status: the Workflow-level capacity sweep, raw-storage isolation benchmark, first high-cardinality server follow-ups, and a fair application-CPU headroom rerun are complete. Ursula 0.3.22 removes the aged-state throughput collapse and beats the distributed PostgreSQL World mutation path, but the complete Workflow runtime converges with PostgreSQL once both receive eight application cores. The active investigation is now deterministic replay/application CPU rather than Raft throughput. New-stream tail latency and production cold-storage economics also remain open. The original `100 concurrent × 50 steps` result was a load point, not a saturation point, so the old `$0.412 / 100k` Ursula and `$0.266 / 100k` PostgreSQL figures remain withdrawn.
 
 ## Goal
 
@@ -426,6 +426,31 @@ The next backend investigation should therefore profile the 32→128 knee inside
 
 At the measured peak and current on-demand prices, backend compute normalizes to approximately `$0.070 / 1M logical steps` for three shared-EKS Ursula `m7g.large` voters, versus approximately `$0.206 / 1M logical steps` for Multi-AZ RDS including its provisioned 100 GiB gp3 baseline. This narrow calculation excludes Ursula S3 requests/retention and shared application compute; it establishes storage-engine efficiency, not the final service bill.
 
+### Complete Workflow CPU-headroom rerun
+
+The storage-isolation result did not establish complete Workflow throughput because the original application tier was saturated. The same `100 concurrent × 50 sequential no-op steps` suite was therefore run first with four one-core application pods on one `m7g.xlarge`, then with eight one-core pods spread exactly four-per-node across two identical `m7g.xlarge` workers. Ursula and PostgreSQL ran serially against the same app topology; Ursula used the production three-voter memory-WAL plus S3 canary and PostgreSQL used the Multi-AZ `db.m7g.large` comparator.
+
+| Application topology | Ursula throughput / run avg / p99 | PostgreSQL throughput / run avg / p99 | Verdict |
+| --- | ---: | ---: | --- |
+| 4 pods, 1 node | 48.6 steps/s / 66.393 s / 102.479 s | 44.7 steps/s / 98.366 s / 110.776 s | Ursula 1.09× throughput |
+| 8 pods, 2 nodes | 81.1 steps/s / 36.874 s / 61.251 s | 81.8 steps/s / 44.425 s / 60.815 s | Throughput and p99 tied; Ursula run average 17.0% lower |
+
+Adding only application CPU raised Ursula throughput by 66.9% and PostgreSQL by 83.0%. The eight-pod comparison is the fair result: comparing eight-core Ursula with four-core PostgreSQL would manufacture a 1.81× advantage from unequal shared runtime resources.
+
+The first benchmark-only OpenTelemetry profile captured every app replica. Its durations are wall time and include asynchronous waits, so they are attribution clues rather than CPU samples:
+
+| Eight-pod aggregate span | Ursula avg | PostgreSQL avg | Interpretation |
+| --- | ---: | ---: | --- |
+| `step.execute timedNoopStep` | 384.0 ms | 606.9 ms | Ursula completes the step lifecycle sooner |
+| `workflow.run ...benchSequentialStepsWorkflow` | 177.5 ms | 85.3 ms | Replay/scheduling wall time consumes Ursula's storage advantage |
+| Actual no-op user body | 0.091 ms | 0.072 ms | User code is irrelevant |
+| `step.hydrate` | 0.158 ms | 0.127 ms | Serialization is not the main limiter |
+| `step.dehydrate` | 0.247 ms | 0.223 ms | Serialization is not the main limiter |
+
+This falsifies the idea that more Ursula server tuning alone can produce the complete-Workflow 1.5× target at this load point. The specialized storage layer already wins the isolated World contract by 1.95× at 32 concurrent runs, but the Workflow handler re-enters `runWorkflow` after every durable step boundary and replays the deterministic program. PostgreSQL's longer storage waits leave more application CPU headroom and overlap across runs; when the common runtime reaches its CPU ceiling, both backends converge near 81 steps/s.
+
+The next measurement adds a low-overhead V8 CPU sampler to the existing per-pod profile endpoint. It starts immediately before the suite and retains only the top self-time frames, not payloads or raw profiles. That result must distinguish VM/context construction, event-log/reducer scans, Promise scheduling, and adapter I/O before a runtime change is selected. The likely structural direction is a replay-prefix or resumable-executor optimization in Workflow core; arbitrary JavaScript stacks cannot simply be serialized by a World adapter, so this must remain an explicit runtime capability rather than an Ursula-only correctness shortcut.
+
 ### Benchmark infrastructure caveats
 
 The benchmark image now activates and caches pnpm in both build and runtime stages. Before that fix, a newly scaled private-subnet node attempted a Corepack npm download and crash-looped while an older node's cache hid the problem.
@@ -564,7 +589,11 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Add a fair public-World storage isolation runner and compare Ursula with Multi-AZ PostgreSQL from the same EKS ARM node.
 - [x] Confirm that Ursula wins the isolated World mutation path at every tested concurrency, peaking at 1.95× PostgreSQL throughput.
 - [ ] Profile the Ursula 32→128 concurrency knee inside the per-core group/OpenRaft response path.
-- [ ] Scale the Workflow application/runtime tier until the end-to-end run reaches a material fraction of isolated storage capacity.
+- [x] Scale the Workflow application/runtime tier until the end-to-end run reaches a material fraction of isolated storage capacity.
+- [x] Repeat the complete Workflow comparison with eight one-core app replicas evenly spread over two ARM nodes.
+- [x] Add per-pod Workflow span aggregation and prove the full run converges at the shared replay/application-CPU ceiling.
+- [ ] Capture low-frequency V8 CPU self-time from every app pod for both backends and identify the replay hotspot.
+- [ ] Implement and benchmark the selected replay-prefix/resumable-runtime optimization without weakening durable step semantics.
 - [ ] Propose an explicit atomic-step capability/transaction method upstream; keep Turbo owner-based staging experimental until the runtime provides that signal.
 - [ ] Replace the interim active-partition registry/watchers with a bucket changefeed only if idle connection and discovery cost justify the Ursula server primitive; it is not expected to fix loaded throughput.
 - [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
@@ -592,4 +621,8 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`postgres-rds-capacity-arm-pool66-failure.json`](./postgres-rds-capacity-arm-pool66-failure.json)
 - [`postgres-rds-capacity-arm-pool32.json`](./postgres-rds-capacity-arm-pool32.json)
 - [`world-storage-comparison-2026-07-27.json`](./world-storage-comparison-2026-07-27.json)
+- [`ursula-v0322-workflow-profile.json`](./ursula-v0322-workflow-profile.json)
+- [`postgres-rds-v0322-workflow-profile.json`](./postgres-rds-v0322-workflow-profile.json)
+- [`ursula-v0322-workflow-profile-8app.json`](./ursula-v0322-workflow-profile-8app.json)
+- [`postgres-rds-v0322-workflow-profile-8app.json`](./postgres-rds-v0322-workflow-profile-8app.json)
 - [`2026-07-26-eks-comparison.md`](./2026-07-26-eks-comparison.md)

@@ -5,10 +5,14 @@ import {
   type Span,
   type SpanProcessor,
 } from '@opentelemetry/sdk-trace-node';
+import { Session } from 'node:inspector/promises';
+import type { Profiler } from 'node:inspector';
 
 const PROFILE_GLOBAL = '__workflowBenchmarkProfile';
 const PROVIDER_GLOBAL = '__workflowBenchmarkTracerProvider';
 const MAX_SAMPLES_PER_MEASUREMENT = 200_000;
+const CPU_PROFILE_TOP_FRAMES = 50;
+const DEFAULT_CPU_PROFILE_INTERVAL_US = 5_000;
 
 const CATEGORICAL_ATTRIBUTES = new Set([
   'error.type',
@@ -63,10 +67,30 @@ export interface SpanProfile {
 }
 
 export interface WorkflowProfileSnapshot {
+  cpu?: CpuProfileSummary;
   enabled: boolean;
   pid: number;
   spans: Record<string, SpanProfile>;
   startedAt: string;
+}
+
+export interface CpuProfileFrame {
+  columnNumber: number;
+  functionName: string;
+  lineNumber: number;
+  selfSamples: number;
+  selfTimeMs: number;
+  url: string;
+}
+
+export interface CpuProfileSummary {
+  intervalMicros: number;
+  sampledTimeMs: number;
+  startedAt: string;
+  stoppedAt: string;
+  topSelf: CpuProfileFrame[];
+  totalSamples: number;
+  wallTimeMs: number;
 }
 
 function newMeasurement(): Measurement {
@@ -117,7 +141,77 @@ function durationMs(span: ReadableSpan): number {
   return span.duration[0] * 1_000 + span.duration[1] / 1_000_000;
 }
 
+function cpuProfileIntervalMicros(): number {
+  const value = Number(process.env.WORKFLOW_BENCH_CPU_PROFILE_INTERVAL_US);
+  if (!Number.isSafeInteger(value) || value < 100) {
+    return DEFAULT_CPU_PROFILE_INTERVAL_US;
+  }
+  return value;
+}
+
+export function summarizeCpuProfile(
+  profile: Profiler.Profile,
+  intervalMicros: number,
+  startedAt: Date,
+  stoppedAt: Date
+): CpuProfileSummary {
+  const nodes = new Map(profile.nodes.map((node) => [node.id, node]));
+  const frameSamples = new Map<
+    number,
+    { selfSamples: number; selfTimeMicros: number }
+  >();
+  const samples = profile.samples ?? [];
+  const timeDeltas = profile.timeDeltas ?? [];
+
+  for (const [index, nodeId] of samples.entries()) {
+    const current = frameSamples.get(nodeId) ?? {
+      selfSamples: 0,
+      selfTimeMicros: 0,
+    };
+    current.selfSamples += 1;
+    current.selfTimeMicros += timeDeltas[index] ?? intervalMicros;
+    frameSamples.set(nodeId, current);
+  }
+
+  const topSelf = [...frameSamples.entries()]
+    .map(([nodeId, measurement]) => {
+      const callFrame = nodes.get(nodeId)?.callFrame;
+      return {
+        columnNumber: callFrame?.columnNumber ?? 0,
+        functionName: callFrame?.functionName || '(anonymous)',
+        lineNumber: callFrame?.lineNumber ?? 0,
+        selfSamples: measurement.selfSamples,
+        selfTimeMs: measurement.selfTimeMicros / 1_000,
+        url: callFrame?.url ?? '',
+      };
+    })
+    .sort(
+      (left, right) =>
+        right.selfTimeMs - left.selfTimeMs ||
+        right.selfSamples - left.selfSamples
+    )
+    .slice(0, CPU_PROFILE_TOP_FRAMES);
+
+  return {
+    intervalMicros,
+    sampledTimeMs:
+      [...frameSamples.values()].reduce(
+        (sum, measurement) => sum + measurement.selfTimeMicros,
+        0
+      ) / 1_000,
+    startedAt: startedAt.toISOString(),
+    stoppedAt: stoppedAt.toISOString(),
+    topSelf,
+    totalSamples: samples.length,
+    wallTimeMs: (profile.endTime - profile.startTime) / 1_000,
+  };
+}
+
 export class WorkflowProfile {
+  private cpuProfile?: CpuProfileSummary;
+  private cpuProfileInterval = DEFAULT_CPU_PROFILE_INTERVAL_US;
+  private cpuProfileSession?: Session;
+  private cpuProfileStartedAt?: Date;
   private spans = new Map<string, SpanMeasurements>();
   private startedAt = new Date();
 
@@ -155,12 +249,25 @@ export class WorkflowProfile {
     }
   }
 
-  reset(): void {
+  async reset(): Promise<void> {
+    await this.stopCpuProfile();
     this.spans.clear();
     this.startedAt = new Date();
+    this.cpuProfile = undefined;
+    this.cpuProfileInterval = cpuProfileIntervalMicros();
+    this.cpuProfileStartedAt = new Date();
+    const session = new Session();
+    session.connect();
+    await session.post('Profiler.enable');
+    await session.post('Profiler.setSamplingInterval', {
+      interval: this.cpuProfileInterval,
+    });
+    await session.post('Profiler.start');
+    this.cpuProfileSession = session;
   }
 
-  snapshot(): WorkflowProfileSnapshot {
+  async snapshot(): Promise<WorkflowProfileSnapshot> {
+    await this.stopCpuProfile();
     const spans: Record<string, SpanProfile> = {};
     for (const [name, profile] of [...this.spans].sort(([a], [b]) =>
       a.localeCompare(b)
@@ -190,11 +297,32 @@ export class WorkflowProfile {
       };
     }
     return {
+      cpu: this.cpuProfile,
       enabled: true,
       pid: process.pid,
       spans,
       startedAt: this.startedAt.toISOString(),
     };
+  }
+
+  private async stopCpuProfile(): Promise<void> {
+    const session = this.cpuProfileSession;
+    const startedAt = this.cpuProfileStartedAt;
+    if (!session || !startedAt) return;
+    this.cpuProfileSession = undefined;
+    this.cpuProfileStartedAt = undefined;
+    try {
+      const { profile } = await session.post('Profiler.stop');
+      this.cpuProfile = summarizeCpuProfile(
+        profile,
+        this.cpuProfileInterval,
+        startedAt,
+        new Date()
+      );
+      await session.post('Profiler.disable');
+    } finally {
+      session.disconnect();
+    }
   }
 }
 

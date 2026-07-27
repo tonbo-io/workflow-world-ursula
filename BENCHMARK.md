@@ -167,6 +167,22 @@ For Postgres, set `WORKFLOW_TARGET_WORLD=@workflow/world-postgres` and
 `WORKFLOW_POSTGRES_URL`. For managed Vercel, use the benchmark workflow's
 standard Vercel environment.
 
+The EKS comparison manifests assume two `m7g.xlarge` workers labelled
+`workflow-benchmark-role=app`. They run eight application replicas spread
+evenly across both nodes. Keep the same application topology for Ursula and
+Postgres and run the backends serially; a single four-core application node
+becomes replay-CPU-bound before either storage backend reaches its useful
+throughput ceiling.
+
+`WORKFLOW_BENCH_PROFILE=1` enables benchmark-only OpenTelemetry aggregation
+and a low-frequency V8 CPU profile in every application process. The runner
+resets and starts all profiles immediately before a suite, then stores span
+distributions and the top 50 self-time frames from every pod in
+`runtimeProfile`. The default sampling interval is 5 ms and can be changed with
+`WORKFLOW_BENCH_CPU_PROFILE_INTERVAL_US`. Both comparators must use the same
+setting; CPU-profiled results should not be compared with older unprofiled
+results as if the methodology were identical.
+
 The repository's EKS manifests implement this matrix directly:
 
 - `deploy/eks-benchmark.yaml` uses the Depot-built `main-ursula` image and
