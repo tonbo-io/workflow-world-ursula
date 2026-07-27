@@ -1,8 +1,8 @@
 # Workflow backend capacity and cost investigation
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
-Status: the Workflow-level capacity sweep, raw-storage isolation benchmark, high-cardinality server follow-ups, and the first structural Workflow-runtime pass are complete. Separating request-serving pods from queue dispatchers raised the median complete-Workflow result to 666.7 steps/s for Ursula versus 428.6 steps/s for PostgreSQL, a 1.556× advantage, with lower run and TTFS p99 on the same eight application cores. This meets the performance gate at the measured 500-run stress point. Fixed Ursula backend cost normalizes approximately 54% below the RDS comparator and current packed cold objects are approximately 8 MiB, but total cost is not signed off: exact cross-AZ traffic and snapshot/reference churn can still consume the cost margin. The active server change makes identical per-voter Raft snapshots one compressed, content-addressed S3 object before the comparison is repeated.
+Status: Ursula 0.3.26 fixes the cold-health leadership storm and completes the same-EKS, same-application-tier cost measurement with immutable benchmark images. On the current reproducible three-sample comparison, Ursula delivers 600.7 steps/s versus PostgreSQL's 460.5 steps/s, with lower run and TTFS p99, but the throughput advantage is only 1.304× rather than the required 1.5×. Exact cross-AZ measurement reverses the previous provisional cost result: Ursula costs approximately `$0.90–0.91 / 1M` steps versus PostgreSQL's `$0.233 / 1M` at the agreed 40% compute allocation. HTTP responses crossing `voter -> gateway -> app` account for 63% of Ursula's measured cross-AZ bytes, so same-zone gateway routing and response-path compression are now the primary structural experiments.
 
 ## Goal
 
@@ -18,13 +18,80 @@ The comparison must answer three different questions:
 
 | Component | Configuration |
 | --- | --- |
-| Ursula | 3 × `m6i.xlarge`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.8 |
+| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.26 |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
-| Application tier | Capacity sweeps used 8, 16, and 32 replicas on 2, 4, and 8 isolated `m6i.xlarge` EKS application nodes |
+| Application tier | Current comparison uses eight one-core pods on two isolated `m7g.xlarge` ARM EKS workers; Ursula uses three request-only plus five dispatcher pods, while PostgreSQL uses eight combined workers |
 | Region | `us-east-1`, same VPC |
 | Workload | Vercel Workflow-compatible sequential no-op steps through the same benchmark application |
 
 Application compute is common to both backends and is excluded from backend price comparisons, but its CPU and memory must still be sampled to prove it did not become the load generator bottleneck.
+
+## 2026-07-28 Ursula 0.3.26 reproducible cost iteration
+
+This iteration used immutable artifacts and a fresh Ursula bucket:
+
+- Ursula 0.3.26: `ghcr.io/tonbo-io/ursula@sha256:c2648ed08698696588d452161f8e7e929d23472700a483c4ba92c28d9c31c49c`;
+- benchmark image: `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:0606f4c4a9e8c6559403dcf1e1b1e7014ef3ece892135f5a1a5fc000566ec7a1`;
+- PostgreSQL benchmark image: `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:ef12d921271011422cbc2dd2bef64be00b64e4489101a252dc83beffb7ad822d`;
+- workload: three independent warm `500 runs × 50 sequential steps` jobs per backend, profiling disabled;
+- Ursula bucket: `workflow-benchmark-v0326-coldhealth-d1-20260728`.
+
+The 0.3.25 run initially produced three valid samples, then failed repeatedly with `OpenRaft head_stream has to forward request to leader`. The cause was a false cold-health overload signal: `cold_hot_group_bytes_max` was a lifetime high-water mark while the default shed threshold was below the 8 MiB flush boundary. Once enough groups had ever crossed the threshold, all leaders were continuously shed even after their live backlog fell. Ursula PR #218 changed the health signal to the current maximum, retained a separate high-water metric, raised production thresholds above the flush boundary, and added validation/tests. After the graceful GitOps upgrade to 0.3.26, cold packs resumed at approximately 8 MiB and the leadership storm did not recur.
+
+### Complete Workflow performance
+
+| Metric | Ursula samples | PostgreSQL samples | Median comparison |
+| --- | ---: | ---: | ---: |
+| Throughput | 611.9, 593.5, 600.7 steps/s | 458.9, 479.3, 460.5 steps/s | **600.7 vs 460.5; Ursula 1.304×** |
+| Run-duration p99 | 39.779, 40.403, 40.143 s | 53.307, 51.091, 53.254 s | **40.143 vs 53.254 s; Ursula 24.6% lower** |
+| TTFS p99 | 33.651, 34.186, 35.405 s | 43.688, 40.037, 42.860 s | **34.186 vs 42.860 s; Ursula 20.2% lower** |
+
+The p99 requirement is reproducibly met. The throughput requirement is not: 1.5× the current PostgreSQL median is 690.8 steps/s, so Ursula needs another 15.0% over its current median.
+
+### Cross-AZ methodology and result
+
+A privileged DaemonSet installed source/destination-specific `mangle/POSTROUTING` counters on every EKS node. Counters match resolved pod and RDS IPs rather than whole VPC CIDRs. Ursula packets are counted once at the sending pod's node; PostgreSQL counts app-to-RDS requests and RDS-to-app responses on the app nodes. Each backend was measured idle and under load, and the equal-duration idle rate was subtracted from every load sample.
+
+| Cross-AZ wire bytes / 1M steps | Ursula | PostgreSQL |
+| --- | ---: | ---: |
+| Load-dependent median | 37.201 GB | 13.324 GB |
+| Always-on idle normalized at median throughput | 3.875 GB | 1.122 GB |
+| **Total** | **41.076 GB** | **14.446 GB** |
+
+AWS charges EC2-to-EC2 cross-AZ traffic at `$0.01/GB` at both endpoints. For EC2-to-RDS in different AZs, AWS charges the EC2 side `$0.01/GB in/out` and does not add an RDS-side transfer charge; RDS Multi-AZ replication is free. The resulting measured network cost is therefore approximately `$0.822 / 1M` Ursula steps and `$0.144 / 1M` PostgreSQL steps.
+
+One additional Ursula run preserved per-pod-pair counters. Its 1.064 GB gross cross-AZ total split as follows:
+
+| Path | Bytes | Share |
+| --- | ---: | ---: |
+| Voter → gateway | 329.0 MB | 30.9% |
+| Gateway → app/dispatcher | 337.2 MB | 31.7% |
+| Voter → voter Raft | 271.2 MB | 25.5% |
+| Gateway → voter | 62.9 MB | 5.9% |
+| App/dispatcher → gateway | 63.6 MB | 6.0% |
+
+The doubled HTTP response path, not Raft replication, is the largest source of network amplification. The current gateway `ClusterIP` Service distributes endpoints cluster-wide even though one gateway replica exists in each AZ. Kubernetes 1.35 supports `trafficDistribution: PreferSameZone`; applying that preference should remove most of the approximately 400.8 MB app↔gateway cross-AZ component without weakening durability. Response compression or a leader-direct data path remains necessary after that because EC2-to-EC2 replication is intrinsically billed at both endpoints.
+
+### Current per-million-step cost
+
+The fixed component uses the agreed 40% allocation for both backends. This is a shared-service allocation, not a claim that AWS discounts idle instances. Application compute is common and excluded.
+
+| Cost / 1M steps | Ursula | PostgreSQL |
+| --- | ---: | ---: |
+| Allocated backend compute/storage floor | `$0.048` | `$0.089` |
+| Cross-AZ transfer | `$0.822` | `$0.144` |
+| S3 packed payload, PUTs, first-month average retention | approximately `$0.032–0.035` | included in provisioned RDS storage |
+| **Measured total before operations** | **approximately `$0.90–0.91`** | **approximately `$0.233`** |
+
+Across the three Ursula samples, cold counters recorded 25 physical uploads and 207,151,796 bytes over 75,000 steps, normalizing to approximately 333 pack uploads and 2.762 GB per million steps. Pack size remains close to the intended 8 MiB. Operations are not assigned a speculative dollar amount; including them cannot rescue the current Ursula result.
+
+### Next gates
+
+1. Add a Helm-configurable `trafficDistribution: PreferSameZone` to the gateway Service, promote it through GitOps, and repeat three warm jobs with the same packet meter.
+2. Require the app↔gateway cross-AZ component to fall materially; reject the change if EndpointSlice routing does not honor the preference on EKS.
+3. Add HTTP response byte/compression metrics, then compress JSON record responses across both voter→gateway and gateway→app legs without changing Durable Streams semantics.
+4. Reduce the 256-group idle heartbeat floor only after the response path is fixed; idle Raft traffic is measurable but not the dominant loaded component.
+5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below 70% of the PostgreSQL comparator.
 
 ## 2026-07-27 structural Workflow rerun
 
