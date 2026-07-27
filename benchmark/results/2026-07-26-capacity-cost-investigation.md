@@ -370,6 +370,16 @@ Removing producer CAS eliminated the 1,000-run enqueue failure, but every messag
 
 The structural conclusion is that one logical workflow queue stored as one Durable Stream is a global sequencing point for enqueue, lease, and ack. Adapter-side batching can move contention between producers, consumers, and replicas, but cannot remove it. The next scalable design needs partitioned physical queue journals plus an efficient discovery/changefeed primitive, or a server-side conditional queue transition that validates message state inside one Raft command without comparing the entire stream tail.
 
+The follow-up split each logical queue into fixed physical journals by execution-lane hash and used the existing queue registry only to discover partitions that had received work. The first 64-partition implementation removed the 1,000-run admission failure, but a full single-iteration sweep plateaued at 104.8 steps/s rather than the guarded baseline's 117.1 steps/s. A watcher-driven ready set then removed empty-partition probes. Because single iterations remained noisy, the comparison was narrowed to three identical 100-run iterations on the same 0.3.22 memory-WAL cluster, eight ARM app replicas, and a fresh bucket per setting:
+
+| Physical journals per logical queue | Throughput | Run duration p99 | TTFS p99 |
+| ---: | ---: | ---: | ---: |
+| 1 | 81.7 steps/s | 28.147 s | 5.992 s |
+| 8 | 87.2 steps/s | 22.531 s | 6.966 s |
+| 64 | 87.7 steps/s | 27.012 s | 8.452 s |
+
+Eight partitions improved throughput by 6.7% and run-duration p99 by 20.0% over the contemporaneous one-partition control, but TTFS p99 worsened by 16.3%. Sixty-four partitions added only 0.6% throughput over eight while worsening both tail metrics and multiplying active watchers. The adapter therefore defaults to eight, not 64. Partitioning is a bounded coordination improvement and removes the enqueue admission ceiling; it is not evidence for the earlier 300 steps/s target. The remaining capacity and TTFS limit is now dominated by the Workflow application/dispatcher path rather than voter CPU or one queue-tail CAS.
+
 ### Benchmark infrastructure caveats
 
 The benchmark image now activates and caches pnpm in both build and runtime stages. Before that fix, a newly scaled private-subnet node attempted a Corepack npm download and crash-looped while an older node's cache hid the problem.
@@ -503,7 +513,8 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [ ] Force a cold-cache miss via leadership transfer and measure real S3 replay.
 - [x] Remove the O(stream-count) append scan, offload inline snapshot encoding, stagger automatic snapshots, and rerun a four-generator PostgreSQL comparison.
 - [x] Test CAS-free and locally batched enqueue at the 1,000-run level; revert both after they moved contention to consumer transitions and reduced throughput.
-- [ ] Design partitioned queue journals around a bucket changefeed, or add a server-side conditional queue transition, then rerun the same capacity sweep.
+- [x] Partition queue journals by execution lane, replace empty scans with a watcher-driven ready set, and rerun the capacity sweep.
+- [ ] Replace the interim active-partition registry/watchers with a bucket changefeed only if idle connection and discovery cost justify the Ursula server primitive; it is not expected to fix loaded throughput.
 - [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Run a multi-hour mixed-load soak and measure snapshot/reference version churn, pack fill ratio, and shared-pack GC.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.

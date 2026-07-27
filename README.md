@@ -50,7 +50,7 @@ World.
 | `WORKFLOW_URSULA_QUEUE_LEASE_DURATION_MS` | Queue message lease duration |
 | `WORKFLOW_URSULA_QUEUE_RETRY_DELAY_MS` | Default retry delay |
 | `WORKFLOW_URSULA_QUEUE_CONCURRENCY` | Local queue dispatcher concurrency |
-| `WORKFLOW_URSULA_QUEUE_PARTITIONS` | Physical journals per logical queue, default `64`; one execution lane always maps to one partition |
+| `WORKFLOW_URSULA_QUEUE_PARTITIONS` | Physical journals per logical queue, default `8`; one execution lane always maps to one partition |
 | `WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS` | Maximum graceful wait for in-flight handlers |
 
 ## Durability model
