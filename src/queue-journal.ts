@@ -17,8 +17,8 @@ import {
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
+const MAX_ENQUEUE_CAS_RETRIES = 128;
 const MAX_RETRY_DELAY_MS = 50;
-const MAX_ENQUEUE_BATCH_SIZE = 64;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
@@ -117,12 +117,6 @@ export interface QueueLease {
   leaseId: string;
 }
 
-interface PendingEnqueue {
-  transition: Extract<QueueTransition, { type: 'enqueued' }>;
-  resolve(messageId: MessageId): void;
-  reject(error: unknown): void;
-}
-
 function queueStream(queueName: ValidQueueName): string {
   const digest = createHash('sha256').update(queueName).digest('base64url');
   return `queue-${digest}`;
@@ -185,16 +179,6 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
   }
   if (value.type === 'enqueued') {
     if (state.messages.has(value.messageId)) return;
-    const createdAt = new Date(value.createdAt);
-    if (value.idempotencyKey) {
-      const existing = state.idempotency.get(value.idempotencyKey);
-      // Enqueue records are intentionally appended without a queue-tail CAS.
-      // Concurrent retries can therefore both be durable. Journal order picks
-      // one canonical message while the retry window is active.
-      if (existing && existing.expiresAt.getTime() > createdAt.getTime()) {
-        return;
-      }
-    }
     const message: QueueMessageState = {
       messageId: MessageIdSchema.parse(value.messageId),
       queueName: value.queueName,
@@ -202,7 +186,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
       headers: value.headers,
       idempotencyKey: value.idempotencyKey,
       availableAt: new Date(value.availableAt),
-      createdAt,
+      createdAt: new Date(value.createdAt),
       attempt: 0,
       status: 'pending',
     };
@@ -255,10 +239,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
   private readonly appendTurns = new Map<ValidQueueName, Promise<void>>();
-  private readonly pendingEnqueues = new Map<
-    ValidQueueName,
-    PendingEnqueue[]
-  >();
+  private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(private readonly client: UrsulaClient) {}
@@ -547,111 +528,76 @@ export class QueueJournal {
     message: QueuePayload,
     options: QueueOptions = {}
   ): Promise<MessageId> {
-    QueuePayloadSchema.parse(message);
-    const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
-    const now = new Date();
-    const availableAt = new Date(
-      now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
-    );
-    const transition: QueueTransition = {
-      version: 1,
-      type: 'enqueued',
-      messageId,
-      queueName,
-      message,
-      headers: options.headers,
-      idempotencyKey: options.idempotencyKey,
-      availableAt: availableAt.toISOString(),
-      createdAt: now.toISOString(),
-    };
-    return new Promise<MessageId>((resolve, reject) => {
-      const pending = this.pendingEnqueues.get(queueName);
-      if (pending) {
-        pending.push({ transition, resolve, reject });
-        return;
-      }
-      this.pendingEnqueues.set(queueName, [{ transition, resolve, reject }]);
-      queueMicrotask(() => {
-        void this.flushEnqueues(queueName);
-      });
+    const previousTurn = this.enqueueTurns.get(queueName);
+    let releaseTurn = () => {};
+    const currentTurn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
     });
-  }
-
-  private async flushEnqueues(queueName: ValidQueueName): Promise<void> {
-    const pending = this.pendingEnqueues.get(queueName);
-    if (!pending) return;
-    this.pendingEnqueues.delete(queueName);
-    for (
-      let offset = 0;
-      offset < pending.length;
-      offset += MAX_ENQUEUE_BATCH_SIZE
-    ) {
-      await this.flushEnqueueBatch(
-        queueName,
-        pending.slice(offset, offset + MAX_ENQUEUE_BATCH_SIZE)
-      );
+    this.enqueueTurns.set(queueName, currentTurn);
+    if (previousTurn) await previousTurn;
+    try {
+      return await this.enqueueUnlocked(queueName, message, options);
+    } finally {
+      releaseTurn();
+      if (this.enqueueTurns.get(queueName) === currentTurn) {
+        this.enqueueTurns.delete(queueName);
+      }
     }
   }
 
-  private async flushEnqueueBatch(
+  private async enqueueUnlocked(
     queueName: ValidQueueName,
-    pending: PendingEnqueue[]
-  ): Promise<void> {
-    try {
+    message: QueuePayload,
+    options: QueueOptions
+  ): Promise<MessageId> {
+    QueuePayloadSchema.parse(message);
+    const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
+    for (
+      let attempt = 0;
+      attempt < MAX_ENQUEUE_CAS_RETRIES;
+      attempt += 1
+    ) {
       const state = await this.loadForMutation(queueName, {
         createIfMissing: true,
       });
-      pruneIdempotency(state, new Date());
-      const seenKeys = new Set<string>();
-      const transitions = pending
-        .map(({ transition }) => transition)
-        .filter((transition) => {
-          const key = transition.idempotencyKey;
-          if (!key) return true;
-          if (state.idempotency.has(key) || seenKeys.has(key)) return false;
-          seenKeys.add(key);
-          return true;
-        });
-      if (transitions.length === 0) {
-        for (const item of pending) {
-          const key = item.transition.idempotencyKey;
-          const canonical = key ? state.idempotency.get(key) : undefined;
-          item.resolve(canonical?.messageId ?? item.transition.messageId);
-        }
-        return;
+      const now = new Date();
+      pruneIdempotency(state, now);
+      if (options.idempotencyKey) {
+        const existing = state.idempotency.get(options.idempotencyKey);
+        if (existing) return existing.messageId;
       }
-      const previousNextRecord = state.nextRecord;
-      const receipt = await this.client.append(
-        queueStream(queueName),
-        transitions,
-        {
-          operationId: `queue-enqueue-batch:${queueName}:${transitions
-            .map(({ messageId: id }) => id)
-            .join(',')}`,
-        }
+      const availableAt = new Date(
+        now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
       );
-      if (state.nextRecord === receipt.startRecord) {
-        for (const transition of transitions) {
-          applyTransition(state, transition);
+      const transition: QueueTransition = {
+        version: 1,
+        type: 'enqueued',
+        messageId,
+        queueName,
+        message,
+        headers: options.headers,
+        idempotencyKey: options.idempotencyKey,
+        availableAt: availableAt.toISOString(),
+        createdAt: now.toISOString(),
+      };
+      try {
+        await this.appendTransition(
+          queueName,
+          state,
+          transition,
+          `queue-enqueue:${queueName}:${messageId}`
+        );
+        return messageId;
+      } catch (error) {
+        if (isUrsulaRequestError(error, 412)) {
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(attempt);
+          continue;
         }
-        state.nextRecord = receipt.nextRecord;
-      } else if (state.nextRecord < receipt.nextRecord) {
-        await this.load(queueName);
+        throw error;
       }
-      this.scheduleCheckpoint(queueName, state, previousNextRecord);
-      for (const item of pending) {
-        const key = item.transition.idempotencyKey;
-        const canonical = key ? state.idempotency.get(key) : undefined;
-        if (key && !canonical) {
-          throw new Error(
-            `Queue "${queueName}" lost idempotency state for "${key}"`
-          );
-        }
-        item.resolve(canonical?.messageId ?? item.transition.messageId);
-      }
-    } catch (error) {
-      for (const item of pending) item.reject(error);
     }
+    throw new Error(`Queue "${queueName}" remained contended during enqueue`);
   }
 
   private claimCandidate(

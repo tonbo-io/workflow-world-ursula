@@ -212,35 +212,6 @@ describe('QueueJournal', () => {
     ).toBeNull();
   });
 
-  it('converges concurrent idempotent enqueues without a queue-tail CAS', async () => {
-    const memory = new MemoryClient();
-    const first = new QueueJournal(memory as unknown as UrsulaClient);
-    const second = new QueueJournal(memory as unknown as UrsulaClient);
-    memory.yieldBeforeAppend = true;
-
-    const [firstId, secondId] = await Promise.all([
-      first.enqueue(
-        queueName,
-        { runId: 'idempotent-race' },
-        { idempotencyKey: 'same-logical-message' }
-      ),
-      second.enqueue(
-        queueName,
-        { runId: 'idempotent-race' },
-        { idempotencyKey: 'same-logical-message' }
-      ),
-    ]);
-
-    expect(secondId).toBe(firstId);
-    const lease = await first.claim(queueName, new Date(), 10_000);
-    expect(lease?.message.messageId).toBe(firstId);
-    if (!lease) throw new Error('expected canonical queue lease');
-    await first.ack(queueName, lease);
-    await expect(
-      second.claim(queueName, new Date(), 10_000)
-    ).resolves.toBeNull();
-  });
-
   it('does not expose a delayed or retry-scheduled message early', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const journal = new QueueJournal(client);
@@ -426,7 +397,7 @@ describe('QueueJournal', () => {
     }
   });
 
-  it('batches concurrent local enqueues into bounded appends', async () => {
+  it('serializes concurrent local transitions before queue CAS', async () => {
     const memory = new MemoryClient();
     memory.yieldBeforeAppend = true;
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
@@ -442,7 +413,7 @@ describe('QueueJournal', () => {
     );
 
     expect(new Set(messageIds)).toHaveLength(100);
-    expect(memory.appendedBatchSizes).toEqual([64, 36]);
+    expect(memory.appendedBatchSizes).toHaveLength(100);
   });
 
   it('refreshes only the missing suffix after cross-instance queue contention', async () => {
