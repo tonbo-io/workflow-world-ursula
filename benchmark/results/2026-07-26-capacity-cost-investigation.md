@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-28
 
-Status: Ursula 0.3.27 enables same-zone gateway routing and removes the app↔gateway half of the doubled cross-AZ HTTP response path. On the current reproducible three-sample comparison, Ursula delivers 611.4 steps/s versus PostgreSQL's 460.5 steps/s, with lower run and TTFS p99, but the throughput advantage is only 1.328× rather than the required 1.5×. Cross-AZ traffic falls from 41.076 to approximately 24.250 GB per million steps and total measured cost falls from approximately `$0.90–0.91` to `$0.565–0.568 / 1M` steps. This is a meaningful improvement, but PostgreSQL still costs approximately `$0.233 / 1M`; voter→gateway record responses and Raft replication are now the dominant remaining network paths.
+Status: Ursula 0.3.28 compresses finite JSON/NDJSON responses while explicitly leaving SSE uncompressed. On the current fresh-bucket three-sample comparison, Ursula delivers 614.0 steps/s versus PostgreSQL's 460.5 steps/s, with 26.4% lower run p99 and 20.2% lower TTFS p99, but the throughput advantage is only 1.333× rather than the required 1.5×. Cross-AZ traffic falls from 24.250 to approximately 12.831 GB per million steps and total measured cost falls from approximately `$0.565–0.568` to `$0.336 / 1M` steps. This is another meaningful cost improvement, but PostgreSQL still costs approximately `$0.233 / 1M`; Raft replication now accounts for about two thirds of gross cross-AZ bytes under load and almost all idle cross-AZ traffic.
 
 ## Goal
 
@@ -18,7 +18,7 @@ The comparison must answer three different questions:
 
 | Component | Configuration |
 | --- | --- |
-| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.27 |
+| Ursula | 3 × `m7g.large`, one voter per AZ, 256 Raft groups, memory WAL, S3 cold storage, Ursula 0.3.28 |
 | PostgreSQL | RDS PostgreSQL 17.9, Multi-AZ `db.m7g.large`, 100 GiB gp3 |
 | Application tier | Current comparison uses eight one-core pods on two isolated `m7g.xlarge` ARM EKS workers; Ursula uses three request-only plus five dispatcher pods, while PostgreSQL uses eight combined workers |
 | Region | `us-east-1`, same VPC |
@@ -134,6 +134,72 @@ The independent change reduced Ursula's measured total by approximately 37% and 
 2. Add coverage for content negotiation and streaming exclusions, then repeat three warm jobs with the exact same source-side cross-AZ meter.
 3. Require a material drop in voter→gateway response bytes without a throughput or p99 regression; report both encoded wire bytes and logical record bytes.
 4. After the response path, target voter→voter variable traffic and the 256-group idle heartbeat floor as separate, independently measurable iterations.
+5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps.
+
+## 2026-07-28 Ursula 0.3.28 finite-response compression iteration
+
+This iteration changed only finite HTTP response encoding. The voter uses fastest-level gzip for JSON, NDJSON, and Durable Streams record NDJSON bodies of at least 256 bytes. SSE is excluded by content type, and the gateway passes `Accept-Encoding` and `Content-Encoding` through without decoding. The live cluster returned a gzip-encoded 15,190-byte wire body for a retained run-journal read and returned the same SSE tail without `Content-Encoding`.
+
+The immutable release and rollout evidence is:
+
+- Ursula image index: `ghcr.io/tonbo-io/ursula:0.3.28@sha256:e60f78c259cc8d293ba7ad73c63595f368db4f3ce857bd5b9cddd20f2725d25c`;
+- ARM64 image: `ghcr.io/tonbo-io/ursula@sha256:cd4b8658c01017cca77d06e5d26b44da95c39024606879f264c9b3dfd408ae13`;
+- Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula:0.3.28@sha256:a1b093d0c08e82db788cd3cfe63be4fa27afb827469f53b23c8e7f344706ced6`;
+- benchmark image remained `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:0606f4c4a9e8c6559403dcf1e1b1e7014ef3ece892135f5a1a5fc000566ec7a1`;
+- Argo completed the memory-WAL `OnDelete` sequence for nodes 3, 2, and 1. Every node was drained, armed with `prepare-restart`, replaced, caught up, undrained, and admitted by strict `3 nodes × 256 groups` verification. Argo finished `Synced / Healthy / Succeeded`, and every voter, gateway, and indexer ran 0.3.28 with zero restarts.
+
+An initial diagnostic reused the accumulated 0.3.26 bucket. It showed the expected network reduction, but its queue/checkpoint history inflated cold uploads and was rejected as the release comparison. The reported sample uses the new `workflow-benchmark-v0328-gzip-d1-20260728` bucket, three request pods plus five dispatcher pods balanced four-per-worker over the same two application nodes, one warm-up job, and three independent measured jobs.
+
+### Performance
+
+| Metric | Ursula 0.3.28 samples | Ursula median | PostgreSQL median | Comparison |
+| --- | ---: | ---: | ---: | ---: |
+| Throughput | 598.2, 614.0, 615.0 steps/s | **614.0 steps/s** | 460.5 steps/s | **1.333×** |
+| Run-duration p99 | 40.887, 39.213, 38.970 s | **39.213 s** | 53.254 s | **26.4% lower** |
+| TTFS p99 | 34.222, 34.926, 32.284 s | **34.222 s** | 42.860 s | **20.2% lower** |
+
+The p99 requirement remains met. Throughput is effectively unchanged from 0.3.27's 611.4 steps/s median and remains 12.5% below the 690.8 steps/s target.
+
+### Network effect
+
+The source-side meter was rebuilt after both the Ursula and application rollouts. It covered the current IPs of all three voters, three gateways, two indexers, three request pods, and five dispatchers, and retained exactly one `POSTROUTING` jump per node. The measured idle rate was 1,516,525 bytes/s. For each load sample, the meter recorded each node at its own start and end timestamp and subtracted that node's idle rate.
+
+| Cross-AZ wire bytes / 1M steps | Ursula 0.3.27 | Ursula 0.3.28 | Change |
+| --- | ---: | ---: | ---: |
+| Load-dependent median | 20.415 GB | 10.361 GB | **−49.2%** |
+| Always-on idle normalized at median throughput | 3.835 GB | 2.470 GB | **−35.6%** |
+| **Total** | **24.250 GB** | **12.831 GB** | **−47.1%** |
+
+The three load-dependent samples were 10.361, 10.496, and 10.313 GB per million steps. A fourth diagnostic job preserved per-pair counters:
+
+| Gross cross-AZ path | Bytes | Share |
+| --- | ---: | ---: |
+| Voter → voter Raft | 227.9 MB | 66.2% |
+| Gateway → voter | 60.5 MB | 17.6% |
+| Voter → gateway | 55.4 MB | 16.1% |
+| Cross-zone application delivery | 0.46 MB | 0.1% |
+
+The comparable 0.3.27 diagnostic saw approximately 322.3 MB of voter→gateway responses, so finite-response compression removed most of the intended response bytes. In a separate idle window, 51.0 of 51.4 MB came from voter→voter traffic. Raft therefore dominates both the remaining variable cost and the 256-group idle floor; application placement and Service routing are no longer material contributors.
+
+### S3 and total cost
+
+The warm-up plus three measured jobs produced 100,000 logical steps. From the warm-up's initial counter snapshot through the third job's final snapshot, physical cold uploads advanced by 32 objects and 265,843,909 bytes. This normalizes to 320 PUTs and 2.658 GB per million steps. At us-east-1 Standard rates and the same first-month average-retention convention, packed payload storage plus PUTs costs approximately `$0.032 / 1M` steps.
+
+| Cost / 1M steps | Ursula 0.3.27 | Ursula 0.3.28 | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| 40%-allocated backend compute/storage | `$0.0475` | `$0.0473` | `$0.0889` |
+| Cross-AZ transfer | `$0.4850` | `$0.2566` | `$0.1445` |
+| S3 packed payload, PUTs, first-month average retention | `$0.032–0.035` | `$0.0322` | included in RDS |
+| **Measured total before operations** | **`$0.565–0.568`** | **`$0.336`** | **`$0.233`** |
+
+The independent change reduced Ursula's measured total by approximately 40.5%, so it is a meaningful reproducible improvement and resets the no-progress counter. The objective remains unmet: Ursula costs about 44.2% more than PostgreSQL, while the 30%-lower target is at most `$0.163 / 1M` steps.
+
+### Next gates
+
+1. Treat per-group Raft traffic as the next structural blocker, not another HTTP or application-placement issue. It accounts for about two thirds of loaded bytes and almost the entire idle floor.
+2. Separate the approximately 256-group heartbeat/control-plane floor from replicated workflow payload. A viable change must report both idle bytes/s and load-dependent voter→voter GB per million steps.
+3. Reduce the bytes replicated per logical step, not only request count. The next design experiment should compact the authoritative Workflow commit representation or otherwise avoid repeating verbose JSON/entity structure across both full followers.
+4. Do not weaken the durability comparator silently. Any two-full-copy plus witness design must prove that a committed append always resides on two data-bearing AZs before acknowledgement and must document its availability semantics against RDS Multi-AZ.
 5. Continue to require at least 690.8 median steps/s, lower p99 than PostgreSQL, and total cost below `$0.163 / 1M` steps.
 
 ## 2026-07-27 structural Workflow rerun
