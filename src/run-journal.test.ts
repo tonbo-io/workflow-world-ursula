@@ -200,6 +200,39 @@ describe('RunJournal', () => {
     expect(client.failedReads).toBe(0);
   });
 
+  it('slices a hot event page without copying the preceding history', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.loadForMutation('wrun_events_page', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    const events = [1, 2, 3].map(
+      (index) =>
+        ({
+          eventType: 'run_cancelled',
+          eventData: {},
+          runId: 'wrun_events_page',
+          eventId: `evnt_01K0000000000000000000000${index}`,
+          createdAt: new Date('2026-07-25T00:00:00.000Z'),
+          specVersion: 5,
+        }) satisfies Event
+    );
+    await journal.append(state, {
+      operationId: 'hot-events-page-1',
+      events,
+    });
+    client.failNextReadAt = 1;
+
+    await expect(
+      journal.eventPage('wrun_events_page', 1, 1, 1)
+    ).resolves.toEqual({
+      events: [events[1]],
+      total: 3,
+    });
+    expect(client.failedReads).toBe(0);
+  });
+
   it('commits an event and its resulting run state in one guarded record', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

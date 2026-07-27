@@ -157,13 +157,7 @@ function paginate<T>(
   values: T[],
   options: PaginationOptions | undefined
 ): PaginatedResponse<T> {
-  const limit = options?.limit ?? DEFAULT_LIMIT;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
-    throw new WorkflowWorldError(
-      `Pagination limit must be between 1 and ${MAX_LIMIT}`
-    );
-  }
-  const start = decodeCursor(options?.cursor);
+  const { start, limit } = paginationBounds(options);
   const data = values.slice(start, start + limit);
   const next = start + data.length;
   const hasMore = next < values.length;
@@ -175,6 +169,18 @@ function paginate<T>(
     cursor: data.length > 0 ? encodeCursor(next) : null,
     hasMore,
   };
+}
+
+function paginationBounds(
+  options: PaginationOptions | undefined
+): { start: number; limit: number } {
+  const limit = options?.limit ?? DEFAULT_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    throw new WorkflowWorldError(
+      `Pagination limit must be between 1 and ${MAX_LIMIT}`
+    );
+  }
+  return { start: decodeCursor(options?.cursor), limit };
 }
 
 function withoutRunData(
@@ -243,18 +249,25 @@ async function withEventPage(
     typeof params?.sinceCursor === 'string';
   if (!preload && !delta) return result;
 
-  const page = paginate(await journal.events(runId, throughRecord), {
+  const { start, limit } = paginationBounds({
     cursor: delta ? params?.sinceCursor : undefined,
     limit: MAX_LIMIT,
     sortOrder: 'asc',
   });
+  const page = await journal.eventPage(
+    runId,
+    start,
+    limit,
+    throughRecord
+  );
+  const next = start + page.events.length;
   return {
     ...result,
-    events: page.data.map((event) =>
+    events: page.events.map((event) =>
       stripEventDataRefs(event, params?.resolveData ?? 'all')
     ),
-    cursor: page.cursor,
-    hasMore: page.hasMore,
+    cursor: page.events.length > 0 ? encodeCursor(next) : null,
+    hasMore: next < page.total,
   };
 }
 
