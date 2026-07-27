@@ -135,7 +135,10 @@ window.
 
 ## Queue state
 
-Queue partitions are append-only state machines:
+Each logical Workflow queue is split into a fixed set of physical, append-only
+queue journals. The stable execution-lane key (`runId` plus `stepId` when
+present) selects one partition, so one lane remains ordered while unrelated
+runs no longer contend on one global record tail:
 
 ```text
 enqueued(availableAt)
@@ -145,20 +148,21 @@ enqueued(availableAt)
   -> leased(...)
 ```
 
-Claiming a message is a record-tail-guarded append. Dispatchers incrementally
-replay queue transitions and may lease several messages from one workflow
-topic. Active leases are keyed by run ID: messages for one run stay serialized,
-while different runs in the same workflow execute concurrently up to the
-configured process limit. A local enqueue or completed delivery wakes the pump
-immediately. Other processes wake it through one long-lived watcher per
-deliverable queue plus a queue-registry watcher. Message activity does not tear
-down and recreate the other queues' long polls; polling is used only as error
-backoff.
+Claiming a message is a record-tail-guarded append scoped to its partition.
+Dispatchers incrementally replay queue transitions and may lease several
+messages from one workflow topic. Active leases are keyed by execution lane:
+messages for one lane stay serialized, while different runs or parallel steps
+execute concurrently up to the configured process limit. The queue registry
+records a partition only when its first message is enqueued, so workers keep
+one long-lived watcher per active partition rather than eagerly opening every
+possible partition on every replica. A local enqueue or completed delivery
+wakes the pump immediately. Polling is used only as error backoff.
 
-Every 256 transitions, the adapter writes a checkpoint containing active
-messages and the live 24-hour idempotency window, publishes it as the queue
-stream's Ursula snapshot, then advances source retention to that record
-boundary. This derived work runs on an ordered per-queue background chain and
+Every 256 transitions in one partition, the adapter writes a checkpoint
+containing that partition's active messages and live 24-hour idempotency
+window, publishes it as the partition stream's Ursula snapshot, then advances
+source retention to that record boundary. This derived work runs on an ordered
+per-partition background chain and
 does not delay enqueue, lease, ack, or retry responses. The source snapshot is
 required by Ursula as the safety proof for retention; adapter recovery reads
 the derived checkpoint stream instead. Only the latest derived checkpoint

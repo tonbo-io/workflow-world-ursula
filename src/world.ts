@@ -70,6 +70,10 @@ function environmentConfig(): UrsulaWorldConfig {
       process.env.WORKFLOW_URSULA_QUEUE_CONCURRENCY,
       'WORKFLOW_URSULA_QUEUE_CONCURRENCY'
     ),
+    partitionCount: positiveInteger(
+      process.env.WORKFLOW_URSULA_QUEUE_PARTITIONS,
+      'WORKFLOW_URSULA_QUEUE_PARTITIONS'
+    ),
     shutdownGraceMs: positiveInteger(
       process.env.WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS,
       'WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS'

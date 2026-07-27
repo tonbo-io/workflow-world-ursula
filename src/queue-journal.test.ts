@@ -6,7 +6,7 @@ import {
   type UrsulaRecord,
   UrsulaRequestError,
 } from './client.js';
-import { QueueJournal } from './queue-journal.js';
+import { QueueJournal, queuePartition } from './queue-journal.js';
 
 class MemoryClient {
   readonly appendedBatchSizes: number[] = [];
@@ -163,6 +163,24 @@ const payload = {
 } satisfies QueuePayload;
 
 describe('QueueJournal', () => {
+  it('keeps one execution lane on one stable queue partition', () => {
+    const first = queuePartition(
+      { runId: 'run-one', stepId: 'step-one', attempt: 1 },
+      64
+    );
+    const retry = queuePartition(
+      { runId: 'run-one', stepId: 'step-one', attempt: 2 },
+      64
+    );
+    const workflowLane = queuePartition({ runId: 'run-one' }, 64);
+
+    expect(retry).toBe(first);
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(first).toBeLessThan(64);
+    expect(workflowLane).toBeGreaterThanOrEqual(0);
+    expect(workflowLane).toBeLessThan(64);
+  });
+
   it('uses the cached record tail after initial queue discovery', async () => {
     const memory = new MemoryClient();
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
