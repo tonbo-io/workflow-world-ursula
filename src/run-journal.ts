@@ -613,7 +613,10 @@ export class RunJournal {
     return useCache ? cloneState(state) : state;
   }
 
-  async events(runId: string, throughRecord?: number): Promise<Event[]> {
+  private async loadEvents(
+    runId: string,
+    throughRecord?: number
+  ): Promise<EventCache> {
     let cached = this.eventCache.get(runId);
     if (!cached) {
       cached = { nextRecord: 0, events: [] };
@@ -628,7 +631,7 @@ export class RunJournal {
       throughRecord !== undefined &&
       cached.nextRecord >= throughRecord
     ) {
-      return [...cached.events];
+      return cached;
     }
     let cursor = cached.nextRecord;
     let catchUpAttempt = 0;
@@ -658,12 +661,29 @@ export class RunJournal {
         cached.events.push(...parseCommit(record.value).events);
         cached.nextRecord = record.record + 1;
       }
-      if (page.records.length < 1000) return [...cached.events];
+      if (page.records.length < 1000) return cached;
       if (cached.nextRecord <= cursor) {
         throw new Error('Ursula run event pagination made no progress');
       }
       cursor = cached.nextRecord;
     }
+  }
+
+  async events(runId: string, throughRecord?: number): Promise<Event[]> {
+    return [...(await this.loadEvents(runId, throughRecord)).events];
+  }
+
+  async eventPage(
+    runId: string,
+    start: number,
+    limit: number,
+    throughRecord?: number
+  ): Promise<{ events: Event[]; total: number }> {
+    const cached = await this.loadEvents(runId, throughRecord);
+    return {
+      events: cached.events.slice(start, start + limit),
+      total: cached.events.length,
+    };
   }
 
   async append(
