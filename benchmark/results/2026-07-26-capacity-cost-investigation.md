@@ -349,6 +349,27 @@ At the agreed symmetric 40% shared-compute allocation, current public inputs pro
 
 The compute-only difference is about 7%, in PostgreSQL's favor; charging the comparator's full 100 GiB baseline makes Ursula about 14% cheaper before Ursula S3, cross-AZ, and retained-byte costs. The honest conclusion is cost parity at this primitive layer, not a decisive Ursula win. Production Workflow cost still requires rerunning the six user-facing scenarios with cold storage enabled and accounting for packed S3 PUTs, retained bytes, and snapshot/reference churn.
 
+### Queue coordination experiments on the production memory-WAL topology
+
+The production target is three memory-WAL voters across three availability zones with S3 cold storage and snapshots. Disk WAL and local fsync are not part of this service contract. The next Workflow experiment therefore reused that canary topology, eight ARM application replicas on two `m7g.xlarge` nodes, eight workflow queues, and a fresh bucket per variant.
+
+The measured 0.3.14 baseline emitted approximately 2.32 accepted appends per logical step while the voters remained lightly utilized. Its 1,000-run admission failure came from queue-tail CAS exhaustion in the adapter rather than Raft, CPU, or S3. Two attempts to amortize dispatcher claims were net-negative: an unbounded claim batch concentrated delivery ownership in one process, and a four-message bounded batch still weakened cross-replica work stealing. Both changes were reverted.
+
+The next experiment treated enqueue as a commutative append while retaining strict tail CAS for lease, ack, retry, and extension:
+
+| Concurrent runs × 20 steps | Guarded enqueue baseline | Commutative enqueue | Result |
+| ---: | ---: | ---: | --- |
+| 25 | 54.2 steps/s | 78.6 steps/s | low-load improvement |
+| 50 | 91.6 steps/s | 87.2 steps/s | approximately tied |
+| 100 | 83.9 steps/s | 84.0 steps/s | tied |
+| 250 | 108.5 steps/s | 95.2 steps/s | regression |
+| 500 | 117.7 steps/s | 97.4 steps/s | regression |
+| 1,000 | 117.1 steps/s | 80.1 steps/s | admission succeeded, throughput regressed |
+
+Removing producer CAS eliminated the 1,000-run enqueue failure, but every message still advanced the shared stream tail and made state-dependent consumer CAS collide more often. Coalescing same-turn enqueues into bounded 64-record appends then measured 65.6, 79.0, and 62.7 steps/s at 25, 50, and 100 runs, respectively, so it was stopped early. The commutative and batching changes were reverted rather than leaving an unproven optimization on `main`.
+
+The structural conclusion is that one logical workflow queue stored as one Durable Stream is a global sequencing point for enqueue, lease, and ack. Adapter-side batching can move contention between producers, consumers, and replicas, but cannot remove it. The next scalable design needs partitioned physical queue journals plus an efficient discovery/changefeed primitive, or a server-side conditional queue transition that validates message state inside one Raft command without comparing the entire stream tail.
+
 ### Benchmark infrastructure caveats
 
 The benchmark image now activates and caches pnpm in both build and runtime stages. Before that fix, a newly scaled private-subnet node attempted a Corepack npm download and crash-looped while an older node's cache hid the problem.
@@ -370,6 +391,7 @@ The temporary managed node group also attached only the EKS cluster security gro
 - Same-stream cold compaction cannot solve the dominant short-stream object distribution.
 - Group-scoped packing reduces the measured Workflow PUT count by 97.3% without regressing the saturated throughput point.
 - The production OpenRaft pack path now creates 8 MiB shared objects without per-stream `.idx` pages; a static three-node test protects this distinction.
+- Queue enqueue admission is an adapter coordination limit: removing its CAS lets 1,000 runs complete, but transfers contention to lease/ack and reduces high-load throughput.
 
 ### Working hypotheses, not yet proven
 
@@ -377,6 +399,7 @@ The temporary managed node group also attached only the EKS cluster security gro
 2. Deterministic gateway routing or a complete group-leader map should primarily improve new-stream and cold-route traffic; it cannot by itself explain the remaining warm-append gap.
 3. Ursula's useful Workflow capacity may be reached first by a TTFS/fairness SLO violation rather than by aggregate voter CPU saturation.
 4. Snapshot/reference version churn may become the next S3 cost floor during a continuous mixed workload even though short-run data/index PUT amplification is removed.
+5. Partitioned queue journals need a bucket changefeed or equivalent discovery primitive; polling every partition from every adapter replica would replace CAS contention with connection and request amplification.
 
 ### Single hot-queue capacity probe
 
@@ -471,7 +494,7 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [x] Attribute the first limiting resource/path using backend counters and resource samples.
 - [x] Recalculate cost per 100,000 useful steps at 30%, 60%, and 80% utilization.
 - [x] Update this investigation report and keep raw JSON/resource samples beside it.
-- [ ] Benchmark Workflow capacity on the 3 × `m7g.large` Ursula topology instead of treating it as a linear sizing estimate.
+- [x] Benchmark Workflow capacity on the 3 × `m7g.large` memory-WAL plus S3 Ursula topology instead of treating it as a linear sizing estimate.
 - [x] Isolate raw create, append, live-delivery, and replay primitives from the World adapter.
 - [x] Correct the S3 request model to include cold index-page PUTs.
 - [ ] Extend append-batch with producer deduplication and per-entry CAS, adopt it in the adapter, and rerun warm append.
@@ -479,7 +502,8 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [ ] Aggregate gateway metrics replica-by-replica and rerun route attribution.
 - [ ] Force a cold-cache miss via leadership transfer and measure real S3 replay.
 - [x] Remove the O(stream-count) append scan, offload inline snapshot encoding, stagger automatic snapshots, and rerun a four-generator PostgreSQL comparison.
-- [x] Remove the queue enqueue-CAS admission ceiling and rerun the 1,000-run Ursula level.
+- [x] Test CAS-free and locally batched enqueue at the 1,000-run level; revert both after they moved contention to consumer transitions and reduced throughput.
+- [ ] Design partitioned queue journals around a bucket changefeed, or add a server-side conditional queue transition, then rerun the same capacity sweep.
 - [x] Reduce cold PUTs toward 8 MiB objects and rerun the request-cost measurement.
 - [ ] Run a multi-hour mixed-load soak and measure snapshot/reference version churn, pack fill ratio, and shared-pack GC.
 - [ ] Add cross-AZ byte accounting and an operations/backup cost sensitivity.
@@ -500,6 +524,7 @@ S3 PUTs, retained bytes, cross-AZ Raft traffic, and RDS storage/IO must remain s
 - [`ursula-v0313-capacity-hot-casfix.json`](./ursula-v0313-capacity-hot-casfix.json)
 - [`ursula-v0313-capacity-sharded-casfix.json`](./ursula-v0313-capacity-sharded-casfix.json)
 - [`ursula-v0314-capacity-pack.json`](./ursula-v0314-capacity-pack.json)
+- [`ursula-commutative-enqueue.json`](./ursula-commutative-enqueue.json)
 - [`ursula-v0314-v0315-s3-inventory.json`](./ursula-v0314-v0315-s3-inventory.json)
 - [`postgres-rds-capacity-arm-pool66-failure.json`](./postgres-rds-capacity-arm-pool66-failure.json)
 - [`postgres-rds-capacity-arm-pool32.json`](./postgres-rds-capacity-arm-pool32.json)
