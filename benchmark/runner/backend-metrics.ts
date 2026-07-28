@@ -29,10 +29,14 @@ const URSULA_COUNTERS = [
   'raft_apply_entries',
   'raft_apply_ns',
   'raft_grpc_append_stream_fallbacks',
+  'raft_grpc_append_stream_batch_frames',
+  'raft_grpc_append_stream_batch_items_max',
   'raft_grpc_append_stream_inflight_max',
   'raft_grpc_append_stream_request_bytes',
+  'raft_grpc_append_stream_request_frames',
   'raft_grpc_append_stream_requests',
   'raft_grpc_append_stream_response_bytes',
+  'raft_grpc_append_stream_response_frames',
   'raft_grpc_append_stream_responses',
   'raft_grpc_append_stream_session_failures',
   'raft_grpc_append_stream_sessions_opened',
@@ -298,6 +302,19 @@ export function deriveBackendMetrics(
         'raft_grpc_append_stream_response_bytes',
         'raft_grpc_append_stream_responses'
       ),
+      raftGrpcAppendStreamItemsPerRequestFrame: per(
+        counters,
+        'raft_grpc_append_stream_requests',
+        'raft_grpc_append_stream_request_frames'
+      ),
+      raftGrpcAppendStreamItemsPerResponseFrame: per(
+        counters,
+        'raft_grpc_append_stream_responses',
+        'raft_grpc_append_stream_response_frames'
+      ),
+      raftGrpcAppendStreamBatchFrameRatio:
+        (counters.raft_grpc_append_stream_batch_frames ?? 0) /
+        Math.max(1, counters.raft_grpc_append_stream_request_frames ?? 0),
       raftGrpcAppendStreamUsageRatio:
         (counters.raft_grpc_append_stream_requests ?? 0) /
         Math.max(
