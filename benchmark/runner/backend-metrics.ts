@@ -28,7 +28,12 @@ const URSULA_COUNTERS = [
   'group_lock_wait_ns',
   'raft_apply_entries',
   'raft_apply_ns',
-  'raft_grpc_append_stream_fallbacks',
+  'raft_grpc_append_heartbeat_request_bytes',
+  'raft_grpc_append_heartbeat_requests',
+  'raft_grpc_append_replication_entries',
+  'raft_grpc_append_replication_request_bytes',
+  'raft_grpc_append_replication_requests',
+  'raft_grpc_append_response_bytes',
   'raft_grpc_append_stream_batch_frames',
   'raft_grpc_append_stream_batch_items_max',
   'raft_grpc_append_stream_inflight_max',
@@ -40,7 +45,13 @@ const URSULA_COUNTERS = [
   'raft_grpc_append_stream_responses',
   'raft_grpc_append_stream_session_failures',
   'raft_grpc_append_stream_sessions_opened',
-  'raft_grpc_append_unary_calls',
+  'raft_grpc_snapshot_payload_bytes',
+  'raft_grpc_snapshot_request_bytes',
+  'raft_grpc_snapshot_requests',
+  'raft_grpc_snapshot_response_bytes',
+  'raft_grpc_vote_request_bytes',
+  'raft_grpc_vote_requests',
+  'raft_grpc_vote_response_bytes',
   'raft_snapshot_body_bytes',
   'raft_snapshot_builds',
   'raft_snapshot_external_uploads',
@@ -233,6 +244,19 @@ function per(
   return (counters[numerator] ?? 0) / count;
 }
 
+function perSum(
+  counters: Record<string, number>,
+  numerator: string,
+  denominators: string[]
+): number | undefined {
+  const count = denominators.reduce(
+    (total, name) => total + (counters[name] ?? 0),
+    0
+  );
+  if (count <= 0) return undefined;
+  return (counters[numerator] ?? 0) / count;
+}
+
 /** Derived averages are diagnostic only. The source metrics are cumulative
  * sums rather than per-request histograms, so these values cannot represent
  * p95/p99 or reconstruct one particular client request. */
@@ -315,13 +339,54 @@ export function deriveBackendMetrics(
       raftGrpcAppendStreamBatchFrameRatio:
         (counters.raft_grpc_append_stream_batch_frames ?? 0) /
         Math.max(1, counters.raft_grpc_append_stream_request_frames ?? 0),
-      raftGrpcAppendStreamUsageRatio:
-        (counters.raft_grpc_append_stream_requests ?? 0) /
-        Math.max(
-          1,
-          (counters.raft_grpc_append_stream_requests ?? 0) +
-            (counters.raft_grpc_append_unary_calls ?? 0)
-        ),
+      raftGrpcAppendHeartbeatRequestBytesPerRequest: per(
+        counters,
+        'raft_grpc_append_heartbeat_request_bytes',
+        'raft_grpc_append_heartbeat_requests'
+      ),
+      raftGrpcAppendReplicationRequestBytesPerRequest: per(
+        counters,
+        'raft_grpc_append_replication_request_bytes',
+        'raft_grpc_append_replication_requests'
+      ),
+      raftGrpcAppendReplicationEntriesPerRequest: per(
+        counters,
+        'raft_grpc_append_replication_entries',
+        'raft_grpc_append_replication_requests'
+      ),
+      raftGrpcAppendResponseBytesPerRequest: perSum(
+        counters,
+        'raft_grpc_append_response_bytes',
+        [
+          'raft_grpc_append_heartbeat_requests',
+          'raft_grpc_append_replication_requests',
+        ]
+      ),
+      raftGrpcVoteRequestBytesPerRequest: per(
+        counters,
+        'raft_grpc_vote_request_bytes',
+        'raft_grpc_vote_requests'
+      ),
+      raftGrpcVoteResponseBytesPerRequest: per(
+        counters,
+        'raft_grpc_vote_response_bytes',
+        'raft_grpc_vote_requests'
+      ),
+      raftGrpcSnapshotRequestBytesPerRequest: per(
+        counters,
+        'raft_grpc_snapshot_request_bytes',
+        'raft_grpc_snapshot_requests'
+      ),
+      raftGrpcSnapshotPayloadBytesPerRequest: per(
+        counters,
+        'raft_grpc_snapshot_payload_bytes',
+        'raft_grpc_snapshot_requests'
+      ),
+      raftGrpcSnapshotResponseBytesPerRequest: per(
+        counters,
+        'raft_grpc_snapshot_response_bytes',
+        'raft_grpc_snapshot_requests'
+      ),
       walWriteNsPerBatch: per(counters, 'wal_write_ns', 'wal_batches'),
       walSyncNsPerBatch: per(counters, 'wal_sync_ns', 'wal_batches'),
       gatewayRedirectNsPerRedirect: per(
