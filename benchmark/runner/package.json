@@ -6,6 +6,7 @@
     "benchmark": "vitest run benchmark.test.ts --reporter=verbose",
     "benchmark:raw": "vitest run raw-backend.test.ts --reporter=verbose",
     "benchmark:world-storage": "vitest run world-storage.test.ts --reporter=verbose",
+    "test": "vitest run backend-metrics.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

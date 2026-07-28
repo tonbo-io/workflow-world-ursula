@@ -27,4 +27,5 @@ jobs:
       - run: pnpm build
       - run: pnpm --filter workflow-benchmark-app test
       - run: pnpm --filter workflow-benchmark-app typecheck
+      - run: pnpm --filter workflow-benchmark-runner test
       - run: pnpm --filter workflow-benchmark-runner typecheck
