@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-28
 
-Status: Ursula 0.3.29 shares one generation-aware HTTP/2 Raft channel per peer endpoint instead of opening one channel per Raft group and peer. The current three-sample median is 620.5 steps/s versus PostgreSQL's 460.5 steps/s, with 27.0% lower run p99 and 24.6% lower TTFS p99, but the throughput advantage is only 1.347× rather than the required 1.5×. The change reduced established voter-to-voter connections from approximately 1,038 to 29 and reduced total cross-AZ traffic from 10.891 to 9.650 GB per million steps. A corrected S3 measurement now includes Raft snapshot objects and reference writes as well as packed stream data: Ursula costs approximately `$0.280 / 1M` steps versus PostgreSQL's approximately `$0.233 / 1M`, while the 30%-lower target is at most `$0.163 / 1M`.
+Status: Ursula 0.3.31 keeps one stable bidirectional Append stream per peer endpoint on top of the 0.3.29 shared HTTP/2 channel. The stream is healthy and eliminates unary Append calls and steady-state session churn, but the current three-sample median regressed to 584.0 steps/s with 41.471 s run p99 and 34.081 s TTFS p99. Total cross-AZ traffic changed only from 9.650 to 9.611 GB per million steps. Using a 100,000-step S3 window, Ursula costs approximately `$0.261 / 1M` steps versus PostgreSQL's approximately `$0.233 / 1M`; the transport did not produce a meaningful performance or cost improvement, so this is no-progress iteration 1 of 5. The 30%-lower target remains at most `$0.163 / 1M`.
 
 ## Goal
 
@@ -25,6 +25,69 @@ The comparison must answer three different questions:
 | Workload | Vercel Workflow-compatible sequential no-op steps through the same benchmark application |
 
 Application compute is common to both backends and is excluded from backend price comparisons, but its CPU and memory must still be sampled to prove it did not become the load generator bottleneck.
+
+## 2026-07-28 Ursula 0.3.31 stable bidirectional Raft Append stream iteration
+
+This iteration tested whether multiplexing OpenRaft Append traffic onto one long-lived bidirectional gRPC stream per peer endpoint would remove enough per-RPC HTTP/2 work to improve complete-Workflow throughput and network cost. The consensus boundary did not change: every Raft group still owns its independent log, election, commit, and state machine, and every Append request still receives its own response before OpenRaft can advance it.
+
+The first 0.3.30 deployment was diagnostic rather than a valid iteration. It completed a fresh-bucket warm-up at 582.1 steps/s without falling back to unary RPCs, but opened 2,232 stream sessions during a 43-second workload. OpenRaft retains per-group network objects, and those objects temporarily held different unary-channel generations after a reconnect; alternating groups therefore replaced the same healthy endpoint stream. Ursula 0.3.31 keys a healthy Append session only by peer endpoint and replaces it only after the stream sender closes. A regression test advances the unary generation and proves that the existing stream channel remains in place.
+
+The immutable implementation and rollout evidence is:
+
+- initial stream and lifecycle PRs: [tonbo-io/ursula#226](https://github.com/tonbo-io/ursula/pull/226) and release [#227](https://github.com/tonbo-io/ursula/pull/227), tag `v0.3.30`;
+- stable-session fix: [tonbo-io/ursula#228](https://github.com/tonbo-io/ursula/pull/228) and release [#229](https://github.com/tonbo-io/ursula/pull/229), tag `v0.3.31`;
+- cloud promotions: [tonbo-io/cloud#41](https://github.com/tonbo-io/cloud/pull/41) and [#42](https://github.com/tonbo-io/cloud/pull/42);
+- live ARM64 image: `ghcr.io/tonbo-io/ursula:0.3.31@sha256:4c4e9f9ece17634ea1b21870c5dc13184053f64f41defad6a53678c3cd8ffc2f`;
+- benchmark application and runner: `ghcr.io/tonbo-io/workflow-world-ursula-benchmark@sha256:ed79ed6f64d2af995dcf25f60fcab60838704280548580b66c5dd4d80798c2fe`;
+- Argo completed the memory-WAL `OnDelete` sequence and finished `Synced / Healthy / Succeeded`; all three voters, three gateways, and two indexers ran 0.3.31, and every voter and gateway had zero restarts.
+
+During a 30-second quiescent check after rollout, the three voters kept their session-open counters fixed at 2, 3, and 4 while serving another 16,800–17,234 Append requests each. Session-failure counters did not move and unary Append calls remained zero. During the excluded warm-up and all three formal jobs, session opens, failures, fallbacks, and unary calls also remained zero. The 0.3.30 lifecycle bug is therefore fixed independently of the performance result.
+
+### Performance
+
+The benchmark used the fresh `workflow-v0331-rstream-d1` bucket, three request pods plus five dispatcher pods on the unchanged two application workers, one excluded warm-up, and three formal `500 runs × 50 sequential steps` jobs. The compact completed-step representation and eight queue shards remained enabled.
+
+| Metric | Ursula 0.3.31 samples | Ursula median | Ursula 0.3.29 median | PostgreSQL median |
+| --- | ---: | ---: | ---: | ---: |
+| Throughput | 584.0, 586.8, 565.0 steps/s | **584.0 steps/s** | 620.5 steps/s | 460.5 steps/s |
+| Run-duration p99 | 41.471, 40.852, 42.636 s | **41.471 s** | 38.894 s | 53.254 s |
+| TTFS p99 | 33.985, 34.081, 34.411 s | **34.081 s** | 32.297 s | 42.860 s |
+
+Ursula remains 1.268× PostgreSQL in throughput, with 22.1% lower run p99 and 20.5% lower TTFS p99. It is still 15.4% below the required 690.8 steps/s. Relative to 0.3.29, throughput regressed by 5.9%, run p99 increased by 6.6%, and TTFS p99 increased by 5.5%. A stream request still carries one protobuf envelope and waits for one per-request oneshot response; the additional client queue, server stream task, and response demultiplexing add scheduling work without reducing replicated payload bytes or Raft commits.
+
+### Network effect
+
+The source-side meter covered the current IPs of all voters, gateways, indexers, request pods, and dispatchers and installed one `POSTROUTING` jump on each of five EKS nodes. The node-specific idle rates summed to 1,176,398 bytes/s. Every formal sample zeroed counters immediately before Job creation and subtracted each node's own idle rate over its own measurement window.
+
+| Cross-AZ wire bytes / 1M steps | Ursula 0.3.29 | Ursula 0.3.31 | Change |
+| --- | ---: | ---: | ---: |
+| Load-dependent median | 7.621 GB | 7.596 GB | −0.3% |
+| Always-on idle normalized at median throughput | 2.029 GB | 2.014 GB | −0.7% |
+| **Total** | **9.650 GB** | **9.611 GB** | **−0.4%** |
+
+The three load-dependent samples were 7.596, 7.545, and 7.627 GB per million steps. The stream carried a median of 213,813 Append messages and approximately 100.5 MB of encoded request envelopes per 25,000-step job. Persistent framing avoids opening RPCs, but it does not coalesce those envelopes; the measured wire result is consequently indistinguishable from 0.3.29.
+
+### S3 and total cost
+
+The excluded warm-up plus three measured jobs covered 100,000 logical steps. S3 version inventory over the exact Job window found 53 immutable snapshot objects totaling 30,566,543 bytes and 60 reference writes totaling 9,564 bytes. This normalizes to 0.306 GB of snapshot payload and 1,130 snapshot/reference PUTs per million steps. At S3 Standard pricing and the existing first-month average-retention convention, snapshot storage plus requests costs approximately `$0.0092 / 1M` steps. The Workflow record representation did not change, so packed stream data remains approximately 0.814 GB and `$0.0099 / 1M` steps.
+
+The longer 100,000-step window amortizes threshold-driven snapshot work more accurately than the earlier separate 25,000-step sample. Its lower snapshot estimate is a measurement correction and workload-window effect, not a benefit caused by the bidirectional transport.
+
+| Cost / 1M steps | Ursula 0.3.29 reported | Ursula 0.3.31 | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| 40%-allocated backend compute/storage | `$0.0468` | `$0.0497` | `$0.0889` |
+| Cross-AZ transfer | `$0.1930` | `$0.1922` | `$0.1445` |
+| S3 packed stream data | approximately `$0.0099` | approximately `$0.0099` | included in RDS |
+| S3 Raft snapshots and references | approximately `$0.0305` | approximately `$0.0092` | included in RDS |
+| **Measured total before operations** | **approximately `$0.280`** | **approximately `$0.261`** | **`$0.233`** |
+
+Ursula remains approximately 12.0% more expensive than PostgreSQL before operations and approximately 60.0% above the `$0.163 / 1M` target. The apparent 6.8% reduction from the previously reported Ursula total comes from the longer snapshot observation window; the independent transport change reduced cross-AZ cost by only approximately `$0.0008 / 1M` while increasing compute cost per completed step.
+
+### Iteration verdict and next gate
+
+This is valid no-progress iteration **1 of 5**. It contains an independent transport change, a successful graceful deployment, one excluded warm-up plus three formal jobs, exact cross-AZ measurement, and S3/cost accounting. It did not produce a reproducible improvement in throughput, p99, or total cost.
+
+The result rejects “one gRPC message per Raft RPC on a persistent stream” as the missing structural lever. The next experiment must reduce physical work per logical step: coalesce independent per-peer Raft envelopes into a framed transport batch while retaining per-item acknowledgements and independent group semantics, or reduce the number/size of replicated Workflow mutations. Merely tuning stream queue sizes or adding linger to the current one-message framing is not a sufficient independent hypothesis.
 
 ## 2026-07-28 Ursula 0.3.29 shared Raft channel iteration
 
