@@ -2,6 +2,8 @@ import { PreconditionFailedError } from '@workflow/errors';
 import type { AnyEventRequest } from '@workflow/world';
 import { describe, expect, it } from 'vitest';
 import {
+  parseUrsulaJson,
+  stringifyUrsulaJson,
   type UrsulaAppendOptions,
   UrsulaClient,
   type UrsulaRecord,
@@ -62,7 +64,13 @@ class MemoryClient extends UrsulaClient {
     }
     const records = Array.isArray(values) ? [...values] : [values];
     const startRecord = current.length;
-    current.push(...records);
+    // Ursula stores the encoded record, so a reload re-parses what the codec
+    // wrote. Keeping the in-memory objects instead lets a value that only
+    // survives by reference — a Date where the wire carries a string — pass a
+    // reload it would fail against the real client.
+    current.push(
+      ...records.map((value) => parseUrsulaJson(stringifyUrsulaJson(value)))
+    );
     this.streams.set(stream, current);
     this.appends.push({ stream, values: records });
     return { startRecord, nextRecord: current.length };
@@ -172,6 +180,32 @@ function delivery(
   };
 }
 
+function stepCreated(stepId: string): AnyEventRequest {
+  return {
+    eventType: 'step_created',
+    correlationId: stepId,
+    eventData: {
+      stepName: `step//test//${stepId}`,
+      input: Uint8Array.from([1]),
+    },
+    specVersion: 5,
+  } as AnyEventRequest;
+}
+
+/** A start that transitions an existing step rather than creating one. */
+function plainStepStarted(stepId: string): AnyEventRequest {
+  return {
+    eventType: 'step_started',
+    correlationId: stepId,
+    eventData: {
+      stepName: `step//test//${stepId}`,
+      workflowName: 'workflow//test//atomic',
+      ownerMessageId: 'msg_atomic',
+    },
+    specVersion: 5,
+  } as AnyEventRequest;
+}
+
 function stepStarted(stepId: string): AnyEventRequest {
   return {
     eventType: 'step_started',
@@ -271,11 +305,15 @@ describe('atomic step transactions', () => {
       stepCompleted('step-turbo')
     );
 
+    // The creation lands on its own record so `stepCreated` is decided by the
+    // record tail; only the start and its terminal event still share one.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(1);
+    expect(commits).toHaveLength(2);
     expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
       'step_started',
+    ]);
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_completed',
     ]);
   });
@@ -285,19 +323,25 @@ describe('atomic step transactions', () => {
     const before = memory.runCommits().length;
 
     await executions.run(delivery('lease-1'), async () => {
+      // Create the step up front so its start is a plain transition: a start
+      // that would create the step is never staged, since its `stepCreated`
+      // answer has to be settled durably.
+      await storage.events.create('wrun_atomic', stepCreated('step-1'));
       const started = await storage.events.create(
         'wrun_atomic',
-        stepStarted('step-1')
+        plainStepStarted('step-1')
       );
       expect(started.step?.status).toBe('running');
       await storage.events.create('wrun_atomic', stepCompleted('step-1'));
     });
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(2);
+    expect(commits).toHaveLength(3);
     expect(commits[0]?.events).toEqual([]);
     expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
+    ]);
+    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);
@@ -335,8 +379,10 @@ describe('atomic step transactions', () => {
       ]);
     });
 
+    // One lease claim, a creation per step, then each step's start and
+    // terminal event sharing a record.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
+    expect(commits).toHaveLength(5);
     expect(
       commits
         .slice(1)
@@ -377,6 +423,47 @@ describe('atomic step transactions', () => {
     ).rejects.toSatisfy((error: unknown) =>
       PreconditionFailedError.is(error)
     );
+  });
+
+  it('grants create ownership only once across discarded deliveries', async () => {
+    const { client, journal, memory } = await setup();
+    const first = new RunExecutionCoordinator(journal);
+    const second = new RunExecutionCoordinator(journal);
+    const before = memory.runCommits().length;
+
+    // A delivery that starts a step and is then abandoned without ever
+    // committing a terminal event — a crash, or a lost race.
+    const claims: (boolean | undefined)[] = [];
+    const start = async (coordinator: RunExecutionCoordinator, tag: string) => {
+      const { storage } = createStorage(client, {
+        journal,
+        executions: coordinator,
+      });
+      await coordinator.run(delivery(tag), async () => {
+        const result = await storage.events.create(
+          'wrun_atomic',
+          stepStarted('step-once')
+        );
+        claims.push(result.stepCreated);
+      });
+    };
+
+    await start(first, 'lease-first');
+    await expect(start(second, 'lease-second')).rejects.toThrow(
+      'already created'
+    );
+
+    // `stepCreated` is the runtime's exactly-once signal for running a step
+    // body inline. Answering it from an uncommitted stage handed it to every
+    // delivery that materialized the same creation.
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect(
+      memory
+        .runCommits()
+        .slice(before)
+        .flatMap(({ events }) => events)
+        .filter(({ eventType }) => eventType === 'step_created')
+    ).toHaveLength(1);
   });
 
   it('reclaims a hook token whose owner died before committing its run', async () => {
@@ -470,7 +557,13 @@ describe('atomic step transactions', () => {
         expiresAt: new Date(Date.now() + 20),
       }),
       async () => {
-        await storage.events.create('wrun_atomic', stepStarted('step-stale'));
+        // The step exists already, so its start is staged rather than
+        // committed — which is what puts the terminal write behind the fence.
+        await storage.events.create('wrun_atomic', stepCreated('step-stale'));
+        await storage.events.create(
+          'wrun_atomic',
+          plainStepStarted('step-stale')
+        );
         staged();
         await gate;
         await storage.events.create(
