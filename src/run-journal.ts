@@ -20,15 +20,6 @@ export interface EntityChange<T> {
   value: T | null;
 }
 
-export interface RunExecutionLease {
-  lane: string;
-  token: string;
-  ownerMessageId: string;
-  attempt: number;
-  expiresAt: Date;
-  generation: number;
-}
-
 export interface RunCommit {
   version: 1;
   operationId: string;
@@ -39,7 +30,6 @@ export interface RunCommit {
   steps?: EntityChange<Step>[];
   hooks?: EntityChange<Hook>[];
   waits?: EntityChange<Wait>[];
-  executionLeases?: EntityChange<RunExecutionLease>[];
   externalStateUpdatedAt?: number;
 }
 
@@ -51,7 +41,6 @@ export interface RunJournalState {
   hooks: Map<string, Hook>;
   hookRetentionUntil: Map<string, Date>;
   waits: Map<string, Wait>;
-  executionLeases: Map<string, RunExecutionLease>;
   externalStateUpdatedAt?: number;
 }
 
@@ -116,9 +105,6 @@ interface RunCheckpoint {
   hooks: Hook[];
   hookRetentionUntil: [string, string][];
   waits: Wait[];
-  executionLeases: Array<
-    Omit<RunExecutionLease, 'expiresAt'> & { expiresAt: string }
-  >;
   externalStateUpdatedAt?: number;
 }
 
@@ -163,7 +149,6 @@ function emptyState(runId: string): RunJournalState {
     hooks: new Map(),
     hookRetentionUntil: new Map(),
     waits: new Map(),
-    executionLeases: new Map(),
   };
 }
 
@@ -182,7 +167,6 @@ function cloneStateForPreview(state: RunJournalState): RunJournalState {
     hooks: new Map(state.hooks),
     hookRetentionUntil: new Map(state.hookRetentionUntil),
     waits: new Map(state.waits),
-    executionLeases: new Map(state.executionLeases),
   };
 }
 
@@ -199,10 +183,6 @@ function checkpointFromState(state: RunJournalState): RunCheckpoint {
       value.toISOString(),
     ]),
     waits: [...state.waits.values()],
-    executionLeases: [...state.executionLeases.values()].map((lease) => ({
-      ...lease,
-      expiresAt: lease.expiresAt.toISOString(),
-    })),
     ...(state.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: state.externalStateUpdatedAt }
       : {}),
@@ -223,9 +203,7 @@ function stateFromCheckpoint(
     !Array.isArray(checkpoint.steps) ||
     !Array.isArray(checkpoint.hooks) ||
     !Array.isArray(checkpoint.hookRetentionUntil) ||
-    !Array.isArray(checkpoint.waits) ||
-    (checkpoint.executionLeases !== undefined &&
-      !Array.isArray(checkpoint.executionLeases))
+    !Array.isArray(checkpoint.waits)
   ) {
     return;
   }
@@ -260,12 +238,6 @@ function stateFromCheckpoint(
           return [parsed.waitId, parsed];
         })
       ),
-      executionLeases: new Map(
-        (checkpoint.executionLeases ?? []).map((lease) => {
-          const parsed = parseExecutionLease(lease);
-          return [parsed.lane, parsed];
-        })
-      ),
       ...(checkpoint.externalStateUpdatedAt !== undefined
         ? { externalStateUpdatedAt: checkpoint.externalStateUpdatedAt }
         : {}),
@@ -273,39 +245,6 @@ function stateFromCheckpoint(
   } catch {
     return;
   }
-}
-
-function parseExecutionLease(value: unknown): RunExecutionLease {
-  if (typeof value !== 'object' || value === null) {
-    throw new Error('Invalid Ursula World run execution lease');
-  }
-  const lease = value as Partial<
-    Omit<RunExecutionLease, 'expiresAt'> & { expiresAt: unknown }
-  >;
-  if (
-    typeof lease.lane !== 'string' ||
-    typeof lease.token !== 'string' ||
-    typeof lease.ownerMessageId !== 'string' ||
-    !Number.isSafeInteger(lease.attempt) ||
-    (lease.attempt as number) < 1 ||
-    typeof lease.expiresAt !== 'string' ||
-    !Number.isSafeInteger(lease.generation) ||
-    (lease.generation as number) < 1
-  ) {
-    throw new Error('Invalid Ursula World run execution lease');
-  }
-  const expiresAt = new Date(lease.expiresAt);
-  if (Number.isNaN(expiresAt.getTime())) {
-    throw new Error('Invalid Ursula World run execution lease expiry');
-  }
-  return {
-    lane: lease.lane,
-    token: lease.token,
-    ownerMessageId: lease.ownerMessageId,
-    attempt: lease.attempt as number,
-    expiresAt,
-    generation: lease.generation as number,
-  };
 }
 
 function objectHasOnlyKeys(
@@ -387,7 +326,6 @@ function compactCompletedStepCommit(
     commit.steps?.length !== 1 ||
     commit.hooks !== undefined ||
     commit.waits !== undefined ||
-    commit.executionLeases !== undefined ||
     !objectHasOnlyKeys(
       commit as unknown as Record<string, unknown>,
       COMPACTABLE_COMMIT_KEYS
@@ -780,14 +718,6 @@ function parseCommit(
           })),
         }
       : {}),
-    ...(commit.executionLeases
-      ? {
-          executionLeases: commit.executionLeases.map(({ id, value }) => ({
-            id,
-            value: value === null ? null : parseExecutionLease(value),
-          })),
-        }
-      : {}),
     ...(commit.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: commit.externalStateUpdatedAt }
       : {}),
@@ -846,7 +776,6 @@ function applyCommit(
   applyChanges(state.steps, commit.steps);
   applyChanges(state.hooks, commit.hooks);
   applyChanges(state.waits, commit.waits);
-  applyChanges(state.executionLeases, commit.executionLeases);
   if (commit.externalStateUpdatedAt !== undefined) {
     state.externalStateUpdatedAt = commit.externalStateUpdatedAt;
   }

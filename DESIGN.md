@@ -56,7 +56,6 @@ interface RunCommit {
   steps?: Record<string, Step | null>;
   hooks?: Record<string, Hook | null>;
   waits?: Record<string, Wait | null>;
-  executionLeases?: Record<string, RunExecutionLease | null>;
   externalStateUpdatedAt?: number;
 }
 ```

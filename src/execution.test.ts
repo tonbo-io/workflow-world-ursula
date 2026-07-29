@@ -237,7 +237,7 @@ async function setup(allowOwnedLazyStarts = true) {
   const memory = new MemoryClient();
   const client = memory;
   const journal = new RunJournal(client);
-  const executions = new RunExecutionCoordinator(journal, {
+  const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts,
   });
   const { storage } = createStorage(client, { journal, executions });
@@ -336,12 +336,11 @@ describe('atomic step transactions', () => {
     });
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
-    expect(commits[0]?.events).toEqual([]);
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits).toHaveLength(2);
+    expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
     ]);
-    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);
@@ -379,13 +378,13 @@ describe('atomic step transactions', () => {
       ]);
     });
 
-    // One lease claim, a creation per step, then each step's start and
-    // terminal event sharing a record.
+    // Each lazy start is committed to settle create ownership, followed by
+    // its terminal event. No second run-journal lease is needed because the
+    // durable queue lease already owns the delivery.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(5);
+    expect(commits).toHaveLength(4);
     expect(
       commits
-        .slice(1)
         .flatMap(({ events }) => events)
         .filter(({ eventType }) => eventType === 'step_completed')
         .map(({ correlationId }) => correlationId)
@@ -427,8 +426,8 @@ describe('atomic step transactions', () => {
 
   it('grants create ownership only once across discarded deliveries', async () => {
     const { client, journal, memory } = await setup();
-    const first = new RunExecutionCoordinator(journal);
-    const second = new RunExecutionCoordinator(journal);
+    const first = new RunExecutionCoordinator();
+    const second = new RunExecutionCoordinator();
     const before = memory.runCommits().length;
 
     // A delivery that starts a step and is then abandoned without ever
@@ -494,55 +493,52 @@ describe('atomic step transactions', () => {
     expect(result.hook).toMatchObject({ hookId: 'hook-live', token });
   });
 
-  it('starts a step through the ordinary path when its lease was superseded', async () => {
-    const { client, journal, memory } = await setup();
-    const first = new RunExecutionCoordinator(journal);
-    const second = new RunExecutionCoordinator(journal);
-    const { storage } = createStorage(client, { journal, executions: first });
+  it('keeps the staged transaction available after the queue lease expires', async () => {
+    const { executions, memory, storage } = await setup();
+    const before = memory.runCommits().length;
 
-    await first.run(
-      delivery('lease-superseded', {
+    await executions.run(
+      delivery('lease-expiring', {
         expiresAt: new Date(Date.now() + 20),
       }),
       async () => {
-        // Let this handler's lease lapse so a newer delivery can take the lane
-        // while it still holds the lease it captured at claim time.
-        await new Promise<void>((resolve) => setTimeout(resolve, 30));
-        await second.run(
-          delivery('lease-newer', { ownerMessageId: 'msg_newer', attempt: 2 }),
-          async () => {}
+        await storage.events.create(
+          'wrun_atomic',
+          stepCreated('step-expiring')
         );
-      // The staged-step optimization is unavailable now, but the step must
-      // still start: an error here would strand it as `pending` forever.
+        await new Promise<void>((resolve) => setTimeout(resolve, 30));
         await expect(
-          storage.events.create('wrun_atomic', stepStarted('step-superseded'))
+          storage.events.create(
+            'wrun_atomic',
+            plainStepStarted('step-expiring')
+          )
         ).resolves.toMatchObject({ step: { status: 'running' } });
         await storage.events.create(
           'wrun_atomic',
-          stepCompleted('step-superseded')
+          stepCompleted('step-expiring')
         );
       }
     );
 
-    expect(
-      memory
-        .runCommits()
-        .flatMap(({ events }) => events)
-        .filter(
-          ({ eventType, correlationId }) =>
-            eventType === 'step_completed' &&
-            correlationId === 'step-superseded'
-        )
-    ).toHaveLength(1);
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(2);
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+      'step_started',
+      'step_completed',
+    ]);
   });
 
-  it('fences a stale handler after a newer lease generation takes over', async () => {
+  it('converges when an expired delivery completes after its redelivery', async () => {
     const { client, journal } = await setup();
-    const first = new RunExecutionCoordinator(journal);
-    const second = new RunExecutionCoordinator(journal);
-    const { storage } = createStorage(client, {
+    const first = new RunExecutionCoordinator();
+    const second = new RunExecutionCoordinator();
+    const { storage: firstStorage } = createStorage(client, {
       journal,
       executions: first,
+    });
+    const { storage: secondStorage } = createStorage(client, {
+      journal,
+      executions: second,
     });
     let release = () => {};
     const gate = new Promise<void>((resolve) => {
@@ -552,23 +548,24 @@ describe('atomic step transactions', () => {
     const stagedGate = new Promise<void>((resolve) => {
       staged = resolve;
     });
+    await firstStorage.events.create(
+      'wrun_atomic',
+      stepCreated('step-redelivered')
+    );
     const stale = first.run(
       delivery('lease-old', {
         expiresAt: new Date(Date.now() + 20),
       }),
       async () => {
-        // The step exists already, so its start is staged rather than
-        // committed — which is what puts the terminal write behind the fence.
-        await storage.events.create('wrun_atomic', stepCreated('step-stale'));
-        await storage.events.create(
+        await firstStorage.events.create(
           'wrun_atomic',
-          plainStepStarted('step-stale')
+          plainStepStarted('step-redelivered')
         );
         staged();
         await gate;
-        await storage.events.create(
+        await firstStorage.events.create(
           'wrun_atomic',
-          stepCompleted('step-stale')
+          stepCompleted('step-redelivered')
         );
       }
     );
@@ -579,10 +576,22 @@ describe('atomic step transactions', () => {
         ownerMessageId: 'msg_new',
         attempt: 2,
       }),
-      async () => {}
+      async () => {
+        await secondStorage.events.create(
+          'wrun_atomic',
+          plainStepStarted('step-redelivered')
+        );
+        await secondStorage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-redelivered')
+        );
+      }
     );
     release();
 
-    await expect(stale).rejects.toThrow('changed ownership');
+    await expect(stale).resolves.toBeUndefined();
+    await expect(
+      firstStorage.steps.get('wrun_atomic', 'step-redelivered')
+    ).resolves.toMatchObject({ status: 'completed', attempt: 1 });
   });
 });
