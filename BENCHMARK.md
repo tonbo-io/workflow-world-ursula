@@ -104,6 +104,40 @@ come from the downloadable artifact on
 they are not substituted for a same-commit rerun when producing the final
 comparison.
 
+## DurableAgent baseline
+
+The first production-shaped agent baseline ran on 2026-07-29 using Workflow commit `62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91`, `@workflow/ai/test` deterministic mock providers, and benchmark images built from `dfbafbabdd4b8f982b9ce39c7df944f03d55a1f0`. The Ursula image index was `sha256:63366de927430d46d8ce060a05c73a3ceb1692a2224546f52dd0a3241e517783`; the Postgres image index was `sha256:be28f3cf004861c1e8fb05199f6b2af7e1558a92b687fb56fcdacce978289de9`.
+
+Both backends used the same two `m7g.xlarge` application nodes and eight one-CPU application processes. Ursula used three `m7g.large` voters across three availability zones, 256 Raft groups, memory WAL, and S3 cold storage. PostgreSQL used RDS PostgreSQL 17.9 on a Multi-AZ `db.m7g.large` with 100 GiB gp3 storage and 3,000 provisioned IOPS. Backends ran serially so their application processes never competed for the two application nodes.
+
+Each recorded repeat contained 30 successful basic runs and 30 successful tool-loop runs after two unrecorded warmups; every run validated the DurableAgent model-step count, tool count, and final text. The table reports the median of the three independent repeat summaries, not a percentile reconstructed from pooled raw samples.
+
+| Scenario | Metric | Ursula | PostgreSQL | Ursula vs PostgreSQL |
+| --- | --- | ---: | ---: | ---: |
+| one model turn, no tool | average | 139 ms | 137 ms | 1% slower |
+| one model turn, no tool | p75 | 134 ms | 137 ms | 2% faster |
+| one model turn, no tool | p90 | 191 ms | 189 ms | 1% slower |
+| one model turn, no tool | p99 | 352 ms | 327 ms | 8% slower |
+| four model turns, three tools | average | 589 ms | 700 ms | 16% faster |
+| four model turns, three tools | p75 | 655 ms | 771 ms | 15% faster |
+| four model turns, three tools | p90 | 762 ms | 890 ms | 14% faster |
+| four model turns, three tools | p99 | 1,285 ms | 1,032 ms | 25% slower |
+
+The repeat-level summaries were:
+
+| Backend | Scenario | Repeat averages | Repeat p90 | Repeat p99 |
+| --- | --- | --- | --- | --- |
+| Ursula | basic | 143.9 / 135.5 / 139.0 ms | 191 / 191 / 151 ms | 233 / 352 / 370 ms |
+| PostgreSQL | basic | 159.1 / 137.0 / 136.2 ms | 304 / 189 / 183 ms | 327 / 243 / 364 ms |
+| Ursula | three-tool loop | 572.1 / 640.3 / 589.2 ms | 708 / 908 / 762 ms | 879 / 1,653 / 1,285 ms |
+| PostgreSQL | three-tool loop | 644.8 / 708.7 / 700.0 ms | 787 / 895 / 890 ms | 987 / 1,039 / 1,032 ms |
+
+Ursula's measured append amplification was stable across all repeats: the basic scenario used 328-333 accepted appends per 30 runs, or about 11 appends per agent run; the three-tool loop used 869-872, or about 29 appends per agent run. Median Raft replication request bytes were about 47.9 KB per basic run and 101.5 KB per three-tool run. PostgreSQL's median physical database growth was about 4.4 KB and 15.0 KB per run respectively, but PostgreSQL page allocation makes such short-window size deltas quantized rather than exact logical-byte accounting. PostgreSQL transaction counters also include the eight workers' steady polling, so they are diagnostic, not a direct per-run billing unit.
+
+The result establishes a narrower claim than the earlier synthetic benchmark: Ursula is not faster for the minimum one-turn agent lifecycle, but it is about 15% faster through the body of a deterministic multi-turn tool loop at average through p90. Ursula does not yet meet the lower-p99 goal; one slow sample dominates each 30-sample p99, and the three-repeat median p99 remains worse than PostgreSQL.
+
+The equivalent Vercel managed DurableAgent run is still missing. The public managed artifact predates these two scenarios, and this environment has no linked Vercel benchmark deployment or credential. Do not substitute the synthetic `97_bench.ts` managed numbers for this agent baseline; run the same image commit, workflow definitions, warmups, and iteration counts on managed World before making a three-way product claim.
+
 ## Workloads
 
 Use deterministic payloads for the measured runs; run a smaller real-model
