@@ -22,6 +22,8 @@ const MAX_RETRY_DELAY_MS = 50;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 
+class LocalQueueContentionError extends Error {}
+
 type QueueTransition =
   | {
       version: 1;
@@ -466,7 +468,8 @@ export class QueueJournal {
     // same state and commit while we wait. Reusing its newer tail here would
     // make our stale transition look valid to Ursula and could persist a
     // lease/ack for a message that the earlier transition already removed.
-    // Keeping the original tail forces a 412 so the caller reloads and
+    // Keeping the original tail lets us reject local staleness before I/O;
+    // remote staleness still produces a 412. In both cases the caller
     // re-evaluates the transition against the committed state.
     const expectedRecord = state.nextRecord;
     const previousTurn = this.appendTurns.get(queueName);
@@ -477,6 +480,12 @@ export class QueueJournal {
     this.appendTurns.set(queueName, currentTurn);
     if (previousTurn) await previousTurn;
     try {
+      // A mutation ahead of us in this process already advanced the shared
+      // materialized state. Do not spend an HTTP round trip on an append that
+      // is guaranteed to fail its record-tail precondition.
+      if (state.nextRecord !== expectedRecord) {
+        throw new LocalQueueContentionError();
+      }
       await this.client.append(
         queueStream(queueName, this.partition),
         transitions,
@@ -620,6 +629,7 @@ export class QueueJournal {
         );
         return messageId;
       } catch (error) {
+        if (error instanceof LocalQueueContentionError) continue;
         if (isUrsulaRequestError(error, 412)) {
           await this.refreshAfterContention(queueName);
           await contentionBackoff(attempt);
@@ -719,6 +729,7 @@ export class QueueJournal {
           },
         };
       } catch (error) {
+        if (error instanceof LocalQueueContentionError) continue;
         if (isUrsulaRequestError(error, 412)) {
           await this.refreshAfterContention(queueName);
           await contentionBackoff(retry);
@@ -787,6 +798,7 @@ export class QueueJournal {
         );
         return true;
       } catch (error) {
+        if (error instanceof LocalQueueContentionError) continue;
         if (isUrsulaRequestError(error, 412)) {
           await this.refreshAfterContention(queueName);
           await contentionBackoff(retry);
@@ -892,6 +904,7 @@ export class QueueJournal {
           },
         };
       } catch (error) {
+        if (error instanceof LocalQueueContentionError) continue;
         if (
           isUrsulaRequestError(error, 412) ||
           error instanceof TypeError
@@ -954,6 +967,7 @@ export class QueueJournal {
         );
         return true;
       } catch (error) {
+        if (error instanceof LocalQueueContentionError) continue;
         if (isUrsulaRequestError(error, 412)) {
           await this.refreshAfterContention(queueName);
           await contentionBackoff(retry);

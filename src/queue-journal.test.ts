@@ -12,6 +12,7 @@ class MemoryClient {
   readonly appendedBatchSizes: number[] = [];
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly retainedRecords: number[] = [];
+  preconditionFailures = 0;
   beforeNextSourceReadAll?: () => Promise<void>;
   goneReads = 0;
   loseNextAppendResponse = false;
@@ -37,6 +38,7 @@ class MemoryClient {
       options.expectedRecord !== undefined &&
       options.expectedRecord !== current.length
     ) {
+      this.preconditionFailures += 1;
       throw new UrsulaRequestError(
         'append records',
         new Response('record tail mismatch', {
@@ -479,6 +481,7 @@ describe('QueueJournal', () => {
 
     expect(acked).toBe(true);
     expect(extended).toBe(false);
+    expect(memory.preconditionFailures).toBe(0);
     await journal.enqueue(queueName, { runId: 'next-run', step: 1 });
     await expect(
       journal.claim(queueName, new Date(), 10_000)
