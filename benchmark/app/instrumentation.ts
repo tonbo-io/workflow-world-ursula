@@ -5,6 +5,10 @@ export async function register() {
       './lib/workflow-profile'
     );
     installWorkflowProfileTracing();
+    const { installUrsulaRequestProfile } = await import(
+      './lib/ursula-request-profile'
+    );
+    installUrsulaRequestProfile();
   }
   const { getWorld } = await import('workflow/runtime');
   const world = await getWorld();
