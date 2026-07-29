@@ -12,6 +12,20 @@ import {
 } from './run-journal.js';
 
 const MAX_LEASE_CAS_RETRIES = 16;
+const MAX_LEASE_RETRY_DELAY_MS = 50;
+
+/**
+ * Jittered backoff between lease-claim CAS attempts.
+ *
+ * Every parallel step of one run claims its lane on that run's single stream,
+ * so retrying immediately turns a burst of steps into a thundering herd on one
+ * record tail. Spreading the retries lets them converge instead of colliding.
+ */
+async function contentionBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(MAX_LEASE_RETRY_DELAY_MS, 2 ** Math.min(attempt, 6));
+  const delayMs = Math.max(1, Math.floor(Math.random() * ceiling));
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
 
 export interface DeliveryExecution {
   runId: string;
@@ -85,12 +99,19 @@ export class RunExecutionCoordinator {
         });
         return lease;
       } catch (error) {
-        if (
-          isUrsulaRequestError(error, 412) &&
-          attempt + 1 < MAX_LEASE_CAS_RETRIES
-        ) {
+        if (isUrsulaRequestError(error, 412)) {
           this.journal.evict(delivery.runId);
-          continue;
+          if (attempt + 1 < MAX_LEASE_CAS_RETRIES) {
+            await contentionBackoff(attempt);
+            continue;
+          }
+          // The lane fence is an optimization, not a precondition: `run()`
+          // executes unfenced when no lease is granted, and the staged-step
+          // path declines to stage without one. Letting the raw 412 escape
+          // instead failed the whole delivery, and its redelivery could then
+          // restart a step another delivery had already completed — which the
+          // runtime has no recovery for.
+          return;
         }
         throw error;
       }
