@@ -534,6 +534,9 @@ export function createStorage(
         try {
           await journal.append(state, commit);
           coordinator.finish(runId, stepId);
+          if (lease?.lane.startsWith('step:')) {
+            coordinator.releaseLane(runId, lease.lane);
+          }
           return withEventPage(
             terminal.result,
             runId,
