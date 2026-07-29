@@ -182,13 +182,13 @@ describe('Ursula queue runtime', () => {
 
   it('persists timeout redelivery with the same message ID', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
-    const queueName = '__wkf_step_retry' as ValidQueueName;
+    const queueName = '__wkf_workflow_retry' as ValidQueueName;
     const queue = createQueue(client, {
       pollIntervalMs: 5,
       leaseDurationMs: 50,
     });
     const attempts: Array<{ attempt: number; messageId: string }> = [];
-    queue.createQueueHandler('__wkf_step_', async (_message, meta) => {
+    queue.createQueueHandler('__wkf_workflow_', async (_message, meta) => {
       attempts.push(meta);
       return meta.attempt === 1 ? { timeoutSeconds: 0 } : undefined;
     });
@@ -206,13 +206,13 @@ describe('Ursula queue runtime', () => {
 
   it('wakes at a persisted retry deadline without waiting for the poll fallback', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
-    const queueName = '__wkf_step_deadline' as ValidQueueName;
+    const queueName = '__wkf_workflow_deadline' as ValidQueueName;
     const queue = createQueue(client, {
       pollIntervalMs: 10_000,
       leaseDurationMs: 1_000,
     });
     const attempts: number[] = [];
-    queue.createQueueHandler('__wkf_step_', async (_message, meta) => {
+    queue.createQueueHandler('__wkf_workflow_', async (_message, meta) => {
       attempts.push(meta.attempt);
       return meta.attempt === 1 ? { timeoutSeconds: 0.05 } : undefined;
     });
