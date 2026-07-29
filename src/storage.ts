@@ -467,6 +467,17 @@ export function createStorage(
       params,
     });
     if (!materialized.commit) return materialized.result;
+    if (materialized.result.stepCreated) {
+      // `stepCreated` is the runtime's exactly-once create-ownership signal:
+      // it runs the step body inline only for the caller that created the
+      // step. A staged start is not appended until its terminal event commits,
+      // so answering `true` from one would promise ownership backed by nothing
+      // durable — and a discarded stage leaves no record, so the next delivery
+      // materializes the same creation and is told it won the claim too.
+      // Falling through to the ordinary path appends the creation first, so
+      // the claim is decided by the record tail rather than by local memory.
+      return;
+    }
     const staged: StagedStepStart = {
       request,
       params,
