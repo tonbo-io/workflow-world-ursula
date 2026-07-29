@@ -113,7 +113,7 @@ class MemoryClient {
 }
 
 describe('Ursula queue runtime', () => {
-  it('runs workflow deliveries inside the claimed run execution lease', async () => {
+  it('runs workflow deliveries inside their execution context', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const run = vi.fn(
       async (

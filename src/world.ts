@@ -148,7 +148,7 @@ export function createWorld(
     compactCompletedStepCommits:
       config.experimentalCompactCompletedStepCommits,
   });
-  const executions = new RunExecutionCoordinator(journal, {
+  const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
   });
   const { storage } = createStorage(client, { journal, executions });

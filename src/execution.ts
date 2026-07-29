@@ -4,28 +4,6 @@ import type {
   CreateEventParams,
   EventResult,
 } from '@workflow/world';
-import { isUrsulaRequestError } from './client.js';
-import {
-  RunJournal,
-  type RunExecutionLease,
-  type RunJournalState,
-} from './run-journal.js';
-
-const MAX_LEASE_CAS_RETRIES = 16;
-const MAX_LEASE_RETRY_DELAY_MS = 50;
-
-/**
- * Jittered backoff between lease-claim CAS attempts.
- *
- * Every parallel step of one run claims its lane on that run's single stream,
- * so retrying immediately turns a burst of steps into a thundering herd on one
- * record tail. Spreading the retries lets them converge instead of colliding.
- */
-async function contentionBackoff(attempt: number): Promise<void> {
-  const ceiling = Math.min(MAX_LEASE_RETRY_DELAY_MS, 2 ** Math.min(attempt, 6));
-  const delayMs = Math.max(1, Math.floor(Math.random() * ceiling));
-  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-}
 
 export interface DeliveryExecution {
   runId: string;
@@ -48,75 +26,29 @@ export interface StagedStepStart {
 
 interface DeliveryContext {
   runId: string;
-  lease?: RunExecutionLease;
+  delivery: DeliveryExecution;
   stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
 }
 
+/**
+ * Coordinates owned step commits within one adapter process.
+ *
+ * The durable queue lease remains the delivery authority. Run mutations use
+ * Ursula's record-tail CAS as their correctness boundary, so this coordinator
+ * never writes a second lease into the run journal.
+ */
 export class RunExecutionCoordinator {
   private readonly contexts = new AsyncLocalStorage<DeliveryContext>();
   private readonly ownedStarts = new Map<string, StagedStepStart>();
   private readonly ownedTurns = new Map<string, Promise<void>>();
 
   constructor(
-    private readonly journal: RunJournal,
     private readonly options: { allowOwnedLazyStarts?: boolean } = {}
   ) {}
 
   allowsOwnedLazyStarts(): boolean {
     return this.options.allowOwnedLazyStarts === true;
-  }
-
-  private async claim(
-    delivery: DeliveryExecution
-  ): Promise<RunExecutionLease | undefined> {
-    for (let attempt = 0; attempt < MAX_LEASE_CAS_RETRIES; attempt += 1) {
-      let state: RunJournalState;
-      try {
-        state = await this.journal.loadForMutation(delivery.runId);
-      } catch (error) {
-        if (isUrsulaRequestError(error, 404)) return;
-        throw error;
-      }
-      const current = state.executionLeases.get(delivery.lane);
-      if (current?.token === delivery.token) return current;
-      if (current && current.expiresAt.getTime() > Date.now()) {
-        return;
-      }
-      const lease: RunExecutionLease = {
-        lane: delivery.lane,
-        token: delivery.token,
-        ownerMessageId: delivery.ownerMessageId,
-        attempt: delivery.attempt,
-        expiresAt: delivery.expiresAt,
-        generation: (current?.generation ?? 0) + 1,
-      };
-      try {
-        await this.journal.append(state, {
-          operationId: `run-execution-claim:${delivery.runId}:${delivery.lane}:${delivery.token}`,
-          events: [],
-          executionLeases: [{ id: delivery.lane, value: lease }],
-        });
-        return lease;
-      } catch (error) {
-        if (isUrsulaRequestError(error, 412)) {
-          this.journal.evict(delivery.runId);
-          if (attempt + 1 < MAX_LEASE_CAS_RETRIES) {
-            await contentionBackoff(attempt);
-            continue;
-          }
-          // The lane fence is an optimization, not a precondition: `run()`
-          // executes unfenced when no lease is granted, and the staged-step
-          // path declines to stage without one. Letting the raw 412 escape
-          // instead failed the whole delivery, and its redelivery could then
-          // restart a step another delivery had already completed — which the
-          // runtime has no recovery for.
-          return;
-        }
-        throw error;
-      }
-    }
-    return;
   }
 
   async run<T>(
@@ -126,12 +58,10 @@ export class RunExecutionCoordinator {
     if (!delivery || delivery.expiresAt.getTime() <= Date.now()) {
       return task();
     }
-    const lease = await this.claim(delivery);
-    if (!lease) return task();
     return this.contexts.run(
       {
         runId: delivery.runId,
-        lease,
+        delivery,
         stagedStarts: new Map(),
         turn: Promise.resolve(),
       },
@@ -139,26 +69,9 @@ export class RunExecutionCoordinator {
     );
   }
 
-  current(runId: string): RunExecutionLease | undefined {
+  current(runId: string): DeliveryExecution | undefined {
     const context = this.contexts.getStore();
-    return context?.runId === runId ? context.lease : undefined;
-  }
-
-  /**
-   * Discharges the delivery's lane fence once a commit has released it.
-   *
-   * A staged terminal commit for a `step:` lane releases that lane in the same
-   * record. The delivery keeps running afterwards — a Turbo invocation
-   * continues the orchestration inline and can commit further steps. Those
-   * later commits must not re-assert ownership of a lane this delivery
-   * deliberately gave up, or every one of them fails the ownership check and
-   * the runtime retries forever.
-   */
-  releaseLane(runId: string, lane: string): void {
-    const context = this.contexts.getStore();
-    if (context?.runId === runId && context.lease?.lane === lane) {
-      context.lease = undefined;
-    }
+    return context?.runId === runId ? context.delivery : undefined;
   }
 
   staged(runId: string, stepId: string): StagedStepStart | undefined {

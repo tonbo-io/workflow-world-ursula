@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
-  EntityConflictError,
   HookNotFoundError,
   PreconditionFailedError,
   WorkflowRunNotFoundError,
@@ -21,6 +20,7 @@ import type {
   WorkflowRun,
 } from '@workflow/world';
 import {
+  isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   stripEventDataRefs,
 } from '@workflow/world';
@@ -41,7 +41,6 @@ import {
   RunJournal,
   type EntityChange,
   type RunCommit,
-  type RunExecutionLease,
   type RunJournalState,
 } from './run-journal.js';
 
@@ -88,31 +87,12 @@ function combineStepCommits(
     ...(mergeChanges(started.waits, terminal.waits)
       ? { waits: mergeChanges(started.waits, terminal.waits) }
       : {}),
-    ...(mergeChanges(started.executionLeases, terminal.executionLeases)
-      ? {
-          executionLeases: mergeChanges(
-            started.executionLeases,
-            terminal.executionLeases
-          ),
-        }
-      : {}),
     ...(terminal.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: terminal.externalStateUpdatedAt }
       : started.externalStateUpdatedAt !== undefined
         ? { externalStateUpdatedAt: started.externalStateUpdatedAt }
         : {}),
   };
-}
-
-function ownsExecutionLease(
-  state: RunJournalState,
-  lease: RunExecutionLease
-): boolean {
-  const current = state.executionLeases.get(lease.lane);
-  return (
-    current?.token === lease.token &&
-    current.generation === lease.generation
-  );
 }
 
 async function mapWithConcurrency<T, R>(
@@ -430,26 +410,16 @@ export function createStorage(
     callId: string
   ): Promise<EventResult | undefined> {
     const coordinator = executions;
-    const lease = coordinator?.current(runId);
+    const delivery = coordinator?.current(runId);
     const stepId = request.correlationId;
     const ownedLazyStart =
       coordinator?.allowsOwnedLazyStarts() === true &&
       request.eventData?.input !== undefined &&
       request.eventData.ownerMessageId !== undefined;
-    if (!coordinator || (!lease && !ownedLazyStart) || !stepId) return;
+    if (!coordinator || (!delivery && !ownedLazyStart) || !stepId) return;
     const existing = coordinator.staged(runId, stepId);
     if (existing) return existing.result;
     const state = await journal.loadForMutation(runId);
-    if (lease && !ownsExecutionLease(state, lease)) {
-      // The lease only fences the atomic staged-step optimization; it is not a
-      // precondition for starting a step. Declining to stage falls through to
-      // the ordinary create path, which carries its own CAS and is always
-      // correct. Failing here instead would drop the step: the runtime has no
-      // recovery for an `EntityConflictError` raised by a step start, so the
-      // step stays `pending` forever and its run never completes.
-      coordinator.releaseLane(runId, lease.lane);
-      return;
-    }
     const operationId = mutationOperationId(
       state,
       request,
@@ -500,7 +470,7 @@ export function createStorage(
     const coordinator = executions;
     const stepId =
       'correlationId' in request ? request.correlationId : undefined;
-    const lease = coordinator?.current(runId);
+    const delivery = coordinator?.current(runId);
     const staged = stepId ? coordinator?.staged(runId, stepId) : undefined;
     if (!coordinator || !stepId || !staged) return;
     const terminalEventId = `evnt_${ulid()}`;
@@ -509,10 +479,52 @@ export function createStorage(
     return coordinator.exclusive(runId, async () => {
       for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
         const state = await journal.loadForMutation(runId);
-        if (lease && !ownsExecutionLease(state, lease)) {
-          throw new EntityConflictError(
-            `Execution lease for run "${runId}" changed ownership`
+        const existingStep = state.steps.get(stepId);
+        if (existingStep && isTerminalStepStatus(existingStep.status)) {
+          coordinator.finish(runId, stepId);
+          return withEventPage(
+            { step: existingStep },
+            runId,
+            journal,
+            request,
+            params,
+            state.nextRecord
           );
+        }
+        if (existingStep?.status === 'running') {
+          const current = materializeEvent(state, request, {
+            eventId: terminalEventId,
+            syntheticEventId: terminalSyntheticEventId,
+            operationId: mutationOperationId(
+              state,
+              request,
+              callId,
+              params?.requestId
+            ),
+            now: terminalNow,
+            params,
+          });
+          try {
+            if (current.commit) await journal.append(state, current.commit);
+            coordinator.finish(runId, stepId);
+            return withEventPage(
+              current.result,
+              runId,
+              journal,
+              request,
+              params,
+              state.nextRecord
+            );
+          } catch (error) {
+            if (isUrsulaRequestError(error, 412)) {
+              journal.evict(runId);
+              if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+              throw new PreconditionFailedError(
+                `Run "${runId}" changed while committing step "${stepId}": ${error.message}`
+              );
+            }
+            throw error;
+          }
         }
         const startOperationId = mutationOperationId(
           state,
@@ -531,8 +543,29 @@ export function createStorage(
           params: startParams,
         });
         if (!started.commit) {
-          throw new EntityConflictError(
-            `Step "${stepId}" no longer has a start transition`
+          coordinator.finish(runId, stepId);
+          const current = materializeEvent(state, request, {
+            eventId: terminalEventId,
+            syntheticEventId: terminalSyntheticEventId,
+            operationId: mutationOperationId(
+              state,
+              request,
+              callId,
+              params?.requestId
+            ),
+            now: terminalNow,
+            params,
+          });
+          if (current.commit) {
+            await journal.append(state, current.commit);
+          }
+          return withEventPage(
+            current.result,
+            runId,
+            journal,
+            request,
+            params,
+            state.nextRecord
           );
         }
         const preview = journal.preview(state, started.commit);
@@ -551,7 +584,7 @@ export function createStorage(
         });
         if (!terminal.commit) return terminal.result;
         const owner =
-          lease?.token ??
+          delivery?.token ??
           staged.request.eventData?.ownerMessageId ??
           staged.callId;
         const operationId = `run-step-transaction:${runId}:${owner}:${stepId}:${requestDigest(request)}`;
@@ -560,17 +593,9 @@ export function createStorage(
           started.commit,
           terminal.commit
         );
-        if (lease?.lane.startsWith('step:')) {
-          commit.executionLeases = mergeChanges(commit.executionLeases, [
-            { id: lease.lane, value: null },
-          ]);
-        }
         try {
           await journal.append(state, commit);
           coordinator.finish(runId, stepId);
-          if (lease?.lane.startsWith('step:')) {
-            coordinator.releaseLane(runId, lease.lane);
-          }
           return withEventPage(
             terminal.result,
             runId,
