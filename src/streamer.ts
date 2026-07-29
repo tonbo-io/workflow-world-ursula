@@ -16,7 +16,6 @@ const MAX_PAGE_SIZE = 1000;
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
 const LONG_POLL_CLIENT_HEADROOM_MS = 5_000;
 const RECORD_CONTENT_TYPE = 'application/json';
-const APPEND_BATCH_MAX_BYTES = 32 * 1024 * 1024;
 type HeaderSource = ConstructorParameters<typeof Headers>[0];
 
 interface ChunkRecord {
@@ -137,16 +136,6 @@ function encodeChunk(chunk: string | Uint8Array): ChunkRecord {
   };
 }
 
-function encodeAppendBatchFrame(payload: string): ArrayBuffer | undefined {
-  const bytes = new TextEncoder().encode(payload);
-  const framedLength = bytes.byteLength + 4;
-  if (framedLength > APPEND_BATCH_MAX_BYTES) return undefined;
-  const frame = new ArrayBuffer(framedLength);
-  new DataView(frame).setUint32(0, bytes.byteLength);
-  new Uint8Array(frame, 4).set(bytes);
-  return frame;
-}
-
 function isChunkRecord(value: unknown): value is ChunkRecord {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Partial<ChunkRecord>;
@@ -249,30 +238,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
   ): Promise<Response> {
     if (response.ok) return response;
     throw new UrsulaStreamError(operation, response, await response.text());
-  }
-
-  async function expectAppendBatchSuccess(response: Response): Promise<void> {
-    await expectSuccess('append stream batch', response);
-    if (response.status === 204) return;
-    const body = await response.text();
-    try {
-      const items = JSON.parse(body) as unknown;
-      if (
-        Array.isArray(items) &&
-        items.length === 1 &&
-        typeof items[0] === 'object' &&
-        items[0] !== null &&
-        (items[0] as { status?: unknown }).status === 204
-      ) {
-        return;
-      }
-    } catch {
-      // Report the response below with enough context to diagnose a bad proxy
-      // or an incompatible Ursula append-batch implementation.
-    }
-    throw new Error(
-      `Ursula append stream batch returned an invalid acknowledgement: ${body || '<empty body>'}`
-    );
   }
 
   async function ensureStream(url: URL): Promise<void> {
@@ -418,7 +383,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         'producer-seq': String(sequence),
       });
       const body = JSON.stringify(records.length === 1 ? records[0] : records);
-      const batchBody = encodeAppendBatchFrame(body);
       const key = url.toString();
       if (!ensuredStreams.has(key)) {
         const created = await fetchImpl(url, {
@@ -441,27 +405,14 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
           await expectSuccess('create stream with first chunks', created);
         }
       }
-      if (batchBody) {
-        appendHeaders.set('prefer', 'return=minimal');
-        const batchUrl = new URL(url);
-        batchUrl.pathname = `${batchUrl.pathname}/append-batch`;
-        await expectAppendBatchSuccess(
-          await fetchImpl(batchUrl, {
-            method: 'POST',
-            headers: appendHeaders,
-            body: batchBody,
-          })
-        );
-      } else {
-        await expectSuccess(
-          'append stream',
-          await fetchImpl(url, {
-            method: 'POST',
-            headers: appendHeaders,
-            body,
-          })
-        );
-      }
+      await expectSuccess(
+        'append stream',
+        await fetchImpl(url, {
+          method: 'POST',
+          headers: appendHeaders,
+          body,
+        })
+      );
       producer.nextSequence += 1;
     });
   }
