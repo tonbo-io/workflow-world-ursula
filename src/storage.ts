@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
@@ -423,9 +424,14 @@ export function createStorage(
     if (existing) return existing.result;
     const state = await journal.loadForMutation(runId);
     if (lease && !ownsExecutionLease(state, lease)) {
-      throw new EntityConflictError(
-        `Execution lease for run "${runId}" changed ownership`
-      );
+      // The lease only fences the atomic staged-step optimization; it is not a
+      // precondition for starting a step. Declining to stage falls through to
+      // the ordinary create path, which carries its own CAS and is always
+      // correct. Failing here instead would drop the step: the runtime has no
+      // recovery for an `EntityConflictError` raised by a step start, so the
+      // step stays `pending` forever and its run never completes.
+      coordinator.releaseLane(runId, lease.lane);
+      return;
     }
     const operationId = mutationOperationId(
       state,
@@ -546,12 +552,12 @@ export function createStorage(
             state.nextRecord
           );
         } catch (error) {
-          if (
-            isUrsulaRequestError(error, 412) &&
-            attempt + 1 < MAX_COMMIT_RETRIES
-          ) {
+          if (isUrsulaRequestError(error, 412)) {
             journal.evict(runId);
-            continue;
+            if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+            throw new PreconditionFailedError(
+              `Run "${runId}" changed while committing step "${stepId}": ${error.message}`
+            );
           }
           throw error;
         }
@@ -774,13 +780,13 @@ export function createStorage(
               state.nextRecord
             );
           } catch (error) {
-            if (
-              isUrsulaRequestError(error, 412) &&
-              attempt + 1 < MAX_COMMIT_RETRIES
-            ) {
+            if (isUrsulaRequestError(error, 412)) {
               journal.evict(effectiveRunId);
               assumeEmpty = false;
-              continue;
+              if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+              throw new PreconditionFailedError(
+                `Run "${effectiveRunId}" changed while committing "${data.eventType}": ${error.message}`
+              );
             }
             throw error;
           }

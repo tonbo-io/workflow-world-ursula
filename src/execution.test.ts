@@ -1,3 +1,4 @@
+import { PreconditionFailedError } from '@workflow/errors';
 import type { AnyEventRequest } from '@workflow/world';
 import { describe, expect, it } from 'vitest';
 import {
@@ -16,6 +17,7 @@ import { createStorage } from './storage.js';
 class MemoryClient extends UrsulaClient {
   readonly appends: Array<{ stream: string; values: unknown[] }> = [];
   private readonly streams = new Map<string, unknown[]>();
+  private remainingRunAppendConflicts = 0;
 
   constructor() {
     super({ baseUrl: 'https://ursula.test' });
@@ -25,11 +27,27 @@ class MemoryClient extends UrsulaClient {
     if (!this.streams.has(stream)) this.streams.set(stream, []);
   }
 
+  failRunAppendsWithConflict(count: number): void {
+    this.remainingRunAppendConflicts = count;
+  }
+
   async append<T>(
     stream: string,
     values: T | readonly T[],
     options: UrsulaAppendOptions
   ): Promise<{ startRecord: number; nextRecord: number }> {
+    if (
+      stream.startsWith('run-') &&
+      !stream.startsWith('run-checkpoint-') &&
+      this.remainingRunAppendConflicts > 0
+    ) {
+      this.remainingRunAppendConflicts -= 1;
+      throw new UrsulaRequestError(
+        'append records',
+        new Response('record tail mismatch', { status: 412 }),
+        'record tail mismatch'
+      );
+    }
     const current = this.streams.get(stream) ?? [];
     if (
       options.expectedRecord !== undefined &&
@@ -309,6 +327,80 @@ describe('atomic step transactions', () => {
         .map(({ correlationId }) => correlationId)
         .sort()
     ).toEqual(['step-a', 'step-b']);
+  });
+
+  it('surfaces exhausted staged-step CAS conflicts as replayable precondition failures', async () => {
+    const { memory, storage } = await setup();
+    await storage.events.create(
+      'wrun_atomic',
+      stepStarted('step-contended')
+    );
+    memory.failRunAppendsWithConflict(16);
+
+    await expect(
+      storage.events.create(
+        'wrun_atomic',
+        stepCompleted('step-contended')
+      )
+    ).rejects.toSatisfy((error: unknown) =>
+      PreconditionFailedError.is(error)
+    );
+  });
+
+  it('surfaces exhausted ordinary event CAS conflicts as replayable precondition failures', async () => {
+    const { memory, storage } = await setup(false);
+    memory.failRunAppendsWithConflict(16);
+
+    await expect(
+      storage.events.create(
+        'wrun_atomic',
+        stepStarted('step-ordinary-contended')
+      )
+    ).rejects.toSatisfy((error: unknown) =>
+      PreconditionFailedError.is(error)
+    );
+  });
+
+  it('starts a step through the ordinary path when its lease was superseded', async () => {
+    const { client, journal, memory } = await setup();
+    const first = new RunExecutionCoordinator(journal);
+    const second = new RunExecutionCoordinator(journal);
+    const { storage } = createStorage(client, { journal, executions: first });
+
+    await first.run(
+      delivery('lease-superseded', {
+        expiresAt: new Date(Date.now() + 20),
+      }),
+      async () => {
+        // Let this handler's lease lapse so a newer delivery can take the lane
+        // while it still holds the lease it captured at claim time.
+        await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        await second.run(
+          delivery('lease-newer', { ownerMessageId: 'msg_newer', attempt: 2 }),
+          async () => {}
+        );
+      // The staged-step optimization is unavailable now, but the step must
+      // still start: an error here would strand it as `pending` forever.
+        await expect(
+          storage.events.create('wrun_atomic', stepStarted('step-superseded'))
+        ).resolves.toMatchObject({ step: { status: 'running' } });
+        await storage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-superseded')
+        );
+      }
+    );
+
+    expect(
+      memory
+        .runCommits()
+        .flatMap(({ events }) => events)
+        .filter(
+          ({ eventType, correlationId }) =>
+            eventType === 'step_completed' &&
+            correlationId === 'step-superseded'
+        )
+    ).toHaveLength(1);
   });
 
   it('fences a stale handler after a newer lease generation takes over', async () => {
