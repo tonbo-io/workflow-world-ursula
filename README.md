@@ -86,6 +86,42 @@ journal.
 handlers end with the process. Committed state is unaffected — an expired lease
 is redelivered.
 
+### Separating request serving from queue dispatch
+
+One eve process both serves requests and dispatches its own queue, which is all
+a single replica needs. Past that, run the request replicas with dispatch off
+and a smaller pool of dispatcher-only processes beside them:
+
+```bash
+# Request replicas: they enqueue, and execute what is delivered to them.
+WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED=0 eve start
+
+# Dispatcher pool: no traffic of its own, delivers over HTTP to the replicas.
+WORKFLOW_URSULA_QUEUE_DELIVERY_URL=https://agent.internal node dispatcher.mjs
+```
+
+where `dispatcher.mjs` is just the world with its watchers running:
+
+```js
+import { createWorld } from '@tonbo-io/world-ursula';
+
+const world = createWorld();
+await world.start();
+process.on('SIGTERM', () => world.close().then(() => process.exit(0)));
+```
+
+Dispatchers hold no state worth keeping: they recover pending messages and
+expired leases from Ursula, so one can be added, restarted, or lost at any
+time. A message enqueued while no dispatcher was running is picked up by the
+next one to start.
+
+Running several is safe — leases fence delivery, so a message is executed once
+no matter how many dispatchers are competing for it. It does cost latency: at
+200 concurrent sessions, p50 session-create went 31 ms in-process, 56 ms with
+one dispatcher, 86 ms with two, since delivery crosses a process boundary and
+the dispatchers contend for the same claims. Size the pool for redundancy
+rather than throughput.
+
 ## Configuration
 
 | Environment variable | Purpose |
