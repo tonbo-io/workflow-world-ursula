@@ -133,6 +133,7 @@ const CATCHUP_RESUME_START_INDEX = envInt(
 const CONCURRENT_ITERATIONS = envInt('BENCH_CONCURRENT_ITERATIONS', 1);
 const CONCURRENT_RUN_COUNT = envInt('BENCH_CONCURRENT_RUN_COUNT', 100);
 const CONCURRENT_STEP_COUNT = envInt('BENCH_CONCURRENT_STEP_COUNT', 50);
+const AGENT_ITERATIONS = envInt('BENCH_AGENT_ITERATIONS', 20);
 const CAPACITY_ONLY = process.env.BENCH_CAPACITY_ONLY === '1';
 const CAPACITY_STEP_COUNT = envInt('BENCH_CAPACITY_STEP_COUNT', 20);
 const CAPACITY_ITERATIONS = envInt('BENCH_CAPACITY_ITERATIONS', 1);
@@ -277,6 +278,24 @@ interface ConcurrentIterationResult {
   runDurationMs: number[];
   ttfsMs: number[];
   stepsPerSecond: number;
+}
+
+interface BenchAgentResult {
+  agentStartedAt: number;
+  completedAt: number;
+  stepCount: number;
+  toolCallCount: number;
+  lastStepText: string | undefined;
+}
+
+interface AgentIterationResult {
+  runId: string;
+  /** Workflow trigger to completed DurableAgent execution. */
+  e2eMs: number;
+  /** Time spent inside DurableAgent, excluding workflow dispatch. */
+  executionMs: number;
+  /** Workflow trigger to DurableAgent body entry. */
+  dispatchMs: number;
 }
 
 /** Response shape of the in-deployment `POST /api/bench` trigger route. */
@@ -629,6 +648,54 @@ async function runConcurrentIteration(
   };
 }
 
+async function runAgentIteration(
+  workflowFn: 'benchAgentBasicWorkflow' | 'benchAgentToolLoopWorkflow',
+  expected: {
+    stepCount: number;
+    toolCallCount: number;
+    lastStepText: string;
+  }
+): Promise<AgentIterationResult> {
+  const { runId, clientStart } = await triggerBenchRun(workflowFn);
+  try {
+    const returnValue = await withTimeout(
+      getReturnValue(runId),
+      RUN_TIMEOUT_MS,
+      `${workflowFn} returnValue (run ${runId})`
+    );
+    const result = returnValue as Partial<BenchAgentResult> | undefined;
+    if (
+      !result ||
+      typeof result.agentStartedAt !== 'number' ||
+      typeof result.completedAt !== 'number' ||
+      typeof result.stepCount !== 'number' ||
+      typeof result.toolCallCount !== 'number'
+    ) {
+      throw new Error(
+        `Run ${runId} returned a malformed agent result: ${JSON.stringify(returnValue)?.slice(0, 300)}`
+      );
+    }
+    if (
+      result.stepCount !== expected.stepCount ||
+      result.toolCallCount !== expected.toolCallCount ||
+      result.lastStepText !== expected.lastStepText
+    ) {
+      throw new Error(
+        `Run ${runId} failed agent correctness: ${JSON.stringify(result)}`
+      );
+    }
+    return {
+      runId,
+      e2eMs: Math.max(0, result.completedAt - clientStart),
+      executionMs: Math.max(0, result.completedAt - result.agentStartedAt),
+      dispatchMs: Math.max(0, result.agentStartedAt - clientStart),
+    };
+  } catch (error) {
+    (error as Error).message += ` (run ${runId})`;
+    throw error;
+  }
+}
+
 /**
  * Runs recorded iterations (plus warmups) sequentially — concurrency would
  * contend on the same deployment and skew latencies. Failed iterations are
@@ -742,6 +809,54 @@ interface MetricRow extends MetricStats {
 const metricRows: MetricRow[] = [];
 let backendMetricsBefore: BackendMetricsSnapshot | undefined;
 
+interface ScenarioBackendUsage {
+  scenario: string;
+  before: BackendMetricsSnapshot | undefined;
+  after: BackendMetricsSnapshot | undefined;
+  delta: Record<string, number> | undefined;
+  derived: Record<string, number> | undefined;
+}
+
+const scenarioBackendUsage: ScenarioBackendUsage[] = [];
+
+async function recordScenarioBackendUsage<T>(
+  scenario: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const before = await captureBackendMetrics();
+  try {
+    return await operation();
+  } finally {
+    const after = await captureBackendMetrics();
+    const delta = diffBackendMetrics(before, after);
+    scenarioBackendUsage.push({
+      scenario,
+      before,
+      after,
+      delta,
+      derived: deriveBackendMetrics(delta),
+    });
+  }
+}
+
+async function runMeasuredAgentScenario<T>(
+  scenario: string,
+  iteration: () => Promise<T>
+): Promise<T[]> {
+  for (let i = 0; i < WARMUP_ITERATIONS; i++) {
+    try {
+      await iteration();
+    } catch (error) {
+      console.warn(`[bench] ${scenario} warmup ${i + 1} failed:`, error);
+    }
+  }
+  return recordScenarioBackendUsage(scenario, () =>
+    runScenario(scenario, AGENT_ITERATIONS, iteration, {
+      warmupIterations: 0,
+    })
+  );
+}
+
 function recordMetric(
   metric: string,
   scenario: string,
@@ -787,6 +902,8 @@ const SCENARIO_CATCHUP_FULL = 'retained stream (full)';
 const SCENARIO_CATCHUP_RESUME = 'retained stream (resume)';
 const SCENARIO_CONCURRENT =
   `${CONCURRENT_RUN_COUNT} concurrent x ${CONCURRENT_STEP_COUNT} steps`;
+const SCENARIO_AGENT_BASIC = 'agent basic';
+const SCENARIO_AGENT_TOOL_LOOP = 'agent tool loop (3 tools)';
 const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STEP,
@@ -831,6 +948,16 @@ const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_CONCURRENT,
     description: `${CONCURRENT_RUN_COUNT} workflows execute ${CONCURRENT_STEP_COUNT} sequential no-op steps each; reports makespan, per-run TTFS/duration, and aggregate logical step throughput`,
+  },
+  {
+    name: SCENARIO_AGENT_BASIC,
+    description:
+      'official DurableAgent lifecycle with @workflow/ai/test mockTextModel: one deterministic model turn streamed through the default output, with no tool call or external model latency',
+  },
+  {
+    name: SCENARIO_AGENT_TOOL_LOOP,
+    description:
+      'official DurableAgent lifecycle with @workflow/ai/test mockSequenceModel: four deterministic model turns interleaved with three durable workflow tool steps, excluding external model latency',
   },
 ];
 
@@ -1053,6 +1180,68 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
     }
   );
 
+  test(
+    'scenario: DurableAgent basic',
+    { timeout: 30 * 60_000 },
+    async () => {
+      const results = await runMeasuredAgentScenario(
+        SCENARIO_AGENT_BASIC,
+        () =>
+          runAgentIteration('benchAgentBasicWorkflow', {
+            stepCount: 1,
+            toolCallCount: 0,
+            lastStepText: 'Agent baseline complete.',
+          })
+      );
+      recordMetric(
+        'agent-e2e',
+        SCENARIO_AGENT_BASIC,
+        results.map((result) => result.e2eMs)
+      );
+      recordMetric(
+        'agent-execution',
+        SCENARIO_AGENT_BASIC,
+        results.map((result) => result.executionMs)
+      );
+      recordMetric(
+        'agent-dispatch',
+        SCENARIO_AGENT_BASIC,
+        results.map((result) => result.dispatchMs)
+      );
+    }
+  );
+
+  test(
+    'scenario: DurableAgent three-tool loop',
+    { timeout: 30 * 60_000 },
+    async () => {
+      const results = await runMeasuredAgentScenario(
+        SCENARIO_AGENT_TOOL_LOOP,
+        () =>
+          runAgentIteration('benchAgentToolLoopWorkflow', {
+            stepCount: 4,
+            toolCallCount: 3,
+            lastStepText: 'All done!',
+          })
+      );
+      recordMetric(
+        'agent-e2e',
+        SCENARIO_AGENT_TOOL_LOOP,
+        results.map((result) => result.e2eMs)
+      );
+      recordMetric(
+        'agent-execution',
+        SCENARIO_AGENT_TOOL_LOOP,
+        results.map((result) => result.executionMs)
+      );
+      recordMetric(
+        'agent-dispatch',
+        SCENARIO_AGENT_TOOL_LOOP,
+        results.map((result) => result.dispatchMs)
+      );
+    }
+  );
+
   test('scenario: sequential steps', { timeout: 60 * 60_000 }, async () => {
     const results = await runScenario(
       SCENARIO_SEQUENTIAL,
@@ -1128,6 +1317,7 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
         concurrentIterations: CONCURRENT_ITERATIONS,
         concurrentRunCount: CONCURRENT_RUN_COUNT,
         concurrentStepCount: CONCURRENT_STEP_COUNT,
+        agentIterations: AGENT_ITERATIONS,
         warmupIterations: WARMUP_ITERATIONS,
       },
       scenarios: SCENARIO_DESCRIPTIONS,
@@ -1143,6 +1333,7 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
           diffBackendMetrics(backendMetricsBefore, backendMetricsAfter)
         ),
       },
+      scenarioBackendUsage,
       runtimeProfile,
     };
     fs.writeFileSync(outputPath, JSON.stringify(results, null, 2));

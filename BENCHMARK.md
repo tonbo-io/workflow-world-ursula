@@ -58,6 +58,11 @@ The Ursula extension adds:
 - **retained-first**: opening a closed stream to its first decoded chunk;
 - **retained-drain**: draining a closed stream from either record zero or a
   resume index.
+- **agent-e2e**: in-deployment trigger to completed DurableAgent execution;
+- **agent-execution**: time inside DurableAgent, excluding workflow dispatch;
+- **agent-dispatch**: in-deployment trigger to DurableAgent body entry.
+
+The agent scenarios are derived from Vercel Workflow's official `100_durable_agent_e2e.ts` and use `DurableAgent` with the official `@workflow/ai/test` mock providers. They exercise the real model-step, tool-step, default-stream, queue, and World persistence lifecycle without including external model latency. The earlier `97_bench.ts` structured-stream scenario remains a synthetic AI-SDK-shaped payload benchmark; it is not presented as a complete agent.
 
 The shared retained-stream scenarios write, close, and immediately replay the
 stream, so they measure **hot retained replay** consistently across all
@@ -113,6 +118,8 @@ validation separately so provider variance does not dominate storage results.
 | 1,000 retained chunks from record 900 | reconnect/resume behavior |
 | 1,000 cold retained chunks from record 0/900 | S3 replay after a verified flush and fresh reader |
 | 100 concurrent 50-step runs | queue fairness and backend contention |
+| DurableAgent with one mock model turn | minimum production-shaped agent lifecycle |
+| DurableAgent with four mock model turns and three tool steps | multi-turn agent persistence, streaming, and tool-loop overhead |
 | 10K completed runs plus active runs | observability/list projection cost |
 | worker restart during write and claim | idempotency and redelivery correctness |
 
@@ -183,15 +190,7 @@ distributions and the top 50 self-time frames from every pod in
 setting; CPU-profiled results should not be compared with older unprofiled
 results as if the methodology were identical.
 
-The benchmark build also marks the installed `@workflow/world` package as
-side-effect-free before bundling. The package consists of declarations,
-schemas, constants, and pure helpers, but its published manifest currently
-omits this metadata. Without it, importing the `Run` serde registration entry
-causes esbuild to retain the whole World barrel, including Zod and every
-locale, in the code evaluated by every deterministic replay. A post-build guard
-requires the VM bundle to contain no Zod runtime and remain below 100 KiB. This
-is a symmetric Workflow runtime optimization applied to both Ursula and
-Postgres images, not an Ursula-only benchmark shortcut.
+The benchmark build also marks the installed `@workflow/world` package as side-effect-free before bundling. The package consists of declarations, schemas, constants, and pure helpers, but its published manifest currently omits this metadata. Without it, importing the `Run` serde registration entry causes esbuild to retain the whole World barrel in the code evaluated by every deterministic replay. DurableAgent legitimately brings the AI SDK and Zod into the VM, so the post-build guard now checks directly that neither `@workflow/world` nor `@tonbo-io/world-ursula` implementation code leaked into the bundle and enforces a 1 MiB budget around the measured official agent workload. This is a symmetric Workflow runtime optimization applied to both Ursula and Postgres images, not an Ursula-only benchmark shortcut.
 
 The repository's EKS manifests implement this matrix directly:
 
@@ -208,6 +207,8 @@ the artifact. The JSON includes a `backendUsage` before/after/delta block:
 Ursula reports append, mutation, cold-upload, and GC counters; Postgres reports
 database bytes, transactions, block activity, tuple activity, and temporary
 I/O.
+
+The result JSON also includes `scenarioBackendUsage` for the two agent scenarios. This is the unit-cost baseline: it records the marginal Ursula append/replication counters or PostgreSQL transaction/tuple counters for a fixed number of successful, correctness-checked agent runs.
 
 ## Cost collection
 

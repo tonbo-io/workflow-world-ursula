@@ -1,5 +1,9 @@
 import { start } from 'workflow/api';
 import {
+  benchAgentBasicWorkflow,
+  benchAgentToolLoopWorkflow,
+} from '../../../workflows/100_agent_bench';
+import {
   benchHookStreamWorkflow,
   benchSequentialStepsWorkflow,
   benchSequentialStepsWorkflow1,
@@ -17,6 +21,8 @@ import {
 } from '../../../workflows/97_bench';
 
 const workflows = {
+  benchAgentBasicWorkflow,
+  benchAgentToolLoopWorkflow,
   benchHookStreamWorkflow,
   benchSequentialStepsWorkflow,
   benchSequentialStepsWorkflow1,
