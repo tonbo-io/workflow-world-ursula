@@ -54,6 +54,45 @@ describe('Ursula Workflow streamer', () => {
     expect(headers.get('producer-seq')).toBe('0');
   });
 
+  it('uses one length-prefixed append-batch frame after stream creation', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(
+        response(
+          '[{"status":204,"stream_record_start":1,"stream_record_next":3}]',
+          { status: 200 }
+        )
+      );
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await streamer.streams.write('wrun_1', 'output', 'first');
+    await streamer.streams.writeMulti?.('wrun_1', 'output', [
+      'second',
+      'third',
+    ]);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const append = fetch.mock.calls[2];
+    const request = append?.[1] as RequestInit;
+    expect(append?.[0]?.toString()).toMatch(/\/append-batch$/);
+    expect(request.method).toBe('POST');
+    const body = Buffer.from(request.body as ArrayBuffer);
+    const payloadLength = body.readUInt32BE(0);
+    expect(payloadLength).toBe(body.length - 4);
+    expect(JSON.parse(body.subarray(4).toString())).toEqual([
+      { v: 1, data: 'c2Vjb25k' },
+      { v: 1, data: 'dGhpcmQ=' },
+    ]);
+    const headers = new Headers(request.headers);
+    expect(headers.get('prefer')).toBe('return=minimal');
+    expect(headers.get('producer-seq')).toBe('1');
+  });
+
   it('does not serialize a data append behind stream registration', async () => {
     let finishRegistration: ((value: Response) => void) | undefined;
     const registration = new Promise<Response>((resolve) => {
@@ -90,7 +129,7 @@ describe('Ursula Workflow streamer', () => {
       .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockRejectedValueOnce(new Error('connection reset'))
       .mockResolvedValueOnce(response(null, { status: 200 }))
-      .mockResolvedValueOnce(response(null, { status: 200 }));
+      .mockResolvedValueOnce(response('[{"status":204}]', { status: 200 }));
     const streamer = createStreamer({
       baseUrl: 'https://ursula.test',
       fetch,
@@ -139,9 +178,13 @@ describe('Ursula Workflow streamer', () => {
   });
 
   it('restarts the producer sequence when a closed stream is retried locally', async () => {
-    const fetch = vi
-      .fn<typeof globalThis.fetch>()
-      .mockResolvedValue(response(null, { status: 200 }));
+    const fetch = vi.fn<typeof globalThis.fetch>((input) =>
+      Promise.resolve(
+        input.toString().endsWith('/append-batch')
+          ? response('[{"status":204}]', { status: 200 })
+          : response(null, { status: 200 })
+      )
+    );
     const streamer = createStreamer({
       baseUrl: 'https://ursula.test',
       fetch,
@@ -469,6 +512,9 @@ describe('Ursula Workflow streamer', () => {
             { once: true }
           );
         });
+      }
+      if (input.toString().endsWith('/append-batch')) {
+        return Promise.resolve(response('[{"status":204}]', { status: 200 }));
       }
       return Promise.resolve(response(null, { status: 201 }));
     });
