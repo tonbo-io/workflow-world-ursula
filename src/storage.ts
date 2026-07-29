@@ -732,15 +732,32 @@ export function createStorage(
           data.eventData.workflowName !== undefined &&
           data.eventData.input !== undefined;
         const createsRun = data.eventType === 'run_created' || lazyRunStart;
-        const initialState = createsRun
+        const initialState =
+          data.eventType === 'run_created'
           ? Promise.all([
               registry.register(effectiveRunId, new Date()),
               journal.loadForMutation(effectiveRunId, {
-                assumeEmpty: data.eventType === 'run_created',
+                assumeEmpty: true,
                 createIfMissing: true,
               }),
             ]).then(([, state]) => state)
-          : undefined;
+          : lazyRunStart
+            ? journal
+                .loadForMutation(effectiveRunId, {
+                  createIfMissing: true,
+                })
+                .then(async (state) => {
+                  // A normal run_started follows run_created, whose registry
+                  // entry is already durable. Register only when this is the
+                  // compatibility path that creates a genuinely missing run;
+                  // otherwise every process boundary emits a deduplicated but
+                  // still expensive registry append.
+                  if (!state.run) {
+                    await registry.register(effectiveRunId, new Date());
+                  }
+                  return state;
+                })
+            : undefined;
         let assumeEmpty = data.eventType === 'run_created';
         for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
           const state =

@@ -19,6 +19,7 @@ class MemoryClient {
   failNextReadAt?: number;
   failedReads = 0;
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
+  readonly reads: Array<{ stream: string; start: number; limit: number }> = [];
   readonly tailReads: string[] = [];
   readonly retainedRecords: Array<{ stream: string; record: number }> = [];
   private readonly streams = new Map<string, unknown[]>();
@@ -143,6 +144,7 @@ class MemoryClient {
     closed: boolean;
     upToDate: boolean;
   }> {
+    this.reads.push({ stream, start, limit });
     const values = this.streams.get(stream) ?? [];
     if (this.failNextReadAt === start) {
       this.failNextReadAt = undefined;
@@ -172,7 +174,7 @@ class MemoryClient {
       records,
       nextRecord: start + records.length,
       closed: false,
-      upToDate: true,
+      upToDate: start + records.length >= values.length,
     };
   }
 
@@ -208,6 +210,31 @@ describe('RunJournal', () => {
     expect(next.nextRecord).toBe(1);
     expect(client.tailReads).toEqual([]);
     expect(client.readAllStarts).toEqual([]);
+  });
+
+  it('materializes a short cold run without probing its checkpoint stream', async () => {
+    const client = new MemoryClient();
+    const writer = new RunJournal(client as unknown as UrsulaClient);
+    const state = await writer.loadForMutation('wrun_short_cold', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    await writer.append(state, {
+      operationId: 'short-cold-1',
+      events: [],
+    });
+
+    const reader = new RunJournal(client as unknown as UrsulaClient);
+    await expect(reader.load('wrun_short_cold')).resolves.toMatchObject({
+      nextRecord: 1,
+    });
+    expect(client.tailReads).toEqual([]);
+    expect(client.readAllStarts).toEqual([]);
+    expect(client.reads).toContainEqual({
+      stream: expect.stringMatching(/^run-/),
+      start: 0,
+      limit: 128,
+    });
   });
 
   it('serves events through a known commit without an empty tail read', async () => {
@@ -278,18 +305,16 @@ describe('RunJournal', () => {
   it('commits an event and its resulting run state in one guarded record', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(response('missing', { status: 404 }))
-      .mockResolvedValueOnce(response('', { status: 200 }))
-      .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockResolvedValueOnce(
         response(null, {
-          status: 200,
+          status: 204,
           headers: {
-            'stream-record-start': '0',
-            'stream-record-next': '1',
+            'stream-record-next': '0',
+            'stream-up-to-date': 'true',
           },
         })
       )
+      .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockResolvedValueOnce(
         response(null, {
           status: 204,
@@ -337,7 +362,7 @@ describe('RunJournal', () => {
     expect(await journal.events('wrun_1')).toEqual([event]);
     expect(state.run).toEqual(run);
     expect(state.nextRecord).toBe(1);
-    const append = fetch.mock.calls[2];
+    const append = fetch.mock.calls[1];
     const headers = new Headers(append?.[1]?.headers);
     expect(append?.[1]?.method).toBe('PUT');
     expect(headers.has('stream-record-match')).toBe(false);
@@ -631,10 +656,10 @@ describe('RunJournal', () => {
       await journal.load(`wrun_lru_${index}`, { createIfMissing: true });
     }
 
-    client.readAllStarts.length = 0;
+    client.reads.length = 0;
     await journal.load('wrun_lru_0');
     expect(
-      client.readAllStarts.some(
+      client.reads.some(
         ({ stream }) =>
           stream.startsWith('run-') && !stream.startsWith('run-checkpoint-')
       )
@@ -645,10 +670,10 @@ describe('RunJournal', () => {
       createIfMissing: true,
       cache: false,
     });
-    client.readAllStarts.length = 0;
+    client.reads.length = 0;
     await journal.load('wrun_scan');
     expect(
-      client.readAllStarts.some(
+      client.reads.some(
         ({ stream }) =>
           stream.startsWith('run-') && !stream.startsWith('run-checkpoint-')
       )

@@ -9,6 +9,7 @@ import type {
 const DEFAULT_BUCKET = 'workflow';
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 1000;
+const DEFAULT_STREAM_FLUSH_INTERVAL_MS = 10;
 // Leave enough headroom for gateways whose response-header timeout is 30s.
 // New Ursula gateways extend their timeout for long-poll requests, but this
 // default also keeps the adapter reliable with older releases and other
@@ -53,7 +54,7 @@ export interface UrsulaStreamerConfig {
   longPollTimeoutMs?: number;
   /**
    * Time Workflow waits to coalesce adjacent chunks before calling
-   * `writeMulti`. Set to `0` for immediate flushes.
+   * `writeMulti`. Defaults to `10`; set to `0` for immediate flushes.
    */
   streamFlushIntervalMs?: number;
   /** Fetch implementation override for tests or custom transports. */
@@ -502,9 +503,8 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
   }
 
   return {
-    ...(config.streamFlushIntervalMs !== undefined && {
-      streamFlushIntervalMs: config.streamFlushIntervalMs,
-    }),
+    streamFlushIntervalMs:
+      config.streamFlushIntervalMs ?? DEFAULT_STREAM_FLUSH_INTERVAL_MS,
     streams: {
       async write(runId, name, chunk) {
         await append(await runId, name, [encodeChunk(chunk)]);

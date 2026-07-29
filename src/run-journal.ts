@@ -1022,22 +1022,43 @@ export class RunJournal {
       }
     }
 
-    const state = await this.loadCheckpoint(runId);
+    // Most Workflow runs finish well before the first checkpoint boundary.
+    // Read that bounded prefix first so a cold process can materialize a short
+    // run with one request instead of probing a checkpoint stream that cannot
+    // exist and then reading the source journal. Long runs still resume from
+    // their latest checkpoint; the bounded prefix is discarded once Ursula
+    // reports that more source records remain.
+    const prefix = emptyState(runId);
     try {
-      this.applyRecords(
-        state,
-        await this.client.readAll<unknown>(stream, state.nextRecord)
+      const page = await this.client.read<unknown>(
+        stream,
+        0,
+        CHECKPOINT_INTERVAL_RECORDS
       );
+      if (
+        page.upToDate &&
+        page.records.length < CHECKPOINT_INTERVAL_RECORDS
+      ) {
+        this.applyRecords(prefix, page.records);
+        if (useCache) this.rememberState(runId, prefix);
+        return useCache ? cloneState(prefix) : prefix;
+      }
     } catch (error) {
       if (
         options.createIfMissing &&
         isUrsulaRequestError(error, 404)
       ) {
-        if (useCache) this.rememberState(runId, state);
-        return useCache ? cloneState(state) : state;
+        if (useCache) this.rememberState(runId, prefix);
+        return useCache ? cloneState(prefix) : prefix;
       }
       throw error;
     }
+
+    const state = await this.loadCheckpoint(runId);
+    this.applyRecords(
+      state,
+      await this.client.readAll<unknown>(stream, state.nextRecord)
+    );
     if (useCache) this.rememberState(runId, state);
     return useCache ? cloneState(state) : state;
   }

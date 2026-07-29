@@ -133,7 +133,7 @@ rather than throughput.
 | `WORKFLOW_URSULA_QUEUE_DISPATCHER_ENABLED` | Set to `0` on request-serving replicas when a smaller redundant dispatcher pool handles queue claims; default `1` |
 | `WORKFLOW_URSULA_QUEUE_DELIVERY_URL` | Workflow HTTP origin for queue delivery; defaults to `localhost:$PORT` |
 | `WORKFLOW_URSULA_LONG_POLL_TIMEOUT_MS` | Stream live-read timeout |
-| `WORKFLOW_URSULA_STREAM_FLUSH_INTERVAL_MS` | Workflow chunk coalescing window; use `0` for immediate flushes |
+| `WORKFLOW_URSULA_STREAM_FLUSH_INTERVAL_MS` | Workflow chunk coalescing window, default `10` ms; use `0` for immediate flushes |
 | `WORKFLOW_URSULA_QUEUE_POLL_INTERVAL_MS` | Retry delay after a dispatcher wake/read error; normal delivery is wake-driven |
 | `WORKFLOW_URSULA_QUEUE_LEASE_DURATION_MS` | Queue message lease duration |
 | `WORKFLOW_URSULA_QUEUE_RETRY_DELAY_MS` | Default retry delay |
