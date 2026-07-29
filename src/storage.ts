@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   EntityConflictError,
   HookNotFoundError,
+  PreconditionFailedError,
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
@@ -33,7 +34,7 @@ import {
   RunExecutionCoordinator,
   type StagedStepStart,
 } from './execution.js';
-import { HookClaims } from './hook-claims.js';
+import { HookClaims, isExpiredReservation } from './hook-claims.js';
 import { materializeEvent } from './reducer.js';
 import { RunRegistry } from './registry.js';
 import {
@@ -372,6 +373,23 @@ export function createStorage(
       if (error instanceof WorkflowRunNotFoundError) return;
       throw error;
     }
+    // An orphan: the owner reserved the token, then died before appending the
+    // run record that would have finalized the claim. The run itself is
+    // usually still alive, so the terminal-run path below never sees it and
+    // the token would stay unavailable forever.
+    //
+    // The owner journal is the arbiter. A Hook present there means the run
+    // record did land and only the claim's `committed` transition was lost —
+    // the claim is legitimate, so leave it. No Hook means the owner never got
+    // that far and the token is free.
+    if (isExpiredReservation(claim) && !state.hooks.has(claim.hookId)) {
+      await hookClaims.release(
+        token,
+        { runId: claim.runId, hookId: claim.hookId },
+        `reconcile-orphan:${claim.operationId}`
+      );
+      return;
+    }
     if (!state.run || !isTerminalWorkflowRunStatus(state.run.status)) return;
     const hook = state.hooks.get(claim.hookId);
     if (hook) {
@@ -423,9 +441,14 @@ export function createStorage(
     if (existing) return existing.result;
     const state = await journal.loadForMutation(runId);
     if (lease && !ownsExecutionLease(state, lease)) {
-      throw new EntityConflictError(
-        `Execution lease for run "${runId}" changed ownership`
-      );
+      // The lease only fences the atomic staged-step optimization; it is not a
+      // precondition for starting a step. Declining to stage falls through to
+      // the ordinary create path, which carries its own CAS and is always
+      // correct. Failing here instead would drop the step: the runtime has no
+      // recovery for an `EntityConflictError` raised by a step start, so the
+      // step stays `pending` forever and its run never completes.
+      coordinator.releaseLane(runId, lease.lane);
+      return;
     }
     const operationId = mutationOperationId(
       state,
@@ -534,6 +557,9 @@ export function createStorage(
         try {
           await journal.append(state, commit);
           coordinator.finish(runId, stepId);
+          if (lease?.lane.startsWith('step:')) {
+            coordinator.releaseLane(runId, lease.lane);
+          }
           return withEventPage(
             terminal.result,
             runId,
@@ -543,12 +569,12 @@ export function createStorage(
             state.nextRecord
           );
         } catch (error) {
-          if (
-            isUrsulaRequestError(error, 412) &&
-            attempt + 1 < MAX_COMMIT_RETRIES
-          ) {
+          if (isUrsulaRequestError(error, 412)) {
             journal.evict(runId);
-            continue;
+            if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+            throw new PreconditionFailedError(
+              `Run "${runId}" changed while committing step "${stepId}": ${error.message}`
+            );
           }
           throw error;
         }
@@ -771,13 +797,13 @@ export function createStorage(
               state.nextRecord
             );
           } catch (error) {
-            if (
-              isUrsulaRequestError(error, 412) &&
-              attempt + 1 < MAX_COMMIT_RETRIES
-            ) {
+            if (isUrsulaRequestError(error, 412)) {
               journal.evict(effectiveRunId);
               assumeEmpty = false;
-              continue;
+              if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+              throw new PreconditionFailedError(
+                `Run "${effectiveRunId}" changed while committing "${data.eventType}": ${error.message}`
+              );
             }
             throw error;
           }

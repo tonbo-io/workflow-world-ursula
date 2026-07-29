@@ -182,13 +182,13 @@ describe('Ursula queue runtime', () => {
 
   it('persists timeout redelivery with the same message ID', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
-    const queueName = '__wkf_step_retry' as ValidQueueName;
+    const queueName = '__wkf_workflow_retry' as ValidQueueName;
     const queue = createQueue(client, {
       pollIntervalMs: 5,
       leaseDurationMs: 50,
     });
     const attempts: Array<{ attempt: number; messageId: string }> = [];
-    queue.createQueueHandler('__wkf_step_', async (_message, meta) => {
+    queue.createQueueHandler('__wkf_workflow_', async (_message, meta) => {
       attempts.push(meta);
       return meta.attempt === 1 ? { timeoutSeconds: 0 } : undefined;
     });
@@ -206,13 +206,13 @@ describe('Ursula queue runtime', () => {
 
   it('wakes at a persisted retry deadline without waiting for the poll fallback', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
-    const queueName = '__wkf_step_deadline' as ValidQueueName;
+    const queueName = '__wkf_workflow_deadline' as ValidQueueName;
     const queue = createQueue(client, {
       pollIntervalMs: 10_000,
       leaseDurationMs: 1_000,
     });
     const attempts: number[] = [];
-    queue.createQueueHandler('__wkf_step_', async (_message, meta) => {
+    queue.createQueueHandler('__wkf_workflow_', async (_message, meta) => {
       attempts.push(meta.attempt);
       return meta.attempt === 1 ? { timeoutSeconds: 0.05 } : undefined;
     });
@@ -269,6 +269,29 @@ describe('Ursula queue runtime', () => {
       timeout: 500,
     });
     await queue.close();
+  });
+
+  it('routes a namespaced queue topic to its handler', async () => {
+    // eve derives a per-agent queue namespace and exports it as
+    // WORKFLOW_QUEUE_NAMESPACE, so every topic it enqueues carries one.
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const prefix = '__eve6167656e74_wkf_workflow_';
+    const queueName = `${prefix}namespaced` as ValidQueueName;
+    const queue = createQueue(client, {
+      pollIntervalMs: 10_000,
+      leaseDurationMs: 1_000,
+    });
+    const handler = vi.fn().mockResolvedValue(undefined);
+    queue.createQueueHandler(prefix, handler);
+    await queue.start();
+
+    await queue.queue(queueName, { runId: 'run-namespaced' });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce(), {
+      timeout: 500,
+    });
+    await queue.close();
+
+    expect(handler.mock.calls[0]?.[1]).toMatchObject({ queueName });
   });
 
   it('wakes a separate dispatcher instance through Ursula long polling', async () => {

@@ -16,13 +16,23 @@ const [bundle, metadata] = await Promise.all([
   stat(bundlePath),
 ]);
 
-if (bundle.includes('node_modules/.pnpm/zod@')) {
+const forbiddenWorldMarkers = [
+  'node_modules/.pnpm/@workflow+world@',
+  'node_modules/.pnpm/@tonbo-io+world-ursula',
+];
+const leakedWorldMarker = forbiddenWorldMarkers.find((marker) =>
+  bundle.includes(marker)
+);
+if (leakedWorldMarker) {
   throw new Error(
-    'Workflow VM bundle still contains Zod; @workflow/world tree-shaking regressed'
+    `Workflow VM bundle contains World implementation code (${leakedWorldMarker}); tree-shaking regressed`
   );
 }
 
-const maxBytes = 100 * 1024;
+// DurableAgent intentionally brings the AI SDK and Zod into the workflow VM.
+// Keep a regression budget around the measured official agent workload while
+// separately asserting above that the World implementation itself stayed out.
+const maxBytes = 1024 * 1024;
 if (metadata.size > maxBytes) {
   throw new Error(
     `Workflow VM bundle is ${metadata.size} bytes, above the ${maxBytes}-byte regression budget`
@@ -30,5 +40,5 @@ if (metadata.size > maxBytes) {
 }
 
 console.log(
-  `[bench] workflow VM bundle is ${metadata.size} bytes and contains no Zod runtime`
+  `[bench] workflow VM bundle is ${metadata.size} bytes and contains no World implementation code`
 );

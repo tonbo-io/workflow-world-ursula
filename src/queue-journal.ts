@@ -134,15 +134,12 @@ function checkpointStream(
 }
 
 export function queueConcurrencyKey(message: QueuePayload): string {
-  if ('runId' in message) {
-    return message.stepId
-      ? `run:${message.runId}:step:${message.stepId}`
-      : `run:${message.runId}:workflow`;
-  }
-  if ('workflowRunId' in message) {
-    return `run:${message.workflowRunId}:step:${message.stepId}`;
-  }
-  return `health:${message.correlationId}`;
+  // Health probes must be matched first. They carry an optional `runId`, so a
+  // `'runId' in message` test no longer separates them from an invoke payload.
+  if ('__healthCheck' in message) return `health:${message.correlationId}`;
+  return message.stepId
+    ? `run:${message.runId}:step:${message.stepId}`
+    : `run:${message.runId}:workflow`;
 }
 
 export function queuePartition(

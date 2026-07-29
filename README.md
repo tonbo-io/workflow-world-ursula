@@ -35,6 +35,57 @@ No delegate database or queue is required. `withUrsulaStreams()` remains
 available only as an incremental migration helper for an existing custom
 World.
 
+## Use with eve
+
+[eve](https://eve.dev) selects a Workflow world by package name in the root
+`agent/agent.ts`:
+
+```ts
+import { defineAgent } from 'eve';
+
+export default defineAgent({
+  model: 'openai/gpt-5.4-mini',
+  experimental: { workflow: { world: '@tonbo-io/world-ursula' } },
+});
+```
+
+Supply the connection through the environment; eve calls `createWorld()` with
+no arguments, so every option has to come from `WORKFLOW_URSULA_*`:
+
+```bash
+export WORKFLOW_URSULA_URL=https://ursula.example.com
+export WORKFLOW_URSULA_TOKEN=...
+export WORKFLOW_URSULA_BUCKET=workflow
+```
+
+That is the whole integration. `eve build && eve start` then runs sessions,
+turns, hooks and streams on Ursula with no other managed service.
+
+Four things are worth knowing before deploying it:
+
+**Version line.** At boot eve compares this package's declared `@workflow/core`
+or `@workflow/world` dependency against the `@workflow/core` it bundles, and
+refuses to start on a major or prerelease-tag mismatch. Track the version eve
+pins; see [DESIGN.md](./DESIGN.md) for what a spec-version change implies for
+committed journals.
+
+**Queue delivery URL.** The dispatcher posts to Workflow's HTTP routes.
+`eve start` exports `PORT`, which the default `localhost:$PORT` resolves
+against. A custom host that serves the Nitro output directly may not, so set
+`WORKFLOW_URSULA_QUEUE_DELIVERY_URL` to the origin serving
+`/.well-known/workflow/v1/*` whenever eve is not the process manager.
+
+**Queue namespace.** eve derives a per-agent queue namespace and exports it as
+`WORKFLOW_QUEUE_NAMESPACE`, so topics arrive as
+`__eve<hex>_wkf_workflow_<name>`. Nothing to configure — noted because queue
+stream names are derived from the full topic, so two agents never share a
+journal.
+
+**Shutdown.** eve awaits `start()` but never calls `close()`, so
+`WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS` does not apply under eve: in-flight
+handlers end with the process. Committed state is unaffected — an expired lease
+is redelivered.
+
 ## Configuration
 
 | Environment variable | Purpose |

@@ -204,22 +204,13 @@ export function createQueue(
     lease: QueueLease
   ): DeliveryExecution | undefined {
     const message = lease.message.message;
-    const runId =
-      'runId' in message
-        ? message.runId
-        : 'workflowRunId' in message
-          ? message.workflowRunId
-          : undefined;
-    if (!runId) return;
-    const stepId =
-      'stepId' in message && typeof message.stepId === 'string'
-        ? message.stepId
-        : undefined;
+    // A health probe may carry a `runId`, but it never owns an execution lane.
+    if ('__healthCheck' in message) return;
     const expiresAt = lease.message.leaseExpiresAt;
     if (!expiresAt) return;
     return {
-      runId,
-      lane: stepId ? `step:${stepId}` : 'run',
+      runId: message.runId,
+      lane: message.stepId ? `step:${message.stepId}` : 'run',
       token: lease.leaseId,
       ownerMessageId: lease.message.messageId,
       attempt: lease.message.attempt,
@@ -304,12 +295,10 @@ export function createQueue(
         'Ursula queue delivery requires deliveryBaseUrl, WORKFLOW_URSULA_QUEUE_DELIVERY_URL, or PORT'
       );
     }
-    const kind = parseQueueName(queueName).kind;
     const execution = deliveryExecution(lease);
+    // Queued steps share the workflow topic and the combined flow handler.
     const response = await fetch(
-      createWorkflowUrl(baseUrl, {
-        type: kind === 'workflow' ? 'flow' : 'step',
-      }),
+      createWorkflowUrl(baseUrl, { type: 'flow' }),
       {
         method: 'POST',
         headers: {

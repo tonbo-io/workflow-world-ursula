@@ -34,7 +34,7 @@ export interface StagedStepStart {
 
 interface DeliveryContext {
   runId: string;
-  lease: RunExecutionLease;
+  lease?: RunExecutionLease;
   stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
 }
@@ -121,6 +121,23 @@ export class RunExecutionCoordinator {
   current(runId: string): RunExecutionLease | undefined {
     const context = this.contexts.getStore();
     return context?.runId === runId ? context.lease : undefined;
+  }
+
+  /**
+   * Discharges the delivery's lane fence once a commit has released it.
+   *
+   * A staged terminal commit for a `step:` lane releases that lane in the same
+   * record. The delivery keeps running afterwards — a Turbo invocation
+   * continues the orchestration inline and can commit further steps. Those
+   * later commits must not re-assert ownership of a lane this delivery
+   * deliberately gave up, or every one of them fails the ownership check and
+   * the runtime retries forever.
+   */
+  releaseLane(runId: string, lane: string): void {
+    const context = this.contexts.getStore();
+    if (context?.runId === runId && context.lease?.lane === lane) {
+      context.lease = undefined;
+    }
   }
 
   staged(runId: string, stepId: string): StagedStepStart | undefined {

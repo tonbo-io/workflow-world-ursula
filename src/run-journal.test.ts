@@ -34,6 +34,20 @@ class MemoryClient {
     }
   }
 
+  corruptLatestCheckpoint(): void {
+    for (const [stream, values] of this.streams) {
+      if (!stream.startsWith('run-checkpoint-') || values.length === 0) {
+        continue;
+      }
+      // A schema this reader does not know, as a newer writer in a rolling
+      // deployment would leave behind.
+      values[values.length - 1] = {
+        ...(values.at(-1) as Record<string, unknown>),
+        version: 2,
+      };
+    }
+  }
+
   runRecordValues(): unknown[] {
     return [...this.streams.entries()]
       .filter(
@@ -432,6 +446,36 @@ describe('RunJournal', () => {
     await expect(reader.load(runId)).resolves.toMatchObject({
       steps: new Map([[stepId, step]]),
     });
+  });
+
+  it('replays the full journal when the latest checkpoint cannot be decoded', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.load('wrun_undecodable');
+    for (let index = 0; index < 128; index += 1) {
+      await journal.append(state, {
+        operationId: `commit-${index}`,
+        events: [],
+      });
+    }
+    await journal.flushCheckpoints();
+    client.corruptLatestCheckpoint();
+
+    client.readAllStarts.length = 0;
+    const restarted = new RunJournal(client as unknown as UrsulaClient);
+
+    // Source records are never truncated, so an unreadable checkpoint costs
+    // replay time rather than the run.
+    const restored = await restarted.load('wrun_undecodable');
+    expect(restored.nextRecord).toBe(128);
+    expect(
+      client.readAllStarts.some(
+        ({ stream, start }) =>
+          stream.startsWith('run-') &&
+          !stream.startsWith('run-checkpoint-') &&
+          start === 0
+      )
+    ).toBe(true);
   });
 
   it('resumes cold-start materialization from the latest checkpoint', async () => {
