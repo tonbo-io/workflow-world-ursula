@@ -6,6 +6,14 @@ function response(body: BodyInit | null, init: ResponseInit = {}): Response {
 }
 
 describe('Ursula Workflow streamer', () => {
+  it('coalesces adjacent chunks for 10ms by default', () => {
+    const streamer = createStreamer({
+      baseUrl: 'https://ursula.test',
+    });
+
+    expect(streamer.streamFlushIntervalMs).toBe(10);
+  });
+
   it('exposes the configured Workflow chunk coalescing interval', () => {
     const streamer = createStreamer({
       baseUrl: 'https://ursula.test',

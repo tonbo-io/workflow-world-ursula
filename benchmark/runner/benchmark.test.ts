@@ -134,6 +134,14 @@ const CONCURRENT_ITERATIONS = envInt('BENCH_CONCURRENT_ITERATIONS', 1);
 const CONCURRENT_RUN_COUNT = envInt('BENCH_CONCURRENT_RUN_COUNT', 100);
 const CONCURRENT_STEP_COUNT = envInt('BENCH_CONCURRENT_STEP_COUNT', 50);
 const AGENT_ITERATIONS = envInt('BENCH_AGENT_ITERATIONS', 20);
+const AGENT_CONCURRENT_ITERATIONS = envInt(
+  'BENCH_AGENT_CONCURRENT_ITERATIONS',
+  1
+);
+const AGENT_CONCURRENT_RUN_COUNT = envInt(
+  'BENCH_AGENT_CONCURRENT_RUN_COUNT',
+  100
+);
 const CAPACITY_ONLY = process.env.BENCH_CAPACITY_ONLY === '1';
 const CAPACITY_STEP_COUNT = envInt('BENCH_CAPACITY_STEP_COUNT', 20);
 const CAPACITY_ITERATIONS = envInt('BENCH_CAPACITY_ITERATIONS', 1);
@@ -296,6 +304,15 @@ interface AgentIterationResult {
   executionMs: number;
   /** Workflow trigger to DurableAgent body entry. */
   dispatchMs: number;
+}
+
+interface ConcurrentAgentIterationResult {
+  runIds: string[];
+  makespanMs: number;
+  e2eMs: number[];
+  executionMs: number[];
+  dispatchMs: number[];
+  logicalStepsPerSecond: number;
 }
 
 /** Response shape of the in-deployment `POST /api/bench` trigger route. */
@@ -663,27 +680,7 @@ async function runAgentIteration(
       RUN_TIMEOUT_MS,
       `${workflowFn} returnValue (run ${runId})`
     );
-    const result = returnValue as Partial<BenchAgentResult> | undefined;
-    if (
-      !result ||
-      typeof result.agentStartedAt !== 'number' ||
-      typeof result.completedAt !== 'number' ||
-      typeof result.stepCount !== 'number' ||
-      typeof result.toolCallCount !== 'number'
-    ) {
-      throw new Error(
-        `Run ${runId} returned a malformed agent result: ${JSON.stringify(returnValue)?.slice(0, 300)}`
-      );
-    }
-    if (
-      result.stepCount !== expected.stepCount ||
-      result.toolCallCount !== expected.toolCallCount ||
-      result.lastStepText !== expected.lastStepText
-    ) {
-      throw new Error(
-        `Run ${runId} failed agent correctness: ${JSON.stringify(result)}`
-      );
-    }
+    const result = validateAgentResult(returnValue, runId, expected);
     return {
       runId,
       e2eMs: Math.max(0, result.completedAt - clientStart),
@@ -694,6 +691,84 @@ async function runAgentIteration(
     (error as Error).message += ` (run ${runId})`;
     throw error;
   }
+}
+
+function validateAgentResult(
+  returnValue: unknown,
+  runId: string,
+  expected: {
+    stepCount: number;
+    toolCallCount: number;
+    lastStepText: string;
+  }
+): BenchAgentResult {
+  const result = returnValue as Partial<BenchAgentResult> | undefined;
+  if (
+    !result ||
+    typeof result.agentStartedAt !== 'number' ||
+    typeof result.completedAt !== 'number' ||
+    typeof result.stepCount !== 'number' ||
+    typeof result.toolCallCount !== 'number'
+  ) {
+    throw new Error(
+      `Run ${runId} returned a malformed agent result: ${JSON.stringify(returnValue)?.slice(0, 300)}`
+    );
+  }
+  if (
+    result.stepCount !== expected.stepCount ||
+    result.toolCallCount !== expected.toolCallCount ||
+    result.lastStepText !== expected.lastStepText
+  ) {
+    throw new Error(
+      `Run ${runId} failed agent correctness: ${JSON.stringify(result)}`
+    );
+  }
+  return result as BenchAgentResult;
+}
+
+async function runConcurrentAgentIteration(): Promise<ConcurrentAgentIterationResult> {
+  const expected = {
+    stepCount: 4,
+    toolCallCount: 3,
+    lastStepText: 'All done!',
+  };
+  const triggers = await Promise.all(
+    Array.from({ length: AGENT_CONCURRENT_RUN_COUNT }, () =>
+      triggerBenchRun('benchAgentToolLoopWorkflow')
+    )
+  );
+  const completed = await Promise.all(
+    triggers.map(async ({ runId, clientStart }) => {
+      const returnValue = await withTimeout(
+        getReturnValue(runId),
+        RUN_TIMEOUT_MS,
+        `concurrent agent returnValue (run ${runId})`
+      );
+      return {
+        runId,
+        clientStart,
+        result: validateAgentResult(returnValue, runId, expected),
+      };
+    })
+  );
+  const firstStart = Math.min(...completed.map((run) => run.clientStart));
+  const lastEnd = Math.max(...completed.map((run) => run.result.completedAt));
+  const makespanMs = Math.max(1, lastEnd - firstStart);
+  return {
+    runIds: completed.map((run) => run.runId),
+    makespanMs,
+    e2eMs: completed.map((run) =>
+      Math.max(0, run.result.completedAt - run.clientStart)
+    ),
+    executionMs: completed.map((run) =>
+      Math.max(0, run.result.completedAt - run.result.agentStartedAt)
+    ),
+    dispatchMs: completed.map((run) =>
+      Math.max(0, run.result.agentStartedAt - run.clientStart)
+    ),
+    logicalStepsPerSecond:
+      (AGENT_CONCURRENT_RUN_COUNT * expected.stepCount * 1000) / makespanMs,
+  };
 }
 
 /**
@@ -904,6 +979,8 @@ const SCENARIO_CONCURRENT =
   `${CONCURRENT_RUN_COUNT} concurrent x ${CONCURRENT_STEP_COUNT} steps`;
 const SCENARIO_AGENT_BASIC = 'agent basic';
 const SCENARIO_AGENT_TOOL_LOOP = 'agent tool loop (3 tools)';
+const SCENARIO_AGENT_CONCURRENT =
+  `${AGENT_CONCURRENT_RUN_COUNT} concurrent agent tool loops`;
 const SCENARIO_DESCRIPTIONS = [
   {
     name: SCENARIO_STEP,
@@ -958,6 +1035,10 @@ const SCENARIO_DESCRIPTIONS = [
     name: SCENARIO_AGENT_TOOL_LOOP,
     description:
       'official DurableAgent lifecycle with @workflow/ai/test mockSequenceModel: four deterministic model turns interleaved with three durable workflow tool steps, excluding external model latency',
+  },
+  {
+    name: SCENARIO_AGENT_CONCURRENT,
+    description: `${AGENT_CONCURRENT_RUN_COUNT} concurrent official DurableAgent tool loops, each with four deterministic model turns and three durable tool calls; reports batch makespan, per-run latency, and aggregate logical agent-step throughput`,
   },
 ];
 
@@ -1242,6 +1323,56 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
     }
   );
 
+  test(
+    'scenario: concurrent DurableAgent three-tool loops',
+    { timeout: 60 * 60_000 },
+    async () => {
+      const results = await recordScenarioBackendUsage(
+        SCENARIO_AGENT_CONCURRENT,
+        () =>
+          runScenario(
+            SCENARIO_AGENT_CONCURRENT,
+            AGENT_CONCURRENT_ITERATIONS,
+            runConcurrentAgentIteration,
+            {
+              warmupIterations: 0,
+              extraAttempts: Math.max(
+                1,
+                Math.ceil(AGENT_CONCURRENT_ITERATIONS * 0.5)
+              ),
+            }
+          )
+      );
+      recordMetric(
+        'agent-concurrent-makespan',
+        SCENARIO_AGENT_CONCURRENT,
+        results.map((result) => result.makespanMs)
+      );
+      recordMetric(
+        'agent-concurrent-e2e',
+        SCENARIO_AGENT_CONCURRENT,
+        results.flatMap((result) => result.e2eMs)
+      );
+      recordMetric(
+        'agent-concurrent-execution',
+        SCENARIO_AGENT_CONCURRENT,
+        results.flatMap((result) => result.executionMs)
+      );
+      recordMetric(
+        'agent-concurrent-dispatch',
+        SCENARIO_AGENT_CONCURRENT,
+        results.flatMap((result) => result.dispatchMs)
+      );
+      recordMetric(
+        'agent-concurrent-steps-per-second',
+        SCENARIO_AGENT_CONCURRENT,
+        results.map((result) => result.logicalStepsPerSecond),
+        undefined,
+        'steps/s'
+      );
+    }
+  );
+
   test('scenario: sequential steps', { timeout: 60 * 60_000 }, async () => {
     const results = await runScenario(
       SCENARIO_SEQUENTIAL,
@@ -1318,6 +1449,8 @@ describe.skipIf(CAPACITY_ONLY)('workflow benchmarks', () => {
         concurrentRunCount: CONCURRENT_RUN_COUNT,
         concurrentStepCount: CONCURRENT_STEP_COUNT,
         agentIterations: AGENT_ITERATIONS,
+        agentConcurrentIterations: AGENT_CONCURRENT_ITERATIONS,
+        agentConcurrentRunCount: AGENT_CONCURRENT_RUN_COUNT,
         warmupIterations: WARMUP_ITERATIONS,
       },
       scenarios: SCENARIO_DESCRIPTIONS,
