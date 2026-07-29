@@ -11,6 +11,7 @@ import {
   type DeliveryExecution,
   RunExecutionCoordinator,
 } from './execution.js';
+import { HookClaims } from './hook-claims.js';
 import { RunJournal, type RunCommit } from './run-journal.js';
 import { createStorage } from './storage.js';
 
@@ -115,6 +116,23 @@ class MemoryClient extends UrsulaClient {
       closed: false,
       upToDate: true,
     };
+  }
+
+  /** Backdates every hook reservation so orphan reconciliation can run. */
+  expireHookReservations(): void {
+    const past = new Date(Date.now() - 1000).toISOString();
+    for (const [stream, values] of this.streams) {
+      if (!stream.startsWith('hook-')) continue;
+      this.streams.set(
+        stream,
+        values.map((value) => {
+          const record = value as Record<string, unknown>;
+          return record.type === 'reserved'
+            ? { ...record, reservedUntil: past }
+            : record;
+        })
+      );
+    }
   }
 
   async publishSnapshotAtRecord(): Promise<void> {}
@@ -359,6 +377,34 @@ describe('atomic step transactions', () => {
     ).rejects.toSatisfy((error: unknown) =>
       PreconditionFailedError.is(error)
     );
+  });
+
+  it('reclaims a hook token whose owner died before committing its run', async () => {
+    const { client, memory, storage } = await setup();
+    const token = 'hook-token-orphan';
+
+    // A process reserves the token and dies before appending the run record
+    // that would finalize the claim, so the run never gains the Hook.
+    const orphaned = new HookClaims(client);
+    await orphaned.reserve({
+      operationId: 'orphan-op',
+      token,
+      runId: 'wrun_atomic',
+      hookId: 'hook-never-committed',
+    });
+    memory.expireHookReservations();
+
+    // Without reconciliation the token stays reserved forever and this
+    // hook_created lands as a hook_conflict instead.
+    const result = await storage.events.create('wrun_atomic', {
+      eventType: 'hook_created',
+      correlationId: 'hook-live',
+      eventData: { token },
+      specVersion: 5,
+    } as AnyEventRequest);
+
+    expect(result.event?.eventType).toBe('hook_created');
+    expect(result.hook).toMatchObject({ hookId: 'hook-live', token });
   });
 
   it('starts a step through the ordinary path when its lease was superseded', async () => {

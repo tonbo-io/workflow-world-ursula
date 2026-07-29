@@ -957,7 +957,16 @@ export class RunJournal {
     if (records.length === 0) return emptyState(runId);
     const state = stateFromCheckpoint(runId, records[0]?.value);
     if (state) return state;
-    throw new Error(`Run "${runId}" has an invalid latest checkpoint`);
+    // A checkpoint this process cannot decode — a newer schema during a
+    // rolling deployment, or a corrupt record — costs replay time, not the
+    // run. Run source streams are never truncated (only the checkpoint
+    // stream's own prefix is), so the authoritative events are still there
+    // and an empty state replays them from record 0.
+    console.warn(
+      'Ursula run checkpoint could not be decoded; replaying the full journal',
+      { runId }
+    );
+    return emptyState(runId);
   }
 
   private async writeCheckpoint(

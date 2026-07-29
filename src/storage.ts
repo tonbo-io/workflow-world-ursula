@@ -34,7 +34,7 @@ import {
   RunExecutionCoordinator,
   type StagedStepStart,
 } from './execution.js';
-import { HookClaims } from './hook-claims.js';
+import { HookClaims, isExpiredReservation } from './hook-claims.js';
 import { materializeEvent } from './reducer.js';
 import { RunRegistry } from './registry.js';
 import {
@@ -372,6 +372,23 @@ export function createStorage(
     } catch (error) {
       if (error instanceof WorkflowRunNotFoundError) return;
       throw error;
+    }
+    // An orphan: the owner reserved the token, then died before appending the
+    // run record that would have finalized the claim. The run itself is
+    // usually still alive, so the terminal-run path below never sees it and
+    // the token would stay unavailable forever.
+    //
+    // The owner journal is the arbiter. A Hook present there means the run
+    // record did land and only the claim's `committed` transition was lost —
+    // the claim is legitimate, so leave it. No Hook means the owner never got
+    // that far and the token is free.
+    if (isExpiredReservation(claim) && !state.hooks.has(claim.hookId)) {
+      await hookClaims.release(
+        token,
+        { runId: claim.runId, hookId: claim.hookId },
+        `reconcile-orphan:${claim.operationId}`
+      );
+      return;
     }
     if (!state.run || !isTerminalWorkflowRunStatus(state.run.status)) return;
     const hook = state.hooks.get(claim.hookId);

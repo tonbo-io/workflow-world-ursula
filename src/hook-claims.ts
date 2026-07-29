@@ -13,6 +13,12 @@ type HookClaimTransition =
       runId: string;
       hookId: string;
       retentionUntil?: string;
+      /**
+       * Deadline after which an uncommitted reservation may be reconciled
+       * against its owner run journal. Absent on records written before this
+       * field existed; readers fall back to `createdAt` plus the default.
+       */
+      reservedUntil?: string;
       createdAt: string;
     }
   | {
@@ -37,7 +43,19 @@ export interface ActiveHookClaim {
   hookId: string;
   retentionUntil?: Date;
   committedRunRecord?: number;
+  /** See {@link HookClaimTransition}'s `reservedUntil`. */
+  reservedUntil: Date;
 }
+
+/**
+ * How long a reservation stays unreconcilable.
+ *
+ * A reservation is appended immediately before its owner run record, so the
+ * honest window is one journal append plus its CAS retries — well under a
+ * second. This is deliberately far longer so the deadline only ever elapses
+ * for a process that actually died, never for one that is merely slow.
+ */
+export const HOOK_RESERVATION_TIMEOUT_MS = 5 * 60 * 1000;
 
 interface ClaimState {
   nextRecord: number;
@@ -54,6 +72,7 @@ function cloneState(state: ClaimState): ClaimState {
       ? {
           active: {
             ...state.active,
+            reservedUntil: new Date(state.active.reservedUntil),
             ...(state.active.retentionUntil
               ? { retentionUntil: new Date(state.active.retentionUntil) }
               : {}),
@@ -61,6 +80,22 @@ function cloneState(state: ClaimState): ClaimState {
         }
       : {}),
   };
+}
+
+/**
+ * Whether a claim is an orphan: reserved, never committed, and past its
+ * deadline. Its owner process died between reserving the token and appending
+ * the run record that would have finalized the claim. Callers must still
+ * confirm against the owner run journal before releasing it.
+ */
+export function isExpiredReservation(
+  claim: ActiveHookClaim,
+  now = new Date()
+): boolean {
+  return (
+    claim.committedRunRecord === undefined &&
+    claim.reservedUntil.getTime() <= now.getTime()
+  );
 }
 
 async function contentionBackoff(attempt: number): Promise<void> {
@@ -106,6 +141,10 @@ export class HookClaims {
             state.active.hookId === args.hookId);
         return { acquired: sameOwner, claim: state.active };
       }
+      const now = new Date();
+      const reservedUntil = new Date(
+        now.getTime() + HOOK_RESERVATION_TIMEOUT_MS
+      );
       const transition: HookClaimTransition = {
         version: 1,
         type: 'reserved',
@@ -116,7 +155,8 @@ export class HookClaims {
         ...(args.retentionUntil
           ? { retentionUntil: args.retentionUntil.toISOString() }
           : {}),
-        createdAt: new Date().toISOString(),
+        reservedUntil: reservedUntil.toISOString(),
+        createdAt: now.toISOString(),
       };
       try {
         await this.client.append(claimStream(args.token), transition, {
@@ -130,6 +170,7 @@ export class HookClaims {
           runId: args.runId,
           hookId: args.hookId,
           retentionUntil: args.retentionUntil,
+          reservedUntil,
         };
         this.cacheState(args.token, {
           nextRecord: state.nextRecord + 1,
@@ -273,6 +314,13 @@ export class HookClaims {
           ...(value.retentionUntil
             ? { retentionUntil: new Date(value.retentionUntil) }
             : {}),
+          // Records written before `reservedUntil` existed still become
+          // reconcilable, so orphans predating this field are not stranded.
+          reservedUntil: new Date(
+            value.reservedUntil ??
+              new Date(value.createdAt).getTime() +
+                HOOK_RESERVATION_TIMEOUT_MS
+          ),
         };
       } else if (
         value.type === 'committed' &&
