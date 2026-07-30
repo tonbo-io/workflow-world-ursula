@@ -302,6 +302,7 @@ export class UrsulaClient {
         headers: this.headers(),
       })
     );
+    this.ensuredStreams.add(stream);
     return {
       nextRecord: nonNegativeInteger(response.headers, 'stream-record-next', 0),
       closed: response.headers.get('stream-closed') === 'true',
@@ -397,6 +398,7 @@ export class UrsulaClient {
     url.searchParams.set('record_view', 'envelope');
     const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204) await this.success('read records', response);
+    this.ensuredStreams.add(stream);
     return {
       records:
         response.status === 204 ? [] : parseRecords<T>(await response.text()),
@@ -420,6 +422,7 @@ export class UrsulaClient {
     const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204)
       await this.success('read tail records', response);
+    this.ensuredStreams.add(stream);
     const records =
       response.status === 204 ? [] : parseRecords<T>(await response.text());
     return {
@@ -452,6 +455,7 @@ export class UrsulaClient {
     });
     if (response.status !== 204)
       await this.success('wait for records', response);
+    this.ensuredStreams.add(stream);
     return {
       records:
         response.status === 204 ? [] : parseRecords<T>(await response.text()),
