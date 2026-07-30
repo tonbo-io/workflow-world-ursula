@@ -7,6 +7,7 @@ import type {
 } from './client.js';
 import type { RunExecutionCoordinator } from './execution.js';
 import { createQueue } from './queue.js';
+import { queuePartition } from './queue-journal.js';
 
 class MemoryClient {
   readonly waitedStreams: string[] = [];
@@ -113,6 +114,23 @@ class MemoryClient {
 }
 
 describe('Ursula queue runtime', () => {
+  it('rejects an invalid static dispatcher assignment', () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+
+    expect(() =>
+      createQueue(client, {
+        partitionShardCount: 2,
+        partitionShardIndex: 2,
+      })
+    ).toThrow(/partitionShardIndex/);
+    expect(() =>
+      createQueue(client, {
+        partitionShardCount: 2,
+        partitionShardReplicas: 3,
+      })
+    ).toThrow(/partitionShardReplicas/);
+  });
+
   it('runs workflow deliveries inside their execution context', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const run = vi.fn(
@@ -251,6 +269,42 @@ describe('Ursula queue runtime', () => {
     );
     for (const release of releases) release();
     await queue.close();
+  });
+
+  it('lets only the owning static dispatcher shard claim a partition', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const queueName =
+      '__wkf_workflow_static_dispatcher_shard' as ValidQueueName;
+    const runId = 'run-static-dispatcher-shard';
+    const partition = queuePartition({ runId }, 8);
+    const handlers = [vi.fn(), vi.fn()];
+    const dispatchers = handlers.map((handler, partitionShardIndex) => {
+      const queue = createQueue(client, {
+        partitionCount: 8,
+        partitionShardCount: 2,
+        partitionShardIndex,
+        pollIntervalMs: 5,
+        leaseDurationMs: 1_000,
+      });
+      queue.createQueueHandler('__wkf_workflow_', handler);
+      return queue;
+    });
+    const producer = createQueue(client, {
+      dispatcherEnabled: false,
+      partitionCount: 8,
+    });
+    await producer.queue(queueName, { runId });
+
+    await Promise.all(dispatchers.map((dispatcher) => dispatcher.start()));
+    await vi.waitFor(() => {
+      expect(handlers[partition % 2]).toHaveBeenCalledOnce();
+    });
+    await Promise.all([
+      producer.close(),
+      ...dispatchers.map((dispatcher) => dispatcher.close()),
+    ]);
+
+    expect(handlers[(partition + 1) % 2]).not.toHaveBeenCalled();
   });
 
   it('wakes immediately when this process enqueues work', async () => {
