@@ -176,6 +176,49 @@ describe('UrsulaClient', () => {
     expect(fetch.mock.calls[0]?.[0]).toEqual(fetch.mock.calls[1]?.[0]);
   });
 
+  it('does not re-create a stream whose existence a read already proved', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        response('{"record":0,"value":{"event":"created"}}', {
+          status: 200,
+          headers: {
+            'stream-record-next': '1',
+            'stream-up-to-date': 'true',
+          },
+        })
+      )
+      .mockResolvedValueOnce(
+        response(null, {
+          status: 200,
+          headers: {
+            'stream-record-start': '1',
+            'stream-record-next': '2',
+          },
+        })
+      );
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+
+    await client.read<{ event: string }>('run-1');
+    await expect(
+      client.append(
+        'run-1',
+        { event: 'started' },
+        {
+          operationId: 'event-2',
+          expectedRecord: 1,
+        }
+      )
+    ).resolves.toEqual({ startRecord: 1, nextRecord: 2 });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetch.mock.calls[1]?.[1]?.method).toBe('POST');
+  });
+
   it('falls back to guarded append when create finds an existing stream', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
