@@ -135,9 +135,10 @@ disabled, then enable writers in a second rollout. This is the same
 mixed-version rule as checkpoint schema evolution: an old reader must never
 observe a record it cannot decode.
 
-The execution claim, or Turbo's matching durable queue lease and owner message,
-is the pre-body linearization and crash-recovery boundary. An owner stamp
-without a local delivery lease is not sufficient to stage a lazy creation.
+The execution claim, or Turbo's durable owner message, is the pre-body
+linearization and crash-recovery boundary. The owner stamp intentionally
+crosses framework and server-bundle boundaries where local async context does
+not; if local delivery context is available, the two identities must match.
 Claimed terminal transactions
 verify the same token and generation before their record-tail-guarded append.
 If the handler dies, no speculative step event is visible and queue redelivery

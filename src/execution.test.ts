@@ -291,7 +291,7 @@ describe('atomic step transactions', () => {
     await first;
   });
 
-  it('keeps an owned lazy turbo step durable without a queue delivery context', async () => {
+  it('commits an owner-stamped lazy turbo step across bundle boundaries', async () => {
     const { memory, storage } = await setup();
     const before = memory.runCommits().length;
 
@@ -305,17 +305,37 @@ describe('atomic step transactions', () => {
       stepCompleted('step-turbo')
     );
 
-    // An owner stamp alone is not a fence: without the matching durable queue
-    // delivery, creation still lands before the body may claim ownership.
+    // Next.js can bundle the queue handler and World mutation separately, so
+    // AsyncLocalStorage delivery context is absent here. The owner message
+    // stamp carries the queue lease identity across that boundary.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(2);
+    expect(commits).toHaveLength(1);
     expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
       'step_started',
-    ]);
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_completed',
     ]);
+  });
+
+  it('does not stage an owner stamp that disagrees with local delivery', async () => {
+    const { executions, memory, storage } = await setup();
+    const before = memory.runCommits().length;
+
+    await executions.run(
+      delivery('lease-mismatch', { ownerMessageId: 'msg_other' }),
+      async () => {
+        await storage.events.create(
+          'wrun_atomic',
+          stepStarted('step-mismatch')
+        );
+        await storage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-mismatch')
+        );
+      }
+    );
+
+    expect(memory.runCommits().slice(before)).toHaveLength(2);
   });
 
   it('commits step_started and step_completed in one run record', async () => {

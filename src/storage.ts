@@ -414,10 +414,10 @@ export function createStorage(
     const stepId = request.correlationId;
     const ownedLazyStart =
       coordinator?.allowsOwnedLazyStarts() === true &&
-      delivery !== undefined &&
       request.eventData?.input !== undefined &&
       request.eventData.ownerMessageId !== undefined &&
-      delivery.ownerMessageId === request.eventData.ownerMessageId;
+      (delivery === undefined ||
+        delivery.ownerMessageId === request.eventData.ownerMessageId);
     if (!coordinator || (!delivery && !ownedLazyStart) || !stepId) return;
     const existing = coordinator.staged(runId, stepId);
     if (existing) return existing.result;
@@ -444,11 +444,13 @@ export function createStorage(
       // it runs the step body inline only for the caller that created the
       // step. A staged start is not appended until its terminal event commits,
       // so answering `true` from one would promise ownership backed by nothing
-      // durable. The sole exception is an opt-in Turbo delivery whose durable
-      // queue lease owns the same message stamped onto the start. That lease is
-      // the pre-body fence: a crash discards the speculative start and queue
-      // redelivery safely materializes it again, while a successful terminal
-      // call commits create, start, and completion in one run record.
+      // durable. The sole exception is an opt-in Turbo start stamped with its
+      // durable queue message. The stamp crosses framework/server-bundle
+      // boundaries where AsyncLocalStorage cannot; when local delivery context
+      // is available it must match. The queue's single lease is the pre-body
+      // fence: a crash discards the speculative start and redelivery safely
+      // materializes it again, while a successful terminal call commits create,
+      // start, and completion in one run record.
       return;
     }
     const staged: StagedStepStart = {
