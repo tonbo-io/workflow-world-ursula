@@ -17,6 +17,7 @@ import {
 } from './client.js';
 
 const MAX_CAS_RETRIES = 32;
+const MAX_ENQUEUE_CAS_RETRIES = 128;
 const MAX_RETRY_DELAY_MS = 50;
 const CHECKPOINT_INTERVAL_RECORDS = 256;
 const IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -154,23 +155,6 @@ export function queuePartition(
   return digest.readUInt32BE(0) % partitionCount;
 }
 
-function enqueueMessageId(
-  queueName: ValidQueueName,
-  idempotencyKey?: string
-): MessageId {
-  if (!idempotencyKey) return MessageIdSchema.parse(`msg_${ulid()}`);
-  // Stable identity lets Ursula's producer deduplication linearize concurrent
-  // retries without a queue-tail compare-and-swap. The in-memory/checkpoint
-  // idempotency map is only a bounded lookup cache; the producer identity
-  // remains stable for the lifetime of the queue stream.
-  const digest = createHash('sha256')
-    .update(queueName)
-    .update('\0')
-    .update(idempotencyKey)
-    .digest('base64url');
-  return MessageIdSchema.parse(`msg_${digest}`);
-}
-
 function pruneIdempotency(state: QueueState, now: Date): void {
   for (const [key, entry] of state.idempotency) {
     if (entry.expiresAt.getTime() <= now.getTime()) {
@@ -271,6 +255,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
 export class QueueJournal {
   private readonly cache = new Map<ValidQueueName, QueueState>();
   private readonly appendTurns = new Map<ValidQueueName, Promise<void>>();
+  private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
   constructor(
@@ -574,49 +559,76 @@ export class QueueJournal {
     message: QueuePayload,
     options: QueueOptions = {}
   ): Promise<MessageId> {
+    const previousTurn = this.enqueueTurns.get(queueName);
+    let releaseTurn = () => {};
+    const currentTurn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    this.enqueueTurns.set(queueName, currentTurn);
+    if (previousTurn) await previousTurn;
+    try {
+      return await this.enqueueUnlocked(queueName, message, options);
+    } finally {
+      releaseTurn();
+      if (this.enqueueTurns.get(queueName) === currentTurn) {
+        this.enqueueTurns.delete(queueName);
+      }
+    }
+  }
+
+  private async enqueueUnlocked(
+    queueName: ValidQueueName,
+    message: QueuePayload,
+    options: QueueOptions
+  ): Promise<MessageId> {
     QueuePayloadSchema.parse(message);
-    const cached = this.cache.get(queueName);
-    const now = new Date();
-    if (cached) {
-      pruneIdempotency(cached, now);
+    const messageId = MessageIdSchema.parse(`msg_${ulid()}`);
+    for (
+      let attempt = 0;
+      attempt < MAX_ENQUEUE_CAS_RETRIES;
+      attempt += 1
+    ) {
+      const state = await this.loadForMutation(queueName, {
+        createIfMissing: true,
+      });
+      const now = new Date();
+      pruneIdempotency(state, now);
       if (options.idempotencyKey) {
-        const existing = cached.idempotency.get(options.idempotencyKey);
+        const existing = state.idempotency.get(options.idempotencyKey);
         if (existing) return existing.messageId;
       }
-    }
-    const messageId = enqueueMessageId(queueName, options.idempotencyKey);
-    const transition: QueueTransition = {
-      version: 1,
-      type: 'enqueued',
-      messageId,
-      queueName,
-      message,
-      headers: options.headers,
-      idempotencyKey: options.idempotencyKey,
-      availableAt: new Date(
+      const availableAt = new Date(
         now.getTime() + Math.max(0, options.delaySeconds ?? 0) * 1000
-      ).toISOString(),
-      createdAt: now.toISOString(),
-    };
-    const receipt = await this.client.append(
-      queueStream(queueName, this.partition),
-      transition,
-      {
-        operationId: `queue-enqueue:${queueName}:${messageId}`,
-        createIfMissing: true,
+      );
+      const transition: QueueTransition = {
+        version: 1,
+        type: 'enqueued',
+        messageId,
+        queueName,
+        message,
+        headers: options.headers,
+        idempotencyKey: options.idempotencyKey,
+        availableAt: availableAt.toISOString(),
+        createdAt: now.toISOString(),
+      };
+      try {
+        await this.appendTransition(
+          queueName,
+          state,
+          transition,
+          `queue-enqueue:${queueName}:${messageId}`
+        );
+        return messageId;
+      } catch (error) {
+        if (isUrsulaRequestError(error, 412)) {
+          await this.refreshAfterContention(queueName);
+          await contentionBackoff(attempt);
+          continue;
+        }
+        throw error;
       }
-    );
-    const localState =
-      cached ?? (receipt.startRecord === 0 ? replay([]) : undefined);
-    if (localState && !cached) {
-      this.cache.set(queueName, localState);
     }
-    if (localState?.nextRecord === receipt.startRecord) {
-      applyTransition(localState, transition);
-      localState.nextRecord = receipt.nextRecord;
-      this.scheduleCheckpoint(queueName, localState, receipt.startRecord);
-    }
-    return messageId;
+    throw new Error(`Queue "${queueName}" remained contended during enqueue`);
   }
 
   private claimCandidate(

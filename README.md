@@ -162,9 +162,7 @@ rather than throughput.
 - Run and queue checkpoints bound restart replay. Queue checkpoints also
   advance Ursula retention, recover lagging instances from `410 Gone`, keep
   only the latest checkpoint record, and omit acknowledged messages from the
-  active set. Queue checkpoints retain a 24-hour idempotency lookup cache;
-  deterministic message IDs and Ursula producer deduplication keep a supplied
-  idempotency key stable for the queue stream's lifetime.
+  active set. Queue idempotency keys have a 24-hour durable retry window.
 - Stream records store binary values with an explicit JSON codec.
 - Run and queue registries are durable discovery metadata; query indexes are
   rebuildable projections, never authoritative state.
