@@ -414,8 +414,10 @@ export function createStorage(
     const stepId = request.correlationId;
     const ownedLazyStart =
       coordinator?.allowsOwnedLazyStarts() === true &&
+      delivery !== undefined &&
       request.eventData?.input !== undefined &&
-      request.eventData.ownerMessageId !== undefined;
+      request.eventData.ownerMessageId !== undefined &&
+      delivery.ownerMessageId === request.eventData.ownerMessageId;
     if (!coordinator || (!delivery && !ownedLazyStart) || !stepId) return;
     const existing = coordinator.staged(runId, stepId);
     if (existing) return existing.result;
@@ -437,15 +439,16 @@ export function createStorage(
       params,
     });
     if (!materialized.commit) return materialized.result;
-    if (materialized.result.stepCreated) {
+    if (materialized.result.stepCreated && !ownedLazyStart) {
       // `stepCreated` is the runtime's exactly-once create-ownership signal:
       // it runs the step body inline only for the caller that created the
       // step. A staged start is not appended until its terminal event commits,
       // so answering `true` from one would promise ownership backed by nothing
-      // durable — and a discarded stage leaves no record, so the next delivery
-      // materializes the same creation and is told it won the claim too.
-      // Falling through to the ordinary path appends the creation first, so
-      // the claim is decided by the record tail rather than by local memory.
+      // durable. The sole exception is an opt-in Turbo delivery whose durable
+      // queue lease owns the same message stamped onto the start. That lease is
+      // the pre-body fence: a crash discards the speculative start and queue
+      // redelivery safely materializes it again, while a successful terminal
+      // call commits create, start, and completion in one run record.
       return;
     }
     const staged: StagedStepStart = {
