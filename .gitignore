@@ -11,3 +11,4 @@ coverage/
 .terraform/
 *.tfplan
 benchmark/results/
+**/target/

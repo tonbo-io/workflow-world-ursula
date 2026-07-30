@@ -6,6 +6,8 @@ export {
   type UrsulaHead,
   type UrsulaReadResult,
   type UrsulaRecord,
+  type UrsulaReduceOptions,
+  type UrsulaReduceResult,
   UrsulaRequestError,
 } from './client.js';
 export { type ActiveHookClaim, HookClaims } from './hook-claims.js';
@@ -29,6 +31,7 @@ export {
   type RunCommit,
   RunJournal,
   type RunJournalState,
+  runStreamId,
 } from './run-journal.js';
 export { createStorage, type UrsulaStorage } from './storage.js';
 export {

@@ -102,6 +102,49 @@ describe('UrsulaClient', () => {
     expect(request?.body).toBe('{"event":"created"}');
   });
 
+  it('executes a reducer transition in one request', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(
+      response('{"sequence":1}', {
+        status: 200,
+        headers: {
+          'stream-record-start': '0',
+          'stream-record-next': '1',
+          'ursula-reducer-version': '1',
+        },
+      })
+    );
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      bucket: 'workflow',
+      fetch,
+    });
+
+    await expect(
+      client.reduce(
+        'run-1',
+        'workflow',
+        { eventType: 'run_started' },
+        { createIfMissing: true }
+      )
+    ).resolves.toEqual({
+      value: { sequence: 1 },
+      startRecord: 0,
+      nextRecord: 1,
+      reducerVersion: 1,
+    });
+
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, request] = fetch.mock.calls[0] ?? [];
+    expect(url?.toString()).toBe(
+      'https://ursula.test/workflow/run-1/reduce/workflow'
+    );
+    expect(request?.method).toBe('POST');
+    expect(
+      new Headers(request?.headers).get('ursula-reducer-create')
+    ).toBe('true');
+    expect(request?.body).toBe('{"eventType":"run_started"}');
+  });
+
   it('retries a leader-unknown create with the same producer operation', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

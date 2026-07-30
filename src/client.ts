@@ -47,6 +47,17 @@ export interface UrsulaAppendOptions {
   createIfMissing?: boolean;
 }
 
+export interface UrsulaReduceOptions {
+  createIfMissing?: boolean;
+}
+
+export interface UrsulaReduceResult<T> {
+  value: T;
+  startRecord: number;
+  nextRecord: number;
+  reducerVersion: number;
+}
+
 export class UrsulaRequestError extends Error {
   readonly status: number;
   readonly operation: string;
@@ -383,6 +394,49 @@ export class UrsulaClient {
         response.headers,
         'stream-record-next',
         (options.expectedRecord ?? 0) + records.length
+      ),
+    };
+  }
+
+  async reduce<TIntent, TResult>(
+    stream: string,
+    moduleId: string,
+    intent: TIntent,
+    options: UrsulaReduceOptions = {}
+  ): Promise<UrsulaReduceResult<TResult>> {
+    const url = this.streamUrl(stream);
+    url.pathname = `${url.pathname}/reduce/${encodeURIComponent(moduleId)}`;
+    const headers = this.headers({
+      'content-type': JSON_CONTENT_TYPE,
+    });
+    if (options.createIfMissing) {
+      headers.set('ursula-reducer-create', 'true');
+    }
+    const response = await this.success(
+      `reduce stream "${stream}" with "${moduleId}"`,
+      await this.request(url, {
+        method: 'POST',
+        headers,
+        body: stringifyUrsulaJson(intent),
+      })
+    );
+    this.ensuredStreams.add(stream);
+    return {
+      value: parseUrsulaJson<TResult>(await response.text()),
+      startRecord: nonNegativeInteger(
+        response.headers,
+        'stream-record-start',
+        0
+      ),
+      nextRecord: nonNegativeInteger(
+        response.headers,
+        'stream-record-next',
+        0
+      ),
+      reducerVersion: nonNegativeInteger(
+        response.headers,
+        'ursula-reducer-version',
+        0
       ),
     };
   }

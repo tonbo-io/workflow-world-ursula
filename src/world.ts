@@ -22,6 +22,8 @@ export interface UrsulaWorldConfig
    * in a rolling deployment runs a version that understands the format.
    */
   experimentalCompactCompletedStepCommits?: boolean;
+  /** Executes run-journal transitions in an Ursula-hosted WebAssembly reducer. */
+  experimentalServerReducerModuleId?: string;
 }
 
 function positiveInteger(
@@ -126,6 +128,8 @@ function environmentConfig(): UrsulaWorldConfig {
     experimentalCompactCompletedStepCommits:
       process.env
         .WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS === '1',
+    experimentalServerReducerModuleId:
+      process.env.WORKFLOW_URSULA_EXPERIMENTAL_SERVER_REDUCER_MODULE_ID,
   };
 }
 
@@ -163,7 +167,11 @@ export function createWorld(
   const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
   });
-  const { storage } = createStorage(client, { journal, executions });
+  const { storage } = createStorage(client, {
+    journal,
+    executions,
+    serverReducerModuleId: config.experimentalServerReducerModuleId,
+  });
   const queue = createQueue(client, config, executions);
   return {
     specVersion: SPEC_VERSION_CURRENT,

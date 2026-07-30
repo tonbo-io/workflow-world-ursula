@@ -131,7 +131,7 @@ async function waitForFollowerCatchUp(attempt: number): Promise<void> {
   });
 }
 
-function streamId(runId: string): string {
+export function runStreamId(runId: string): string {
   const digest = createHash('sha256').update(runId).digest('base64url');
   return `run-${digest}`;
 }
@@ -977,7 +977,7 @@ export class RunJournal {
     options: { createIfMissing?: boolean; cache?: boolean } = {}
   ): Promise<RunJournalState> {
     const useCache = options.cache !== false;
-    const stream = streamId(runId);
+    const stream = runStreamId(runId);
     const cached = useCache ? this.cache.get(runId) : undefined;
     if (cached) {
       this.cache.delete(runId);
@@ -1084,7 +1084,7 @@ export class RunJournal {
     while (true) {
       let page: UrsulaReadResult<unknown>;
       try {
-        page = await this.client.read<unknown>(streamId(runId), cursor);
+        page = await this.client.read<unknown>(runStreamId(runId), cursor);
       } catch (error) {
         if (
           isCursorBeyondLocalTail(error) &&
@@ -1149,7 +1149,7 @@ export class RunJournal {
     const storedValue = this.compactCompletedStepCommits
       ? (compactCompletedStepCommit(value) ?? value)
       : value;
-    await this.client.append(streamId(state.runId), storedValue, {
+    await this.client.append(runStreamId(state.runId), storedValue, {
       operationId: commit.operationId,
       expectedRecord: state.nextRecord,
       createIfMissing: state.nextRecord === 0,
@@ -1182,5 +1182,21 @@ export class RunJournal {
     }
     this.scheduleCheckpoint(state);
     return state;
+  }
+
+  async reduce<TIntent, TResult>(
+    runId: string,
+    moduleId: string,
+    intent: TIntent,
+    createIfMissing: boolean
+  ): Promise<TResult> {
+    const result = await this.client.reduce<TIntent, TResult>(
+      runStreamId(runId),
+      moduleId,
+      intent,
+      { createIfMissing }
+    );
+    this.evict(runId);
+    return result.value;
   }
 }

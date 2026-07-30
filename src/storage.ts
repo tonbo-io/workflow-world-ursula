@@ -20,9 +20,14 @@ import type {
   WorkflowRun,
 } from '@workflow/world';
 import {
+  EventSchema,
+  HookSchema,
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
+  StepSchema,
   stripEventDataRefs,
+  WaitSchema,
+  WorkflowRunSchema,
 } from '@workflow/world';
 import { ulid } from 'ulid';
 import {
@@ -262,12 +267,14 @@ export function createStorage(
   options: {
     journal?: RunJournal;
     executions?: RunExecutionCoordinator;
+    serverReducerModuleId?: string;
   } = {}
 ): UrsulaStorage {
   const client =
     config instanceof UrsulaClient ? config : new UrsulaClient(config);
   const journal = options.journal ?? new RunJournal(client);
   const executions = options.executions;
+  const serverReducerModuleId = options.serverReducerModuleId;
   const registry = new RunRegistry(client);
   const hookClaims = new HookClaims(client);
 
@@ -704,6 +711,51 @@ export function createStorage(
           throw new WorkflowWorldError(
             'runId is required for non-run_created events'
           );
+        }
+        if (serverReducerModuleId) {
+          const now = new Date();
+          const createsRun =
+            data.eventType === 'run_created' ||
+            (data.eventType === 'run_started' &&
+              data.eventData?.deploymentId !== undefined &&
+              data.eventData.workflowName !== undefined &&
+              data.eventData.input !== undefined);
+          const registration =
+            data.eventType === 'run_created'
+              ? registry.register(effectiveRunId, now)
+              : undefined;
+          const raw = await journal.reduce<
+            {
+              runId: string;
+              request: AnyEventRequest;
+              eventId: string;
+              syntheticEventId: string;
+              now: string;
+              operationId: string;
+            },
+            EventResult
+          >(
+            effectiveRunId,
+            serverReducerModuleId,
+            {
+              runId: effectiveRunId,
+              request: data,
+              eventId: `evnt_${ulid()}`,
+              syntheticEventId: `evnt_${ulid()}`,
+              now: now.toISOString(),
+              operationId: `server-reducer:${effectiveRunId}:${params?.requestId ?? callId}`,
+            },
+            createsRun
+          );
+          await registration;
+          return {
+            ...raw,
+            ...(raw.event ? { event: EventSchema.parse(raw.event) } : {}),
+            ...(raw.run ? { run: WorkflowRunSchema.parse(raw.run) } : {}),
+            ...(raw.step ? { step: StepSchema.parse(raw.step) } : {}),
+            ...(raw.hook ? { hook: HookSchema.parse(raw.hook) } : {}),
+            ...(raw.wait ? { wait: WaitSchema.parse(raw.wait) } : {}),
+          };
         }
         if (data.eventType === 'step_started') {
           const staged = await stageStepStart(
