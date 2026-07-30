@@ -60,6 +60,13 @@ export interface UrsulaQueueConfig {
    * execution lane always hash to the same partition.
    */
   partitionCount?: number;
+  /**
+   * Optional static dispatcher sharding. Every replica in one dispatcher
+   * pool must use the same shard count and a distinct index.
+   */
+  partitionShardCount?: number;
+  partitionShardIndex?: number;
+  partitionShardReplicas?: number;
 }
 
 export interface UrsulaQueue extends Queue {
@@ -126,6 +133,31 @@ export function createQueue(
     DEFAULT_PARTITION_COUNT,
     'Ursula queue partitionCount'
   );
+  const partitionShardCount = positiveInteger(
+    config.partitionShardCount,
+    1,
+    'Ursula queue partitionShardCount'
+  );
+  const partitionShardIndex = config.partitionShardIndex ?? 0;
+  const partitionShardReplicas = positiveInteger(
+    config.partitionShardReplicas,
+    1,
+    'Ursula queue partitionShardReplicas'
+  );
+  if (
+    !Number.isSafeInteger(partitionShardIndex) ||
+    partitionShardIndex < 0 ||
+    partitionShardIndex >= partitionShardCount
+  ) {
+    throw new Error(
+      'Ursula queue partitionShardIndex must be within partitionShardCount'
+    );
+  }
+  if (partitionShardReplicas > partitionShardCount) {
+    throw new Error(
+      'Ursula queue partitionShardReplicas cannot exceed partitionShardCount'
+    );
+  }
   const journals = Array.from(
     { length: partitionCount },
     (_, partition) => new QueueJournal(client, partition)
@@ -182,6 +214,15 @@ export function createQueue(
 
   function canDeliver(queueName: ValidQueueName): boolean {
     return Boolean(deliveryBaseUrl() || handlerFor(queueName));
+  }
+
+  function ownsPartition(partition: number): boolean {
+    const firstOwner = partition % partitionShardCount;
+    return (
+      (partitionShardIndex - firstOwner + partitionShardCount) %
+        partitionShardCount <
+      partitionShardReplicas
+    );
   }
 
   async function waitAfterWatcherError(): Promise<void> {
@@ -438,6 +479,7 @@ export function createQueue(
     const now = new Date();
     for (const queueName of queueNames) {
       for (const partition of registry.partitions(queueName)) {
+        if (!ownsPartition(partition)) continue;
         ensureQueueWatcher(queueName, partition);
         const journal = journals[partition];
         const deadline = journal?.nextLocalDeadline(queueName, now);
@@ -458,6 +500,7 @@ export function createQueue(
     const work = orderedQueues.flatMap((queueName) =>
       registry
         .partitions(queueName)
+        .filter(ownsPartition)
         .filter((partition) =>
           readyPartitions.has(partitionKey(queueName, partition))
         )
@@ -512,6 +555,7 @@ export function createQueue(
       (queueEarliest, queueName) =>
         registry
           .partitions(queueName)
+          .filter(ownsPartition)
           .map((partition) => journals[partition])
           .filter((journal): journal is QueueJournal => Boolean(journal))
           .reduce<Date | undefined>((earliest, journal) => {

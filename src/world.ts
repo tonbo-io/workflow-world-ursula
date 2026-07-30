@@ -105,6 +105,18 @@ function environmentConfig(): UrsulaWorldConfig {
       process.env.WORKFLOW_URSULA_QUEUE_PARTITIONS,
       'WORKFLOW_URSULA_QUEUE_PARTITIONS'
     ),
+    partitionShardCount: positiveInteger(
+      process.env.WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_COUNT,
+      'WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_COUNT'
+    ),
+    partitionShardIndex: nonNegativeInteger(
+      process.env.WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_INDEX,
+      'WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_INDEX'
+    ),
+    partitionShardReplicas: positiveInteger(
+      process.env.WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_REPLICAS,
+      'WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_REPLICAS'
+    ),
     shutdownGraceMs: positiveInteger(
       process.env.WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS,
       'WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS'

@@ -139,6 +139,9 @@ rather than throughput.
 | `WORKFLOW_URSULA_QUEUE_RETRY_DELAY_MS` | Default retry delay |
 | `WORKFLOW_URSULA_QUEUE_CONCURRENCY` | Local queue dispatcher concurrency |
 | `WORKFLOW_URSULA_QUEUE_PARTITIONS` | Physical journals per logical queue, default `8`; one execution lane always maps to one partition |
+| `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_COUNT` | Optional static dispatcher pool size; use one stable shard index per replica to avoid every dispatcher racing every queue partition |
+| `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_INDEX` | Zero-based static index for this dispatcher; every index must stay covered by a live replica |
+| `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_REPLICAS` | Number of adjacent dispatcher indices allowed to claim each partition, default `1`; use `2` to trade some duplicate CAS attempts for failover and lower single-run latency |
 | `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS` | Set to `1` only when the runtime guarantees one active handler for an optimistic owned-lazy step; lets Turbo commit started + terminal state in one record |
 | `WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS` | Set to `1` only after every process can read compact v2 records; removes duplicated owned-step fields from the authoritative run append |
 | `WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS` | Maximum graceful wait for in-flight handlers |
