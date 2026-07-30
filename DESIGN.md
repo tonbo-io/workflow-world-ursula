@@ -136,10 +136,7 @@ mixed-version rule as checkpoint schema evolution: an old reader must never
 observe a record it cannot decode.
 
 The execution claim, or Turbo's durable owner message, is the pre-body
-linearization and crash-recovery boundary. The owner stamp intentionally
-crosses framework and server-bundle boundaries where local async context does
-not; if local delivery context is available, the two identities must match.
-Claimed terminal transactions
+linearization and crash-recovery boundary. Claimed terminal transactions
 verify the same token and generation before their record-tail-guarded append.
 If the handler dies, no speculative step event is visible and queue redelivery
 can claim a newer generation or re-run the owned lazy step. If an old claimed
