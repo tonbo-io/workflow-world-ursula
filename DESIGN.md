@@ -239,12 +239,9 @@ restarts, then pending messages or expired leases are recovered from Ursula.
 At-least-once redelivery and execution fencing remain unchanged.
 
 Every 256 transitions in one partition, the adapter writes a checkpoint
-containing that partition's active messages and live 24-hour idempotency lookup
-cache, publishes it as the partition stream's Ursula snapshot, then advances
-source retention to that record boundary. Stable message IDs and Ursula
-producer deduplication preserve the actual enqueue idempotency boundary for the
-queue stream's lifetime without retaining every key in the checkpoint. This
-derived work runs on an ordered
+containing that partition's active messages and live 24-hour idempotency
+window, publishes it as the partition stream's Ursula snapshot, then advances
+source retention to that record boundary. This derived work runs on an ordered
 per-partition background chain and
 does not delay enqueue, lease, ack, or retry responses. The source snapshot is
 required by Ursula as the safety proof for retention; adapter recovery reads
