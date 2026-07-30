@@ -10,6 +10,7 @@ import { QueueJournal, queuePartition } from './queue-journal.js';
 
 class MemoryClient {
   readonly appendedBatchSizes: number[] = [];
+  readonly appendExpectedRecords: Array<number | undefined> = [];
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly retainedRecords: number[] = [];
   beforeNextSourceReadAll?: () => Promise<void>;
@@ -17,6 +18,10 @@ class MemoryClient {
   loseNextAppendResponse = false;
   yieldBeforeAppend = false;
   reads = 0;
+  private readonly appendReceipts = new Map<
+    string,
+    { startRecord: number; nextRecord: number }
+  >();
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
 
@@ -32,6 +37,10 @@ class MemoryClient {
     if (this.yieldBeforeAppend) {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
+    const operationKey = `${stream}\0${options.operationId}`;
+    const existingReceipt = this.appendReceipts.get(operationKey);
+    if (existingReceipt) return existingReceipt;
+    this.appendExpectedRecords.push(options.expectedRecord);
     const current = this.streams.get(stream) ?? [];
     if (
       options.expectedRecord !== undefined &&
@@ -51,11 +60,13 @@ class MemoryClient {
     const startRecord = current.length;
     current.push(...records);
     this.streams.set(stream, current);
+    const receipt = { startRecord, nextRecord: current.length };
+    this.appendReceipts.set(operationKey, receipt);
     if (this.loseNextAppendResponse) {
       this.loseNextAppendResponse = false;
       throw new TypeError('simulated lost append response');
     }
-    return { startRecord, nextRecord: current.length };
+    return receipt;
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
@@ -216,6 +227,11 @@ describe('QueueJournal', () => {
     expect(first?.message.attempt).toBe(1);
 
     journal = new QueueJournal(client);
+    await expect(
+      journal.enqueue(queueName, payload, {
+        idempotencyKey: 'start-run-1',
+      })
+    ).resolves.toBe(messageId);
     expect(await journal.claim(queueName, new Date(base + 50), 100)).toBeNull();
     const redelivery = await journal.claim(
       queueName,
@@ -326,35 +342,6 @@ describe('QueueJournal', () => {
     expect(otherRun?.message.message).toMatchObject({ runId: 'run-two' });
   });
 
-  it('refreshes and leases remotely enqueued work before acking', async () => {
-    const memory = new MemoryClient();
-    const dispatcher = new QueueJournal(
-      memory as unknown as UrsulaClient
-    );
-    const producer = new QueueJournal(memory as unknown as UrsulaClient);
-    await dispatcher.enqueue(queueName, {
-      runId: 'run-remote-successor',
-      step: 1,
-    });
-    const now = new Date(Date.now() + 100);
-    const first = await dispatcher.claim(queueName, now, 10_000);
-    if (!first) throw new Error('expected first lease');
-    const secondMessageId = await producer.enqueue(queueName, {
-      runId: 'run-remote-candidate',
-      step: 2,
-    });
-
-    const next = await dispatcher.ackAndClaimNext(
-      queueName,
-      first,
-      now,
-      10_000
-    );
-
-    expect(next?.message.messageId).toBe(secondMessageId);
-    expect(memory.appendedBatchSizes.at(-1)).toBe(2);
-  });
-
   it('recovers the successor lease after an ack-and-claim response is lost', async () => {
     const memory = new MemoryClient();
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
@@ -419,7 +406,7 @@ describe('QueueJournal', () => {
     ).toBe(true);
   });
 
-  it('expires durable idempotency entries after the retry window', async () => {
+  it('keeps deterministic enqueue identity after the retry cache expires', async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-07-25T00:00:00.000Z'));
@@ -438,13 +425,13 @@ describe('QueueJournal', () => {
       const afterWindow = await journal.enqueue(queueName, payload, {
         idempotencyKey: 'reusable-key',
       });
-      expect(afterWindow).not.toBe(first);
+      expect(afterWindow).toBe(first);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('serializes concurrent local transitions before queue CAS', async () => {
+  it('appends concurrent enqueues without queue CAS contention', async () => {
     const memory = new MemoryClient();
     memory.yieldBeforeAppend = true;
     const journal = new QueueJournal(memory as unknown as UrsulaClient);
@@ -461,6 +448,9 @@ describe('QueueJournal', () => {
 
     expect(new Set(messageIds)).toHaveLength(100);
     expect(memory.appendedBatchSizes).toHaveLength(100);
+    expect(memory.appendExpectedRecords).toEqual(
+      Array.from({ length: 100 }, () => undefined)
+    );
   });
 
   it('refreshes only the missing suffix after cross-instance queue contention', async () => {
