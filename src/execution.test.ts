@@ -291,7 +291,7 @@ describe('atomic step transactions', () => {
     await first;
   });
 
-  it('commits an owned lazy turbo step without a queue delivery context', async () => {
+  it('commits an owner-stamped lazy turbo step across bundle boundaries', async () => {
     const { memory, storage } = await setup();
     const before = memory.runCommits().length;
 
@@ -305,17 +305,37 @@ describe('atomic step transactions', () => {
       stepCompleted('step-turbo')
     );
 
-    // The creation lands on its own record so `stepCreated` is decided by the
-    // record tail; only the start and its terminal event still share one.
+    // Next.js can bundle the queue handler and World mutation separately, so
+    // AsyncLocalStorage delivery context is absent here. The owner message
+    // stamp carries the queue lease identity across that boundary.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(2);
+    expect(commits).toHaveLength(1);
     expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
       'step_started',
-    ]);
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_completed',
     ]);
+  });
+
+  it('does not stage an owner stamp that disagrees with local delivery', async () => {
+    const { executions, memory, storage } = await setup();
+    const before = memory.runCommits().length;
+
+    await executions.run(
+      delivery('lease-mismatch', { ownerMessageId: 'msg_other' }),
+      async () => {
+        await storage.events.create(
+          'wrun_atomic',
+          stepStarted('step-mismatch')
+        );
+        await storage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-mismatch')
+        );
+      }
+    );
+
+    expect(memory.runCommits().slice(before)).toHaveLength(2);
   });
 
   it('commits step_started and step_completed in one run record', async () => {
@@ -378,11 +398,16 @@ describe('atomic step transactions', () => {
       ]);
     });
 
-    // Each lazy start is committed to settle create ownership, followed by
-    // its terminal event. No second run-journal lease is needed because the
-    // durable queue lease already owns the delivery.
+    // The durable queue lease is the create-ownership fence. Each complete
+    // lazy step therefore commits create, start, and terminal in one record.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(4);
+    expect(commits).toHaveLength(2);
+    expect(
+      commits.map(({ events }) => events.map(({ eventType }) => eventType))
+    ).toEqual([
+      ['step_created', 'step_started', 'step_completed'],
+      ['step_created', 'step_started', 'step_completed'],
+    ]);
     expect(
       commits
         .flatMap(({ events }) => events)
@@ -424,10 +449,14 @@ describe('atomic step transactions', () => {
     );
   });
 
-  it('grants create ownership only once across discarded deliveries', async () => {
+  it('re-materializes an abandoned owned start on queue redelivery', async () => {
     const { client, journal, memory } = await setup();
-    const first = new RunExecutionCoordinator();
-    const second = new RunExecutionCoordinator();
+    const first = new RunExecutionCoordinator({
+      allowOwnedLazyStarts: true,
+    });
+    const second = new RunExecutionCoordinator({
+      allowOwnedLazyStarts: true,
+    });
     const before = memory.runCommits().length;
 
     // A delivery that starts a step and is then abandoned without ever
@@ -448,14 +477,31 @@ describe('atomic step transactions', () => {
     };
 
     await start(first, 'lease-first');
-    await expect(start(second, 'lease-second')).rejects.toThrow(
-      'already created'
+    expect(memory.runCommits().slice(before)).toHaveLength(0);
+
+    const { storage: redeliveryStorage } = createStorage(client, {
+      journal,
+      executions: second,
+    });
+    await second.run(
+      delivery('lease-second', { ownerMessageId: 'msg_atomic' }),
+      async () => {
+        const result = await redeliveryStorage.events.create(
+          'wrun_atomic',
+          stepStarted('step-once')
+        );
+        claims.push(result.stepCreated);
+        await redeliveryStorage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-once')
+        );
+      }
     );
 
-    // `stepCreated` is the runtime's exactly-once signal for running a step
-    // body inline. Answering it from an uncommitted stage handed it to every
-    // delivery that materialized the same creation.
-    expect(claims.filter(Boolean)).toHaveLength(1);
+    // Both deliveries may execute the body across a crash boundary, matching
+    // Workflow's at-least-once activity semantics, but only the successful
+    // redelivery leaves one authoritative create/start/terminal record.
+    expect(claims.filter(Boolean)).toHaveLength(2);
     expect(
       memory
         .runCommits()
@@ -463,6 +509,7 @@ describe('atomic step transactions', () => {
         .flatMap(({ events }) => events)
         .filter(({ eventType }) => eventType === 'step_created')
     ).toHaveLength(1);
+    expect(memory.runCommits().slice(before)).toHaveLength(1);
   });
 
   it('reclaims a hook token whose owner died before committing its run', async () => {
