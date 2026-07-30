@@ -855,9 +855,6 @@ export class RunJournal {
     runId: string,
     options: { assumeEmpty?: boolean; createIfMissing?: boolean } = {}
   ): Promise<RunJournalState> {
-    if (options.createIfMissing && !options.assumeEmpty) {
-      await this.client.ensureJsonStream(streamId(runId));
-    }
     const cached = this.cache.get(runId);
     if (cached) {
       this.cache.delete(runId);
@@ -869,7 +866,9 @@ export class RunJournal {
       this.rememberState(runId, state);
       return cloneState(state);
     }
-    return this.load(runId);
+    return this.load(runId, {
+      createIfMissing: options.createIfMissing,
+    });
   }
 
   private async loadCheckpoint(runId: string): Promise<RunJournalState> {
@@ -979,9 +978,6 @@ export class RunJournal {
   ): Promise<RunJournalState> {
     const useCache = options.cache !== false;
     const stream = streamId(runId);
-    if (options.createIfMissing) {
-      await this.client.ensureJsonStream(stream);
-    }
     const cached = useCache ? this.cache.get(runId) : undefined;
     if (cached) {
       this.cache.delete(runId);
