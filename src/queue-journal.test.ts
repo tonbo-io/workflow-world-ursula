@@ -326,6 +326,35 @@ describe('QueueJournal', () => {
     expect(otherRun?.message.message).toMatchObject({ runId: 'run-two' });
   });
 
+  it('refreshes a remotely enqueued successor before acking', async () => {
+    const memory = new MemoryClient();
+    const dispatcher = new QueueJournal(
+      memory as unknown as UrsulaClient
+    );
+    const producer = new QueueJournal(memory as unknown as UrsulaClient);
+    await dispatcher.enqueue(queueName, {
+      runId: 'run-remote-successor',
+      step: 1,
+    });
+    const now = new Date(Date.now() + 100);
+    const first = await dispatcher.claim(queueName, now, 10_000);
+    if (!first) throw new Error('expected first lease');
+    const secondMessageId = await producer.enqueue(queueName, {
+      runId: 'run-remote-successor',
+      step: 2,
+    });
+
+    const next = await dispatcher.ackAndClaimNext(
+      queueName,
+      first,
+      now,
+      10_000
+    );
+
+    expect(next?.message.messageId).toBe(secondMessageId);
+    expect(memory.appendedBatchSizes.at(-1)).toBe(2);
+  });
+
   it('recovers the successor lease after an ack-and-claim response is lost', async () => {
     const memory = new MemoryClient();
     const journal = new QueueJournal(memory as unknown as UrsulaClient);

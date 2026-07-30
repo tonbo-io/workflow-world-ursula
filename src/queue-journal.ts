@@ -821,7 +821,12 @@ export class QueueJournal {
   ): Promise<QueueLease | null> {
     const nextLeaseId = randomUUID();
     for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
-      let state = await this.loadForMutation(queueName);
+      // The delivery handler may have enqueued its successor through another
+      // app process immediately before returning. Refresh the incremental
+      // tail here so the dispatcher can commit the current ack and successor
+      // lease in one append instead of exposing a pending-message window that
+      // every dispatcher owner races to claim.
+      let state = await this.load(queueName);
       let current = state.messages.get(lease.message.messageId);
       if (current?.status !== 'leased' || current.leaseId !== lease.leaseId) {
         state = await this.load(queueName);
