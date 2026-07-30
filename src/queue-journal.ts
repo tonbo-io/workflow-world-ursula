@@ -810,8 +810,9 @@ export class QueueJournal {
 
   /**
    * Completes one delivery and, when work is immediately available, leases
-   * its successor in the same durable append. This preserves the queue state
-   * machine while removing one Raft round trip from suspension-heavy runs.
+   * the next eligible message in the same durable append. The normal
+   * concurrency-key exclusion still applies; selecting across ready lanes
+   * only removes the observable gap between an ack and the next claim.
    */
   async ackAndClaimNext(
     queueName: ValidQueueName,
@@ -858,8 +859,7 @@ export class QueueJournal {
       const candidate = this.claimCandidate(
         state,
         now,
-        lease.message.messageId,
-        queueConcurrencyKey(lease.message.message)
+        lease.message.messageId
       );
       const leased = candidate
         ? ({

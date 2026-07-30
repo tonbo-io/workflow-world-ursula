@@ -326,7 +326,7 @@ describe('QueueJournal', () => {
     expect(otherRun?.message.message).toMatchObject({ runId: 'run-two' });
   });
 
-  it('refreshes a remotely enqueued successor before acking', async () => {
+  it('refreshes and leases remotely enqueued work before acking', async () => {
     const memory = new MemoryClient();
     const dispatcher = new QueueJournal(
       memory as unknown as UrsulaClient
@@ -340,7 +340,7 @@ describe('QueueJournal', () => {
     const first = await dispatcher.claim(queueName, now, 10_000);
     if (!first) throw new Error('expected first lease');
     const secondMessageId = await producer.enqueue(queueName, {
-      runId: 'run-remote-successor',
+      runId: 'run-remote-candidate',
       step: 2,
     });
 
