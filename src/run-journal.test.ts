@@ -22,6 +22,7 @@ class MemoryClient {
   readonly reads: Array<{ stream: string; start: number; limit: number }> = [];
   readonly tailReads: string[] = [];
   readonly retainedRecords: Array<{ stream: string; record: number }> = [];
+  readonly ensuredStreams: string[] = [];
   private readonly streams = new Map<string, unknown[]>();
 
   clearRunStreams(): void {
@@ -76,6 +77,7 @@ class MemoryClient {
   }
 
   async ensureJsonStream(stream: string): Promise<void> {
+    this.ensuredStreams.push(stream);
     if (!this.streams.has(stream)) this.streams.set(stream, []);
   }
 
@@ -210,6 +212,22 @@ describe('RunJournal', () => {
     expect(next.nextRecord).toBe(1);
     expect(client.tailReads).toEqual([]);
     expect(client.readAllStarts).toEqual([]);
+  });
+
+  it('does not pre-create a stream before a create-if-missing load', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+
+    const state = await journal.loadForMutation('wrun_lazy_create', {
+      createIfMissing: true,
+    });
+    await journal.append(state, {
+      operationId: 'lazy-create-1',
+      events: [],
+    });
+
+    expect(client.ensuredStreams).toEqual([]);
+    expect(state.nextRecord).toBe(1);
   });
 
   it('materializes a short cold run without probing its checkpoint stream', async () => {
