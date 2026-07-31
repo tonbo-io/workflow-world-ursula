@@ -921,7 +921,20 @@ export function createStorage(
             .map((change) => state.hooks.get(change.id))
             .filter((hook): hook is Hook => hook !== undefined);
           try {
-            await journal.append(state, materialized.commit);
+            const terminalRunEvent =
+              data.eventType === 'run_completed' ||
+              data.eventType === 'run_failed' ||
+              data.eventType === 'run_cancelled';
+            const committedWithDelivery =
+              terminalRunEvent && executions
+                ? await executions.commitTerminal(
+                    effectiveRunId,
+                    journal.prepareAppend(state, materialized.commit)
+                  )
+                : false;
+            if (!committedWithDelivery) {
+              await journal.append(state, materialized.commit);
+            }
             if (hookReservation?.acquired) {
               await hookClaims.commit(hookReservation.claim, state.nextRecord);
             }

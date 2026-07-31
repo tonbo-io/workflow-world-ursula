@@ -49,6 +49,13 @@ export interface UrsulaAppendOptions {
   createIfMissing?: boolean;
 }
 
+export interface UrsulaTransactionOperation {
+  stream: string;
+  values: unknown | readonly unknown[];
+  operationId: string;
+  expectedRecord?: number;
+}
+
 export class UrsulaRequestError extends Error {
   readonly status: number;
   readonly operation: string;
@@ -405,6 +412,71 @@ export class UrsulaClient {
         (options.expectedRecord ?? 0) + records.length
       ),
     };
+  }
+
+  /** Atomically appends to streams routed through this client's affinity key. */
+  async appendTransaction(
+    operations: readonly UrsulaTransactionOperation[]
+  ): Promise<void> {
+    if (!this.affinity) {
+      throw new Error('Ursula group transaction requires an affinity client');
+    }
+    if (operations.length === 0) {
+      throw new Error('Ursula group transaction requires at least one operation');
+    }
+    await Promise.all(
+      operations.map(({ stream }) => this.ensureJsonStream(stream))
+    );
+    const url = new URL(
+      `${this.baseUrl}/${encodeURIComponent(this.bucket)}/${encodeURIComponent(this.affinity)}/$transaction`
+    );
+    const response = await this.success(
+      'append group transaction',
+      await this.request(url, {
+        method: 'POST',
+        headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
+        body: stringifyUrsulaJson({
+          operations: operations.map((operation) => {
+            const records = Array.isArray(operation.values)
+              ? operation.values
+              : [operation.values];
+            if (records.length === 0) {
+              throw new Error(
+                'Ursula transaction append requires at least one record'
+              );
+            }
+            return {
+              stream: operation.stream,
+              content_type: JSON_CONTENT_TYPE,
+              payload_base64: Buffer.from(
+                stringifyUrsulaJson(
+                  records.length === 1 ? records[0] : records
+                )
+              ).toString('base64'),
+              ...(operation.expectedRecord === undefined
+                ? {}
+                : { record_match: operation.expectedRecord }),
+              producer: {
+                producer_id: producerId(operation.operationId),
+                producer_epoch: 0,
+                producer_seq: 0,
+              },
+            };
+          }),
+        }),
+      })
+    );
+    const extensions = response.headers.get('stream-extensions') ?? '';
+    if (
+      !extensions
+        .split(',')
+        .map((value) => value.trim())
+        .includes('group-append-transaction-v1')
+    ) {
+      throw new Error(
+        'Ursula did not advertise group-append-transaction-v1 after committing the transaction'
+      );
+    }
   }
 
   async read<T>(
