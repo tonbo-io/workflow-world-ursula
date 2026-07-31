@@ -702,13 +702,20 @@ export function createQueue(
     ValidQueueNameSchema.parse(queueName);
     const runId = runLocalQueues ? affinityForMessage(message) : undefined;
     const partition = runLocalQueues ? 0 : queuePartition(message, partitionCount);
-    if (runId) await registry.registerRun(queueName, runId);
-    else await registry.register(queueName, partition);
     const journal = journalForTarget(queueName, partition, runId);
     if (!journal) {
       throw new Error(`Invalid Ursula queue partition ${partition}`);
     }
-    const messageId = await journal.enqueue(queueName, message, options);
+    // A run-local queue and its global discovery record live in independent
+    // Raft groups. Persist them concurrently so the queue hot path pays the
+    // slower quorum rather than the sum of both quorums. queue() still waits
+    // for both, preserving crash-safe discovery before it acknowledges work.
+    const [messageId] = await Promise.all([
+      journal.enqueue(queueName, message, options),
+      runId
+        ? registry.registerRun(queueName, runId)
+        : registry.register(queueName, partition),
+    ]);
     markReady(queueName, partition, runId);
     wake();
     return { messageId };
