@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 import { createWorkflowUrl } from '@workflow/utils';
 import type { Queue, QueuePrefix, ValidQueueName } from '@workflow/world';
 import {
@@ -34,6 +35,8 @@ const DEFAULT_PARTITION_COUNT = 8;
 type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
 export interface UrsulaQueueConfig {
+  /** Store every run's queue in the same Ursula affinity group as its journal. */
+  runLocalQueues?: boolean;
   deploymentId?: string;
   /**
    * Whether this process claims and delivers queue messages.
@@ -144,6 +147,7 @@ export function createQueue(
     1,
     'Ursula queue partitionShardReplicas'
   );
+  const runLocalQueues = config.runLocalQueues === true;
   if (
     !Number.isSafeInteger(partitionShardIndex) ||
     partitionShardIndex < 0 ||
@@ -162,6 +166,7 @@ export function createQueue(
     { length: partitionCount },
     (_, partition) => new QueueJournal(client, partition)
   );
+  const runJournals = new Map<string, QueueJournal>();
   const registry = new QueueRegistry(client);
   const handlers = new Map<QueuePrefix, QueueHandler>();
   const inFlight = new Set<Promise<void>>();
@@ -225,6 +230,51 @@ export function createQueue(
     );
   }
 
+  function affinityForMessage(message: Parameters<Queue['queue']>[1]): string {
+    if ('__healthCheck' in message) {
+      if (message.runId) return message.runId;
+      return `health-${createHash('sha256')
+        .update(message.correlationId)
+        .digest('base64url')
+        .slice(0, 32)}`;
+    }
+    return message.runId;
+  }
+
+  function ownsRun(runId: string): boolean {
+    const owner =
+      createHash('sha256').update(runId).digest().readUInt32BE(0) %
+      partitionShardCount;
+    return (
+      (partitionShardIndex - owner + partitionShardCount) %
+        partitionShardCount <
+      partitionShardReplicas
+    );
+  }
+
+  function targetKey(
+    queueName: ValidQueueName,
+    partition: number,
+    runId?: string
+  ): string {
+    return `${queueName}\u0000${runId ?? ''}\u0000${partition}`;
+  }
+
+  function journalForTarget(
+    queueName: ValidQueueName,
+    partition: number,
+    runId?: string
+  ): QueueJournal | undefined {
+    if (!runId) return journals[partition];
+    const key = targetKey(queueName, partition, runId);
+    let journal = runJournals.get(key);
+    if (!journal) {
+      journal = new QueueJournal(client, partition, runId);
+      runJournals.set(key, journal);
+    }
+    return journal;
+  }
+
   async function waitAfterWatcherError(): Promise<void> {
     try {
       await delay(pollIntervalMs, undefined, { signal: shutdown.signal });
@@ -234,7 +284,11 @@ export function createQueue(
   }
 
   function journalForLease(lease: QueueLease): QueueJournal {
-    const journal = journals[lease.partition];
+    const journal = journalForTarget(
+      lease.message.queueName,
+      lease.partition,
+      lease.affinity
+    );
     if (!journal) {
       throw new Error(`Invalid Ursula queue partition ${lease.partition}`);
     }
@@ -265,38 +319,56 @@ export function createQueue(
 
   function partitionKey(
     queueName: ValidQueueName,
-    partition: number
+    partition: number,
+    runId?: string
   ): string {
-    return `${queueName}\u0000${partition}`;
+    return targetKey(queueName, partition, runId);
   }
 
-  function markReady(queueName: ValidQueueName, partition: number): void {
-    readyPartitions.add(partitionKey(queueName, partition));
+  function markReady(
+    queueName: ValidQueueName,
+    partition: number,
+    runId?: string
+  ): void {
+    readyPartitions.add(partitionKey(queueName, partition, runId));
   }
 
   function ensureQueueWatcher(
     queueName: ValidQueueName,
-    partition: number
+    partition: number,
+    runId?: string
   ): void {
-    const key = partitionKey(queueName, partition);
+    const key = partitionKey(queueName, partition, runId);
     if (queueWatchers.has(key)) return;
-    const journal = journals[partition];
+    const journal = journalForTarget(queueName, partition, runId);
     if (!journal) return;
     // A newly discovered partition may already contain work written before
     // this process observed its registry record.
-    markReady(queueName, partition);
+    markReady(queueName, partition, runId);
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: a durable watcher owns its long-poll, retry, wake, and shutdown lifecycle.
     const watcher = (async () => {
       while (!shutdown.signal.aborted) {
         try {
-          const changed = await journal.waitForChange(
-            queueName,
-            longPollTimeoutMs,
-            shutdown.signal
-          );
-          if (changed) {
-            markReady(queueName, partition);
-            wake();
+          if (runId) {
+            await journal.watchChanges(
+              queueName,
+              () => {
+                markReady(queueName, partition, runId);
+                wake();
+              },
+              shutdown.signal
+            );
+            if (!shutdown.signal.aborted) await waitAfterWatcherError();
+          } else {
+            const changed = await journal.waitForChange(
+              queueName,
+              longPollTimeoutMs,
+              shutdown.signal
+            );
+            if (changed) {
+              markReady(queueName, partition);
+              wake();
+            }
           }
         } catch (error) {
           if (shutdown.signal.aborted) return;
@@ -483,45 +555,57 @@ export function createQueue(
     }
   }
 
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: queue discovery, capacity and per-run ownership checks belong in one dispatcher pass.
-  async function pump(): Promise<ValidQueueName[]> {
-    const queueNames = registry.current().filter(canDeliver);
-    const now = new Date();
-    for (const queueName of queueNames) {
-      for (const partition of registry.partitions(queueName)) {
-        if (!ownsPartition(partition)) continue;
-        ensureQueueWatcher(queueName, partition);
-        const journal = journals[partition];
-        const deadline = journal?.nextLocalDeadline(queueName, now);
-        if (deadline && deadline <= now) markReady(queueName, partition);
-      }
+  interface DispatchTarget {
+    queueName: ValidQueueName;
+    partition: number;
+    runId?: string;
+    journal: QueueJournal;
+  }
+
+  function dispatchTargets(): DispatchTarget[] {
+    if (runLocalQueues) {
+      return registry
+        .targets()
+        .filter(({ queueName, runId }) => canDeliver(queueName) && Boolean(runId))
+        .filter(({ runId }) => runId !== undefined && ownsRun(runId))
+        .flatMap(({ queueName, partition, runId }) => {
+          const journal = journalForTarget(queueName, partition, runId);
+          return journal ? [{ queueName, partition, runId, journal }] : [];
+        });
     }
-    if (inFlight.size >= concurrency || queueNames.length === 0) {
-      return queueNames;
-    }
-    const queueStart = queueCursor % queueNames.length;
-    const orderedQueues = [
-      ...queueNames.slice(queueStart),
-      ...queueNames.slice(0, queueStart),
-    ];
-    // Visit every partition of the selected logical queue, then rotate the
-    // logical starting point after a successful claim. This preserves topic
-    // fairness even when two topics hash their ready work to distant shards.
-    const work = orderedQueues.flatMap((queueName) =>
+    return registry.current().filter(canDeliver).flatMap((queueName) =>
       registry
         .partitions(queueName)
         .filter(ownsPartition)
-        .filter((partition) =>
-          readyPartitions.has(partitionKey(queueName, partition))
-        )
-        .map((partition) => journals[partition])
-        .filter((journal): journal is QueueJournal => Boolean(journal))
-        .map((journal) => ({ queueName, journal }))
+        .flatMap((partition) => {
+          const journal = journalForTarget(queueName, partition);
+          return journal ? [{ queueName, partition, journal }] : [];
+        })
+    );
+  }
+
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: queue discovery, capacity and per-run ownership checks belong in one dispatcher pass.
+  async function pump(): Promise<DispatchTarget[]> {
+    const targets = dispatchTargets();
+    const now = new Date();
+    for (const { queueName, partition, runId, journal } of targets) {
+      ensureQueueWatcher(queueName, partition, runId);
+      const deadline = journal.nextLocalDeadline(queueName, now);
+      if (deadline && deadline <= now) markReady(queueName, partition, runId);
+    }
+    if (inFlight.size >= concurrency || targets.length === 0) {
+      return targets;
+    }
+    const queueStart = queueCursor % targets.length;
+    const work = [
+      ...targets.slice(queueStart),
+      ...targets.slice(0, queueStart),
+    ].filter(({ queueName, partition, runId }) =>
+      readyPartitions.has(partitionKey(queueName, partition, runId))
     );
     for (const item of work) {
-      if (!item) continue;
-      const { queueName, journal } = item;
-      if (inFlight.size >= concurrency) return queueNames;
+      const { queueName, partition, runId, journal } = item;
+      if (inFlight.size >= concurrency) return targets;
       // Production delivery always crosses the Workflow HTTP route. Besides
       // matching hosted execution, this preserves per-invocation middleware,
       // tracing and accounting. Direct handlers are only a fallback for
@@ -535,11 +619,20 @@ export function createQueue(
           leaseDurationMs
         );
         if (!lease) {
-          readyPartitions.delete(partitionKey(queueName, journal.partition));
+          readyPartitions.delete(partitionKey(queueName, partition, runId));
           break;
         }
-        const logicalIndex = queueNames.indexOf(queueName);
-        queueCursor = (logicalIndex + 1) % queueNames.length;
+        const logicalIndex = targets.indexOf(item);
+        let nextIndex = (logicalIndex + 1) % targets.length;
+        if (!runLocalQueues) {
+          while (
+            nextIndex !== logicalIndex &&
+            targets[nextIndex]?.queueName === queueName
+          ) {
+            nextIndex = (nextIndex + 1) % targets.length;
+          }
+        }
+        queueCursor = nextIndex;
         const task = deliverChain(queueName, lease, handler)
           .catch(() => {
             // Delivery already persisted a retry when possible. A lost lease
@@ -547,32 +640,26 @@ export function createQueue(
           })
           .finally(() => {
             inFlight.delete(task);
-            markReady(queueName, lease.partition);
+            markReady(queueName, lease.partition, lease.affinity);
             wake();
           });
         inFlight.add(task);
       }
     }
-    return queueNames;
+    return targets;
   }
 
   async function waitForWork(
-    queueNames: ValidQueueName[],
+    targets: DispatchTarget[],
     observedVersion: number
   ): Promise<void> {
     const now = new Date();
-    const nextDeadline = queueNames.reduce<Date | undefined>(
-      (queueEarliest, queueName) =>
-        registry
-          .partitions(queueName)
-          .filter(ownsPartition)
-          .map((partition) => journals[partition])
-          .filter((journal): journal is QueueJournal => Boolean(journal))
-          .reduce<Date | undefined>((earliest, journal) => {
-            const deadline = journal.nextLocalDeadline(queueName, now);
-            if (!deadline) return earliest;
-            return !earliest || deadline < earliest ? deadline : earliest;
-          }, queueEarliest),
+    const nextDeadline = targets.reduce<Date | undefined>(
+      (earliest, { queueName, journal }) => {
+        const deadline = journal.nextLocalDeadline(queueName, now);
+        if (!deadline) return earliest;
+        return !earliest || deadline < earliest ? deadline : earliest;
+      },
       undefined
     );
     const deadlineWait = nextDeadline
@@ -591,9 +678,9 @@ export function createQueue(
     while (!shutdown.signal.aborted) {
       const observedVersion = wakeVersion;
       try {
-        const queueNames = await pump();
+        const targets = await pump();
         if (wakeVersion !== observedVersion) continue;
-        await waitForWork(queueNames, observedVersion);
+        await waitForWork(targets, observedVersion);
       } catch (error) {
         if (shutdown.signal.aborted) return;
         // A transient Ursula or network error must not permanently stop queue
@@ -613,14 +700,16 @@ export function createQueue(
 
   const queue: Queue['queue'] = async (queueName, message, options) => {
     ValidQueueNameSchema.parse(queueName);
-    const partition = queuePartition(message, partitionCount);
-    await registry.register(queueName, partition);
-    const journal = journals[partition];
+    const runId = runLocalQueues ? affinityForMessage(message) : undefined;
+    const partition = runLocalQueues ? 0 : queuePartition(message, partitionCount);
+    if (runId) await registry.registerRun(queueName, runId);
+    else await registry.register(queueName, partition);
+    const journal = journalForTarget(queueName, partition, runId);
     if (!journal) {
       throw new Error(`Invalid Ursula queue partition ${partition}`);
     }
     const messageId = await journal.enqueue(queueName, message, options);
-    markReady(queueName, partition);
+    markReady(queueName, partition, runId);
     wake();
     return { messageId };
   };
@@ -699,7 +788,11 @@ export function createQueue(
               }
             : undefined;
         if (execution && executions?.allowsOwnedLazyStarts()) {
-          const journal = journals[execution.queuePartition];
+          const journal = journalForTarget(
+            queueName.data,
+            execution.queuePartition,
+            runLocalQueues ? execution.runId : undefined
+          );
           const ownsLease =
             journal &&
             (await journal.ownsLease(queueName.data, {

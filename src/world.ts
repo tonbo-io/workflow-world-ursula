@@ -22,6 +22,11 @@ export interface UrsulaWorldConfig
    * in a rolling deployment runs a version that understands the format.
    */
   experimentalCompactCompletedStepCommits?: boolean;
+  /**
+   * Uses Ursula path affinity and group-local append transactions for
+   * run-owned stream data and discovery metadata.
+   */
+  experimentalGroupTransactions?: boolean;
 }
 
 function positiveInteger(
@@ -126,6 +131,8 @@ function environmentConfig(): UrsulaWorldConfig {
     experimentalCompactCompletedStepCommits:
       process.env
         .WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS === '1',
+    experimentalGroupTransactions:
+      process.env.WORKFLOW_URSULA_EXPERIMENTAL_GROUP_TRANSACTIONS === '1',
   };
 }
 
@@ -159,12 +166,20 @@ export function createWorld(
   const journal = new RunJournal(client, {
     compactCompletedStepCommits:
       config.experimentalCompactCompletedStepCommits,
+    pathAffinity: config.experimentalGroupTransactions,
   });
   const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
   });
   const { storage } = createStorage(client, { journal, executions });
-  const queue = createQueue(client, config, executions);
+  const queue = createQueue(
+    client,
+    {
+      ...config,
+      runLocalQueues: config.experimentalGroupTransactions,
+    },
+    executions
+  );
   return {
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {

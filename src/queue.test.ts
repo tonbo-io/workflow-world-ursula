@@ -12,7 +12,13 @@ import { QueueJournal, queuePartition } from './queue-journal.js';
 class MemoryClient {
   readonly waitedStreams: string[] = [];
   readonly waitTimeouts: number[] = [];
+  readonly affinities: string[] = [];
   private readonly streams = new Map<string, unknown[]>();
+
+  withAffinity(affinity: string): this {
+    this.affinities.push(affinity);
+    return this;
+  }
 
   async ensureJsonStream(stream: string): Promise<void> {
     if (!this.streams.has(stream)) this.streams.set(stream, []);
@@ -111,9 +117,58 @@ class MemoryClient {
     });
     return this.read<T>(stream, start);
   }
+
+  async watchRecords<T>(
+    stream: string,
+    start: number,
+    onRecords: (records: UrsulaRecord<T>[]) => void | Promise<void>,
+    signal?: AbortSignal
+  ): Promise<void> {
+    this.waitedStreams.push(stream);
+    let cursor = start;
+    while (!signal?.aborted) {
+      const page = await this.read<T>(stream, cursor);
+      if (page.records.length > 0) {
+        await onRecords(page.records);
+        cursor = page.nextRecord;
+      }
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 5);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timeout);
+            resolve();
+          },
+          { once: true }
+        );
+      });
+    }
+  }
 }
 
 describe('Ursula queue runtime', () => {
+  it('stores and watches a run queue through the run affinity key', async () => {
+    const memory = new MemoryClient();
+    const queueName = '__wkf_workflow_run_local' as ValidQueueName;
+    const queue = createQueue(memory as unknown as UrsulaClient, {
+      runLocalQueues: true,
+      pollIntervalMs: 5,
+    });
+    const delivered = vi.fn().mockResolvedValue(undefined);
+    queue.createQueueHandler('__wkf_workflow_', delivered);
+
+    await queue.queue(queueName, { runId: 'wrun_local_1' });
+    await queue.start();
+    await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce());
+    await queue.close();
+
+    expect(memory.affinities).toContain('wrun_local_1');
+    expect(memory.waitedStreams).toContainEqual(
+      expect.stringMatching(/^queue-/)
+    );
+  });
+
   it('rejects an invalid static dispatcher assignment', () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
 

@@ -5,14 +5,22 @@ import { type UrsulaClient, UrsulaRequestError } from './client.js';
 const QUEUE_REGISTRY_STREAM = 'registry-queues';
 
 interface QueueRegistration {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   queueName: ValidQueueName;
   partition?: number;
+  runId?: string;
+}
+
+export interface QueueTarget {
+  queueName: ValidQueueName;
+  partition: number;
+  runId?: string;
 }
 
 export class QueueRegistry {
   private readonly queueNames = new Set<ValidQueueName>();
   private readonly partitionsByQueue = new Map<ValidQueueName, Set<number>>();
+  private readonly targetsByKey = new Map<string, QueueTarget>();
   private nextRecord = 0;
 
   constructor(private readonly client: UrsulaClient) {}
@@ -44,8 +52,24 @@ export class QueueRegistry {
         }
         partitions.add(value.partition as number);
       }
+      if (
+        value.version === 3 &&
+        typeof value.runId === 'string' &&
+        value.runId.length > 0
+      ) {
+        const target = {
+          queueName,
+          partition: value.partition ?? 0,
+          runId: value.runId,
+        } satisfies QueueTarget;
+        this.targetsByKey.set(this.targetKey(target), target);
+      }
       this.nextRecord = record + 1;
     }
+  }
+
+  private targetKey(target: QueueTarget): string {
+    return `${target.queueName}\u0000${target.runId ?? ''}\u0000${target.partition}`;
   }
 
   async register(queueName: ValidQueueName, partition: number): Promise<void> {
@@ -67,6 +91,22 @@ export class QueueRegistry {
     partitions.add(partition);
   }
 
+  async registerRun(queueName: ValidQueueName, runId: string): Promise<void> {
+    const target = { queueName, partition: 0, runId } satisfies QueueTarget;
+    const key = this.targetKey(target);
+    if (this.targetsByKey.has(key)) return;
+    await this.client.append(
+      QUEUE_REGISTRY_STREAM,
+      { version: 3, queueName, partition: 0, runId } satisfies QueueRegistration,
+      {
+        operationId: `register-run-queue:${queueName}:${runId}`,
+        createIfMissing: true,
+      }
+    );
+    this.queueNames.add(queueName);
+    this.targetsByKey.set(key, target);
+  }
+
   current(): ValidQueueName[] {
     return [...this.queueNames];
   }
@@ -75,6 +115,10 @@ export class QueueRegistry {
     return [...(this.partitionsByQueue.get(queueName) ?? [])].sort(
       (left, right) => left - right
     );
+  }
+
+  targets(): QueueTarget[] {
+    return [...this.targetsByKey.values()];
   }
 
   async list(): Promise<ValidQueueName[]> {
