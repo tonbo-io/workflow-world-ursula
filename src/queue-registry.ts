@@ -4,13 +4,13 @@ import { ValidQueueName as ValidQueueNameSchema } from '@workflow/world';
 import { type UrsulaClient, UrsulaRequestError } from './client.js';
 
 const QUEUE_REGISTRY_STREAM = 'registry-queues';
-const RUN_QUEUE_REGISTRY_SHARDS = 32;
+export const RUN_QUEUE_REGISTRY_SHARDS = 32;
 
 function runQueueRegistryStream(shard: number): string {
   return `registry-run-queues-${shard.toString(16).padStart(2, '0')}`;
 }
 
-function runQueueRegistryShard(runId: string): number {
+export function runQueueRegistryShard(runId: string): number {
   return (
     (createHash('sha256').update(runId).digest()[0] ?? 0) %
     RUN_QUEUE_REGISTRY_SHARDS
@@ -155,6 +155,7 @@ export class QueueRegistry {
 
   async watchRunChanges(
     onChange: () => void,
+    shards: readonly number[],
     signal?: AbortSignal
   ): Promise<void> {
     const controller = new AbortController();
@@ -162,7 +163,7 @@ export class QueueRegistry {
     signal?.addEventListener('abort', abort, { once: true });
     try {
       await Promise.all(
-        Array.from({ length: RUN_QUEUE_REGISTRY_SHARDS }, async (_, shard) => {
+        shards.map(async (shard) => {
           const stream = runQueueRegistryStream(shard);
           await this.client.ensureJsonStream(stream);
           await this.client.watchRecords<QueueRegistration>(

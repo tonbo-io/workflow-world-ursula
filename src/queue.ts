@@ -22,7 +22,11 @@ import {
   queuePartition,
   type QueueLease,
 } from './queue-journal.js';
-import { QueueRegistry } from './queue-registry.js';
+import {
+  QueueRegistry,
+  RUN_QUEUE_REGISTRY_SHARDS,
+  runQueueRegistryShard,
+} from './queue-registry.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_LEASE_DURATION_MS = 60_000;
@@ -242,11 +246,18 @@ export function createQueue(
   }
 
   function ownsRun(runId: string): boolean {
-    const owner =
-      createHash('sha256').update(runId).digest().readUInt32BE(0) %
-      partitionShardCount;
+    const owner = runQueueRegistryShard(runId) % partitionShardCount;
     return (
       (partitionShardIndex - owner + partitionShardCount) %
+        partitionShardCount <
+      partitionShardReplicas
+    );
+  }
+
+  function ownsRunQueueRegistryShard(shard: number): boolean {
+    const firstOwner = shard % partitionShardCount;
+    return (
+      (partitionShardIndex - firstOwner + partitionShardCount) %
         partitionShardCount <
       partitionShardReplicas
     );
@@ -388,7 +399,15 @@ export function createQueue(
     while (!shutdown.signal.aborted) {
       try {
         if (runLocalQueues) {
-          await registry.watchRunChanges(wake, shutdown.signal);
+          const ownedShards = Array.from(
+            { length: RUN_QUEUE_REGISTRY_SHARDS },
+            (_, shard) => shard
+          ).filter(ownsRunQueueRegistryShard);
+          await registry.watchRunChanges(
+            wake,
+            ownedShards,
+            shutdown.signal
+          );
           if (!shutdown.signal.aborted) await waitAfterWatcherError();
           continue;
         }
