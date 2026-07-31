@@ -387,6 +387,11 @@ export function createQueue(
   async function watchRegistry(): Promise<void> {
     while (!shutdown.signal.aborted) {
       try {
+        if (runLocalQueues) {
+          await registry.watchRunChanges(wake, shutdown.signal);
+          if (!shutdown.signal.aborted) await waitAfterWatcherError();
+          continue;
+        }
         const changed = await registry.waitForChange(
           longPollTimeoutMs,
           shutdown.signal
