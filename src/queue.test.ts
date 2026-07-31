@@ -167,6 +167,41 @@ describe('Ursula queue runtime', () => {
     expect(memory.waitedStreams).toContainEqual(
       expect.stringMatching(/^queue-/)
     );
+    expect(memory.waitedStreams).toContainEqual(
+      expect.stringMatching(/^registry-run-queues-/)
+    );
+  });
+
+  it('discovers a run-local queue through a sharded registry', async () => {
+    const memory = new MemoryClient();
+    const client = memory as unknown as UrsulaClient;
+    const queueName = '__wkf_workflow_run_remote' as ValidQueueName;
+    const worker = createQueue(client, {
+      runLocalQueues: true,
+      pollIntervalMs: 10_000,
+      leaseDurationMs: 1_000,
+    });
+    const producer = createQueue(client, {
+      runLocalQueues: true,
+      dispatcherEnabled: false,
+    });
+    const handler = vi.fn().mockResolvedValue(undefined);
+    worker.createQueueHandler('__wkf_workflow_', handler);
+    await worker.start();
+
+    await producer.queue(queueName, { runId: 'wrun_remote_local' });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce(), {
+      timeout: 500,
+    });
+    await Promise.all([producer.close(), worker.close()]);
+
+    expect(
+      new Set(
+        memory.waitedStreams.filter((stream) =>
+          stream.startsWith('registry-run-queues-')
+        )
+      ).size
+    ).toBe(32);
   });
 
   it('rejects an invalid static dispatcher assignment', () => {
