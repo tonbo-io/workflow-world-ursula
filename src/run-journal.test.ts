@@ -565,6 +565,48 @@ describe('RunJournal', () => {
     ).toBe(false);
   });
 
+  it('restores execution fences from a checkpoint', async () => {
+    const client = new MemoryClient();
+    const runId = 'wrun_fence_checkpoint';
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.load(runId);
+    await journal.append(state, {
+      operationId: 'execution-fence',
+      events: [],
+      executionFence: {
+        lane: 'run',
+        epoch: 1,
+        queueName: '__wkf_workflow_fenced',
+        queuePartition: 3,
+        token: 'lease-fenced',
+        generation: 17,
+        ownerMessageId: 'msg_fenced',
+        attempt: 2,
+      },
+    });
+    for (let index = 1; index < 128; index += 1) {
+      await journal.append(state, {
+        operationId: `fence-checkpoint-${index}`,
+        events: [],
+      });
+    }
+    await journal.flushCheckpoints();
+
+    const restarted = new RunJournal(client as unknown as UrsulaClient);
+    const restored = await restarted.load(runId);
+
+    expect(restored.executionFences.get('run')).toEqual({
+      lane: 'run',
+      epoch: 1,
+      queueName: '__wkf_workflow_fenced',
+      queuePartition: 3,
+      token: 'lease-fenced',
+      generation: 17,
+      ownerMessageId: 'msg_fenced',
+      attempt: 2,
+    });
+  });
+
   it('does not block the source mutation on checkpoint persistence', async () => {
     const client = new MemoryClient();
     const journal = new RunJournal(client as unknown as UrsulaClient);

@@ -230,6 +230,53 @@ describe('QueueJournal', () => {
     ).toBeNull();
   });
 
+  it('uses the durable lease record as a monotonic execution generation', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    let journal = new QueueJournal(client);
+    const messageId = await journal.enqueue(queueName, {
+      runId: 'run-fenced-redelivery',
+    });
+    const base = Date.now() + 1000;
+    const first = await journal.claim(queueName, new Date(base), 100);
+    if (!first) throw new Error('expected first queue lease');
+
+    await expect(
+      journal.ownsLease(
+        queueName,
+        {
+          messageId,
+          leaseId: first.leaseId,
+          generation: first.generation,
+        },
+        new Date(base + 50)
+      )
+    ).resolves.toBe(true);
+
+    journal = new QueueJournal(client);
+    const second = await journal.claim(
+      queueName,
+      new Date(base + 101),
+      100
+    );
+    if (!second) throw new Error('expected redelivery queue lease');
+
+    expect(second.generation).toBeGreaterThan(first.generation);
+    await expect(
+      journal.ownsLease(queueName, {
+        messageId,
+        leaseId: first.leaseId,
+        generation: first.generation,
+      })
+    ).resolves.toBe(false);
+    await expect(
+      journal.ownsLease(queueName, {
+        messageId,
+        leaseId: second.leaseId,
+        generation: second.generation,
+      })
+    ).resolves.toBe(true);
+  });
+
   it('does not expose a delayed or retry-scheduled message early', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const journal = new QueueJournal(client);

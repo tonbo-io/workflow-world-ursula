@@ -11,8 +11,8 @@ export interface UrsulaWorldConfig
   extends UrsulaStreamerConfig,
     UrsulaQueueConfig {
   /**
-   * Experimental optimization for Workflow's optimistic owned-lazy step path.
-   * The runtime must guarantee one active handler for the owning queue message.
+   * Optimizes owned lazy steps behind a durable run-journal execution fence.
+   * Keep disabled until the workload-specific latency and throughput gate passes.
    */
   experimentalOwnedStepTransactions?: boolean;
   /**

@@ -242,6 +242,7 @@ export function createQueue(
   }
 
   function deliveryExecution(
+    queueName: ValidQueueName,
     lease: QueueLease
   ): DeliveryExecution | undefined {
     const message = lease.message.message;
@@ -252,7 +253,10 @@ export function createQueue(
     return {
       runId: message.runId,
       lane: message.stepId ? `step:${message.stepId}` : 'run',
+      queueName,
+      queuePartition: lease.partition,
       token: lease.leaseId,
+      generation: lease.generation,
       ownerMessageId: lease.message.messageId,
       attempt: lease.message.attempt,
       expiresAt,
@@ -336,7 +340,7 @@ export function createQueue(
         'Ursula queue delivery requires deliveryBaseUrl, WORKFLOW_URSULA_QUEUE_DELIVERY_URL, or PORT'
       );
     }
-    const execution = deliveryExecution(lease);
+    const execution = deliveryExecution(queueName, lease);
     // Queued steps share the workflow topic and the combined flow handler.
     const response = await fetch(
       createWorkflowUrl(baseUrl, { type: 'flow' }),
@@ -352,7 +356,13 @@ export function createQueue(
             ? {
                 'x-ursula-run-id': execution.runId,
                 'x-ursula-execution-lane': execution.lane,
+                'x-ursula-execution-partition': String(
+                  execution.queuePartition
+                ),
                 'x-ursula-execution-token': execution.token,
+                'x-ursula-execution-generation': String(
+                  execution.generation
+                ),
                 'x-ursula-execution-expires-at':
                   execution.expiresAt.toISOString(),
               }
@@ -388,7 +398,7 @@ export function createQueue(
         requestId: lease.message.headers?.['x-vercel-id'],
       })) ?? undefined;
     return executions
-      ? executions.run(deliveryExecution(lease), call)
+      ? executions.run(deliveryExecution(queueName, lease), call)
       : call();
   }
 
@@ -654,6 +664,14 @@ export function createQueue(
         const runId = request.headers.get('x-ursula-run-id');
         const lane = request.headers.get('x-ursula-execution-lane');
         const token = request.headers.get('x-ursula-execution-token');
+        const partitionRaw = request.headers.get(
+          'x-ursula-execution-partition'
+        );
+        const generationRaw = request.headers.get(
+          'x-ursula-execution-generation'
+        );
+        const partition = partitionRaw === null ? NaN : Number(partitionRaw);
+        const generation = generationRaw === null ? NaN : Number(generationRaw);
         const expiresAtRaw = request.headers.get(
           'x-ursula-execution-expires-at'
         );
@@ -662,17 +680,40 @@ export function createQueue(
           runId &&
           lane &&
           token &&
+          Number.isSafeInteger(partition) &&
+          partition >= 0 &&
+          Number.isSafeInteger(generation) &&
+          generation >= 0 &&
           expiresAt &&
           !Number.isNaN(expiresAt.getTime())
             ? {
                 runId,
                 lane,
+                queueName: queueName.data,
+                queuePartition: partition,
                 token,
+                generation,
                 ownerMessageId: messageId.data,
                 attempt,
                 expiresAt,
               }
             : undefined;
+        if (execution && executions?.allowsOwnedLazyStarts()) {
+          const journal = journals[execution.queuePartition];
+          const ownsLease =
+            journal &&
+            (await journal.ownsLease(queueName.data, {
+              messageId: messageId.data,
+              leaseId: execution.token,
+              generation: execution.generation,
+            }));
+          if (!ownsLease) {
+            return Response.json(
+              { error: 'Ursula queue delivery lease is no longer active' },
+              { status: 409 }
+            );
+          }
+        }
         const result = executions
           ? await executions.run(execution, call)
           : await call();

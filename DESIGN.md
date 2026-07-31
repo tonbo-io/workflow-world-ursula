@@ -97,17 +97,14 @@ Workflow's public World contract exposes `step_started` and the terminal
 awaited calls. Persisting both literally costs two Raft commits per logical
 step even when one queue delivery owns the entire inline execution.
 
-For ordinary queue delivery, the Ursula adapter claims an execution lane in
-the run journal before entering the Workflow handler. The claim contains a
-unique fencing token, owner message ID, attempt, expiry, and monotonically
-increasing generation. The `run` lane covers inline orchestration; a
-background step uses `step:<stepId>`, so independent parallel steps do not
-serialize on one lease. With
-`WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1`, Turbo's optimistic
-lazy inline start can use its owning queue message as the transaction fence
-without paying a separate execution-claim append. This remains opt-in because
-the current World interface does not tell a backend whether a lazy start is
-running under Turbo's single-handler guarantee.
+With `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1`, the Ursula
+adapter claims an execution lane in the run journal before entering a queue
+delivery handler. The claim contains a run-local epoch, queue source, unique
+fencing token, owner message ID, attempt, and monotonically increasing durable
+lease generation. The `run` lane covers inline orchestration; a background
+step uses `step:<stepId>`, so independent parallel steps do not serialize on
+one fence. Turbo's optimistic lazy inline start also combines `step_created`
+with the started and terminal lifecycle.
 
 Inside that claimed handler, `step_started` is materialized speculatively but
 not appended. The terminal mutation replays the staged start against the
@@ -135,20 +132,19 @@ disabled, then enable writers in a second rollout. This is the same
 mixed-version rule as checkpoint schema evolution: an old reader must never
 observe a record it cannot decode.
 
-The execution claim, or Turbo's durable owner message, is the pre-body
-linearization and crash-recovery boundary. Claimed terminal transactions
-verify the same token and generation before their record-tail-guarded append.
+The execution fence is the pre-body linearization and crash-recovery boundary.
+Claimed terminal transactions verify the same queue source, token, and
+generation before their record-tail-guarded append.
 If the handler dies, no speculative step event is visible and queue redelivery
 can claim a newer generation or re-run the owned lazy step. If an old claimed
 handler later returns, the generation check rejects its terminal write.
 External run events committed after the claim do not revoke the owner;
 terminal materialization rebases on them under `Stream-Record-Match`.
 
-For a Turbo invocation that executes `N` owned lazy steps, the run write cost
-is `N` atomic step appends instead of `2N` step appends. A non-Turbo queue
-invocation pays one execution-claim append plus `N` atomic step appends.
-Transports that provide neither a delivery lease nor an owned lazy start fall
-back to the literal two-append contract.
+For a queue invocation that executes `N` staged steps, the opt-in run write
+cost is one execution-fence append plus `N` atomic step appends instead of
+`2N` step appends. Transports without a queue delivery lease and deployments
+with the option disabled fall back to the literal two-append contract.
 
 The queue journal still owns ready-message discovery, delivery attempts,
 delays, and acknowledgement. A later phase can move continuation readiness

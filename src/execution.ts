@@ -8,10 +8,17 @@ import type {
 export interface DeliveryExecution {
   runId: string;
   lane: string;
+  queueName: string;
+  queuePartition: number;
   token: string;
+  generation: number;
   ownerMessageId: string;
   attempt: number;
   expiresAt: Date;
+}
+
+export interface ClaimedExecutionFence extends DeliveryExecution {
+  epoch: number;
 }
 
 export interface StagedStepStart {
@@ -22,26 +29,33 @@ export interface StagedStepStart {
   syntheticEventId: string;
   now: Date;
   result: EventResult;
+  fence?: ClaimedExecutionFence;
 }
 
 interface DeliveryContext {
   runId: string;
   delivery: DeliveryExecution;
+  fence?: ClaimedExecutionFence;
   stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
 }
 
+type ExecutionFenceClaimer = (
+  delivery: DeliveryExecution
+) => Promise<ClaimedExecutionFence>;
+
 /**
  * Coordinates owned step commits within one adapter process.
  *
- * The durable queue lease remains the delivery authority. Run mutations use
- * Ursula's record-tail CAS as their correctness boundary, so this coordinator
- * never writes a second lease into the run journal.
+ * The durable queue lease remains the delivery authority. The optional fence
+ * claimer projects that ownership into the run journal before handler code is
+ * allowed to execute.
  */
 export class RunExecutionCoordinator {
   private readonly contexts = new AsyncLocalStorage<DeliveryContext>();
   private readonly ownedStarts = new Map<string, StagedStepStart>();
   private readonly ownedTurns = new Map<string, Promise<void>>();
+  private fenceClaimer: ExecutionFenceClaimer | undefined;
 
   constructor(
     private readonly options: { allowOwnedLazyStarts?: boolean } = {}
@@ -51,6 +65,10 @@ export class RunExecutionCoordinator {
     return this.options.allowOwnedLazyStarts === true;
   }
 
+  setFenceClaimer(claimer: ExecutionFenceClaimer): void {
+    this.fenceClaimer = claimer;
+  }
+
   async run<T>(
     delivery: DeliveryExecution | undefined,
     task: () => Promise<T>
@@ -58,10 +76,14 @@ export class RunExecutionCoordinator {
     if (!delivery || delivery.expiresAt.getTime() <= Date.now()) {
       return task();
     }
+    const fence = this.allowsOwnedLazyStarts()
+      ? await this.claimFence(delivery)
+      : undefined;
     return this.contexts.run(
       {
         runId: delivery.runId,
         delivery,
+        fence,
         stagedStarts: new Map(),
         turn: Promise.resolve(),
       },
@@ -69,9 +91,43 @@ export class RunExecutionCoordinator {
     );
   }
 
-  current(runId: string): DeliveryExecution | undefined {
+  private async claimFence(
+    delivery: DeliveryExecution
+  ): Promise<ClaimedExecutionFence> {
+    if (!this.fenceClaimer) {
+      throw new Error('Ursula execution fence claimer is not configured');
+    }
+    return this.fenceClaimer(delivery);
+  }
+
+  current(
+    runId: string,
+    ownerMessageId?: string
+  ): DeliveryExecution | undefined {
     const context = this.contexts.getStore();
-    return context?.runId === runId ? context.delivery : undefined;
+    if (
+      context?.runId !== runId ||
+      (ownerMessageId !== undefined &&
+        context.delivery.ownerMessageId !== ownerMessageId)
+    ) {
+      return;
+    }
+    return context.delivery;
+  }
+
+  fence(
+    runId: string,
+    ownerMessageId?: string
+  ): ClaimedExecutionFence | undefined {
+    const context = this.contexts.getStore();
+    if (
+      context?.runId !== runId ||
+      (ownerMessageId !== undefined &&
+        context.delivery.ownerMessageId !== ownerMessageId)
+    ) {
+      return;
+    }
+    return context.fence;
   }
 
   staged(runId: string, stepId: string): StagedStepStart | undefined {

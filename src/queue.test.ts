@@ -7,7 +7,7 @@ import type {
 } from './client.js';
 import type { RunExecutionCoordinator } from './execution.js';
 import { createQueue } from './queue.js';
-import { queuePartition } from './queue-journal.js';
+import { QueueJournal, queuePartition } from './queue-journal.js';
 
 class MemoryClient {
   readonly waitedStreams: string[] = [];
@@ -166,6 +166,47 @@ describe('Ursula queue runtime', () => {
       ownerMessageId: expect.stringMatching(/^msg_/),
       attempt: 1,
     });
+  });
+
+  it('rejects an expired fenced HTTP delivery before invoking its handler', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const run = vi.fn();
+    const executions = {
+      allowsOwnedLazyStarts: () => true,
+      run,
+    } as unknown as RunExecutionCoordinator;
+    const queueName = '__wkf_workflow_stale_http' as ValidQueueName;
+    const journal = new QueueJournal(client);
+    await journal.enqueue(queueName, { runId: 'wrun_stale_http' });
+    const lease = await journal.claim(queueName, new Date(), -1);
+    if (!lease) throw new Error('expected expired queue lease');
+    const handler = createQueue(client, {}, executions).createQueueHandler(
+      '__wkf_workflow_',
+      async () => undefined
+    );
+
+    const response = await handler(
+      new Request('http://workflow.test/flow', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-vqs-queue-name': queueName,
+          'x-vqs-message-id': lease.message.messageId,
+          'x-vqs-message-attempt': String(lease.message.attempt),
+          'x-ursula-run-id': 'wrun_stale_http',
+          'x-ursula-execution-lane': 'run',
+          'x-ursula-execution-partition': String(lease.partition),
+          'x-ursula-execution-token': lease.leaseId,
+          'x-ursula-execution-generation': String(lease.generation),
+          'x-ursula-execution-expires-at':
+            lease.message.leaseExpiresAt?.toISOString() ?? '',
+        },
+        body: JSON.stringify(lease.message.message),
+      })
+    );
+
+    expect(response.status).toBe(409);
+    expect(run).not.toHaveBeenCalled();
   });
 
   it('recovers an enqueued message in a fresh dispatcher', async () => {

@@ -172,7 +172,10 @@ function delivery(
   return {
     runId: 'wrun_atomic',
     lane: 'run',
+    queueName: '__wkf_workflow_test',
+    queuePartition: 0,
     token,
+    generation: 10,
     ownerMessageId: 'msg_atomic',
     attempt: 1,
     expiresAt: new Date(Date.now() + 60_000),
@@ -258,8 +261,8 @@ async function setup(allowOwnedLazyStarts = true) {
 }
 
 describe('atomic step transactions', () => {
-  it('keeps the public two-append contract by default', async () => {
-    const { memory, storage } = await setup(false);
+  it('keeps the public contract without a queue delivery lease', async () => {
+    const { memory, storage } = await setup();
     const before = memory.runCommits().length;
 
     await storage.events.create('wrun_atomic', stepStarted('step-default'));
@@ -291,6 +294,20 @@ describe('atomic step transactions', () => {
     await first;
   });
 
+  it('keeps delivery contexts isolated between World coordinators', async () => {
+    const first = new RunExecutionCoordinator();
+    const second = new RunExecutionCoordinator();
+
+    await first.run(delivery('lease-first'), async () => {
+      expect(first.current('wrun_atomic')?.token).toBe('lease-first');
+      expect(second.current('wrun_atomic')).toBeUndefined();
+      await second.run(delivery('lease-second'), async () => {
+        expect(first.current('wrun_atomic')?.token).toBe('lease-first');
+        expect(second.current('wrun_atomic')?.token).toBe('lease-second');
+      });
+    });
+  });
+
   it('commits an owned lazy turbo step without a queue delivery context', async () => {
     const { memory, storage } = await setup();
     const before = memory.runCommits().length;
@@ -318,6 +335,27 @@ describe('atomic step transactions', () => {
     ]);
   });
 
+  it('does not append a delivery fence when the experiment is disabled', async () => {
+    const { executions, memory, storage } = await setup(false);
+    const before = memory.runCommits().length;
+
+    await executions.run(delivery('lease-disabled'), async () => {
+      await storage.events.create('wrun_atomic', stepCreated('step-disabled'));
+      await storage.events.create(
+        'wrun_atomic',
+        plainStepStarted('step-disabled')
+      );
+      await storage.events.create(
+        'wrun_atomic',
+        stepCompleted('step-disabled')
+      );
+    });
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(2);
+    expect(commits.every(({ executionFence }) => !executionFence)).toBe(true);
+  });
+
   it('commits step_started and step_completed in one run record', async () => {
     const { executions, memory, storage } = await setup();
     const before = memory.runCommits().length;
@@ -336,11 +374,24 @@ describe('atomic step transactions', () => {
     });
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(2);
-    expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits).toHaveLength(3);
+    expect(commits[0]).toMatchObject({
+      events: [],
+      executionFence: {
+        lane: 'run',
+        epoch: 1,
+        queueName: '__wkf_workflow_test',
+        queuePartition: 0,
+        token: 'lease-1',
+        generation: 10,
+        ownerMessageId: 'msg_atomic',
+        attempt: 1,
+      },
+    });
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
     ]);
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);
@@ -378,11 +429,14 @@ describe('atomic step transactions', () => {
       ]);
     });
 
-    // Each lazy start is committed to settle create ownership, followed by
-    // its terminal event. No second run-journal lease is needed because the
-    // durable queue lease already owns the delivery.
+    // One durable delivery fence covers both steps. Each successful step then
+    // commits its complete lifecycle in one record.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(4);
+    expect(commits).toHaveLength(3);
+    expect(commits[0]).toMatchObject({
+      events: [],
+      executionFence: { token: 'lease-parallel' },
+    });
     expect(
       commits
         .flatMap(({ events }) => events)
@@ -410,6 +464,85 @@ describe('atomic step transactions', () => {
     );
   });
 
+  it('rejects an old handler as soon as a redelivery enters the handler', async () => {
+    const { client, journal, memory } = await setup();
+    const first = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
+    const second = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
+    const { storage: firstStorage } = createStorage(client, {
+      journal,
+      executions: first,
+    });
+    const { storage: secondStorage } = createStorage(client, {
+      journal,
+      executions: second,
+    });
+    const before = memory.runCommits().length;
+    let releaseFirst = () => {};
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted = () => {};
+    const firstDidStart = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+
+    const oldHandler = first.run(delivery('lease-old'), async () => {
+      await firstStorage.events.create(
+        'wrun_atomic',
+        stepStarted('step-fenced')
+      );
+      firstStarted();
+      await firstMayFinish;
+      await expect(
+        firstStorage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-fenced')
+        )
+      ).rejects.toSatisfy((error: unknown) =>
+        PreconditionFailedError.is(error)
+      );
+    });
+    await firstDidStart;
+
+    await second.run(
+      delivery('lease-new', { attempt: 2, generation: 11 }),
+      async () => {
+        // The new fence is durable before this callback begins. The old
+        // handler must already be unable to commit even though this delivery
+        // has not reached its first step.
+        releaseFirst();
+        await oldHandler;
+        await secondStorage.events.create(
+          'wrun_atomic',
+          stepStarted('step-fenced')
+        );
+        await secondStorage.events.create(
+          'wrun_atomic',
+          stepCompleted('step-fenced')
+        );
+      }
+    );
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(3);
+    expect(
+      commits
+        .filter(({ executionFence }) => executionFence)
+        .map(({ executionFence }) => [
+          executionFence?.token,
+          executionFence?.epoch,
+        ])
+    ).toEqual([
+      ['lease-old', 1],
+      ['lease-new', 2],
+    ]);
+    expect(
+      commits
+        .flatMap(({ events }) => events)
+        .filter(({ eventType }) => eventType === 'step_completed')
+    ).toHaveLength(1);
+  });
+
   it('surfaces exhausted ordinary event CAS conflicts as replayable precondition failures', async () => {
     const { memory, storage } = await setup(false);
     memory.failRunAppendsWithConflict(16);
@@ -424,21 +557,25 @@ describe('atomic step transactions', () => {
     );
   });
 
-  it('grants create ownership only once across discarded deliveries', async () => {
+  it('lets a newer delivery reclaim an uncommitted lazy step', async () => {
     const { client, journal, memory } = await setup();
-    const first = new RunExecutionCoordinator();
-    const second = new RunExecutionCoordinator();
+    const first = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
+    const second = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
     const before = memory.runCommits().length;
 
     // A delivery that starts a step and is then abandoned without ever
     // committing a terminal event — a crash, or a lost race.
     const claims: (boolean | undefined)[] = [];
-    const start = async (coordinator: RunExecutionCoordinator, tag: string) => {
+    const start = async (
+      coordinator: RunExecutionCoordinator,
+      tag: string,
+      generation: number
+    ) => {
       const { storage } = createStorage(client, {
         journal,
         executions: coordinator,
       });
-      await coordinator.run(delivery(tag), async () => {
+      await coordinator.run(delivery(tag, { generation }), async () => {
         const result = await storage.events.create(
           'wrun_atomic',
           stepStarted('step-once')
@@ -447,22 +584,19 @@ describe('atomic step transactions', () => {
       });
     };
 
-    await start(first, 'lease-first');
-    await expect(start(second, 'lease-second')).rejects.toThrow(
-      'already created'
-    );
+    await start(first, 'lease-first', 10);
+    await start(second, 'lease-second', 11);
 
-    // `stepCreated` is the runtime's exactly-once signal for running a step
-    // body inline. Answering it from an uncommitted stage handed it to every
-    // delivery that materialized the same creation.
-    expect(claims.filter(Boolean)).toHaveLength(1);
+    // No speculative lifecycle event is visible until its terminal commit.
+    // A newer at-least-once delivery must therefore rerun the abandoned body.
+    expect(claims).toEqual([true, true]);
     expect(
       memory
         .runCommits()
         .slice(before)
         .flatMap(({ events }) => events)
         .filter(({ eventType }) => eventType === 'step_created')
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
 
   it('reclaims a hook token whose owner died before committing its run', async () => {
@@ -521,8 +655,8 @@ describe('atomic step transactions', () => {
     );
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(2);
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits).toHaveLength(3);
+    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);
@@ -530,8 +664,8 @@ describe('atomic step transactions', () => {
 
   it('converges when an expired delivery completes after its redelivery', async () => {
     const { client, journal } = await setup();
-    const first = new RunExecutionCoordinator();
-    const second = new RunExecutionCoordinator();
+    const first = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
+    const second = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
     const { storage: firstStorage } = createStorage(client, {
       journal,
       executions: first,
@@ -575,6 +709,7 @@ describe('atomic step transactions', () => {
       delivery('lease-new', {
         ownerMessageId: 'msg_new',
         attempt: 2,
+        generation: 11,
       }),
       async () => {
         await secondStorage.events.create(
