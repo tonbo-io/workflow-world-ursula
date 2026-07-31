@@ -8,6 +8,7 @@ import {
   UrsulaClient,
   type UrsulaRecord,
   UrsulaRequestError,
+  type UrsulaTransactionOperation,
 } from './client.js';
 import {
   type DeliveryExecution,
@@ -74,6 +75,30 @@ class MemoryClient extends UrsulaClient {
     this.streams.set(stream, current);
     this.appends.push({ stream, values: records });
     return { startRecord, nextRecord: current.length };
+  }
+
+  async appendTransaction(
+    operations: readonly UrsulaTransactionOperation[]
+  ): Promise<void> {
+    for (const operation of operations) {
+      const current = this.streams.get(operation.stream) ?? [];
+      if (
+        operation.expectedRecord !== undefined &&
+        operation.expectedRecord !== current.length
+      ) {
+        throw new UrsulaRequestError(
+          'append group transaction',
+          new Response('record tail mismatch', { status: 412 }),
+          'record tail mismatch'
+        );
+      }
+    }
+    for (const operation of operations) {
+      await this.append(operation.stream, operation.values, {
+        operationId: operation.operationId,
+        expectedRecord: operation.expectedRecord,
+      });
+    }
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
@@ -243,6 +268,10 @@ async function setup(allowOwnedLazyStarts = true) {
   const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts,
   });
+  executions.setOwnedStepCommitter(async (_delivery, append) => {
+    await memory.appendTransaction([append.operation]);
+    append.apply();
+  });
   const { storage } = createStorage(client, { journal, executions });
   await storage.events.create('wrun_atomic', {
     eventType: 'run_created',
@@ -306,6 +335,26 @@ describe('atomic step transactions', () => {
         expect(second.current('wrun_atomic')?.token).toBe('lease-second');
       });
     });
+  });
+
+  it('bridges an owned delivery to a separate server bundle by owner message', async () => {
+    const handlerBundle = new RunExecutionCoordinator({
+      allowOwnedLazyStarts: true,
+    });
+    const storageBundle = new RunExecutionCoordinator({
+      allowOwnedLazyStarts: true,
+    });
+    const current = delivery('lease-bundle');
+
+    await handlerBundle.run(current, async () => {
+      expect(
+        storageBundle.current(current.runId, current.ownerMessageId)
+      ).toEqual(current);
+      expect(storageBundle.current(current.runId)).toBeUndefined();
+    });
+    expect(
+      storageBundle.current(current.runId, current.ownerMessageId)
+    ).toBeUndefined();
   });
 
   it('commits an owned lazy turbo step without a queue delivery context', async () => {
@@ -374,24 +423,11 @@ describe('atomic step transactions', () => {
     });
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
-    expect(commits[0]).toMatchObject({
-      events: [],
-      executionFence: {
-        lane: 'run',
-        epoch: 1,
-        queueName: '__wkf_workflow_test',
-        queuePartition: 0,
-        token: 'lease-1',
-        generation: 10,
-        ownerMessageId: 'msg_atomic',
-        attempt: 1,
-      },
-    });
-    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits).toHaveLength(2);
+    expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_created',
     ]);
-    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);
@@ -432,11 +468,7 @@ describe('atomic step transactions', () => {
     // One durable delivery fence covers both steps. Each successful step then
     // commits its complete lifecycle in one record.
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
-    expect(commits[0]).toMatchObject({
-      events: [],
-      executionFence: { token: 'lease-parallel' },
-    });
+    expect(commits).toHaveLength(2);
     expect(
       commits
         .flatMap(({ events }) => events)
@@ -464,7 +496,7 @@ describe('atomic step transactions', () => {
     );
   });
 
-  it('rejects an old handler as soon as a redelivery enters the handler', async () => {
+  it('rejects an old handler when a newer lease wins the terminal fence', async () => {
     const { client, journal, memory } = await setup();
     const first = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
     const second = new RunExecutionCoordinator({ allowOwnedLazyStarts: true });
@@ -476,6 +508,18 @@ describe('atomic step transactions', () => {
       journal,
       executions: second,
     });
+    let activeToken = 'lease-old';
+    const installCommitter = (coordinator: RunExecutionCoordinator) => {
+      coordinator.setOwnedStepCommitter(async (delivery, append) => {
+        if (delivery.token !== activeToken) {
+          throw new PreconditionFailedError('delivery lease was superseded');
+        }
+        await memory.appendTransaction([append.operation]);
+        append.apply();
+      });
+    };
+    installCommitter(first);
+    installCommitter(second);
     const before = memory.runCommits().length;
     let releaseFirst = () => {};
     const firstMayFinish = new Promise<void>((resolve) => {
@@ -507,9 +551,7 @@ describe('atomic step transactions', () => {
     await second.run(
       delivery('lease-new', { attempt: 2, generation: 11 }),
       async () => {
-        // The new fence is durable before this callback begins. The old
-        // handler must already be unable to commit even though this delivery
-        // has not reached its first step.
+        activeToken = 'lease-new';
         releaseFirst();
         await oldHandler;
         await secondStorage.events.create(
@@ -524,18 +566,7 @@ describe('atomic step transactions', () => {
     );
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
-    expect(
-      commits
-        .filter(({ executionFence }) => executionFence)
-        .map(({ executionFence }) => [
-          executionFence?.token,
-          executionFence?.epoch,
-        ])
-    ).toEqual([
-      ['lease-old', 1],
-      ['lease-new', 2],
-    ]);
+    expect(commits).toHaveLength(1);
     expect(
       commits
         .flatMap(({ events }) => events)
@@ -655,8 +686,8 @@ describe('atomic step transactions', () => {
     );
 
     const commits = memory.runCommits().slice(before);
-    expect(commits).toHaveLength(3);
-    expect(commits[2]?.events.map(({ eventType }) => eventType)).toEqual([
+    expect(commits).toHaveLength(2);
+    expect(commits[1]?.events.map(({ eventType }) => eventType)).toEqual([
       'step_started',
       'step_completed',
     ]);

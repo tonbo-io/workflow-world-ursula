@@ -97,14 +97,7 @@ Workflow's public World contract exposes `step_started` and the terminal
 awaited calls. Persisting both literally costs two Raft commits per logical
 step even when one queue delivery owns the entire inline execution.
 
-With `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1`, the Ursula
-adapter claims an execution lane in the run journal before entering a queue
-delivery handler. The claim contains a run-local epoch, queue source, unique
-fencing token, owner message ID, attempt, and monotonically increasing durable
-lease generation. The `run` lane covers inline orchestration; a background
-step uses `step:<stepId>`, so independent parallel steps do not serialize on
-one fence. Turbo's optimistic lazy inline start also combines `step_created`
-with the started and terminal lifecycle.
+With both `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1` and `WORKFLOW_URSULA_EXPERIMENTAL_GROUP_TRANSACTIONS=1`, the durable queue lease is the execution fence. The adapter does not copy that fence into a second run-journal record before entering the handler. The delivery headers carry the queue source, token, owner message ID, attempt, and monotonically increasing lease generation into the application process. A process-global registry keyed by run and owner message bridges framework server bundles without becoming durable state.
 
 Inside that claimed handler, `step_started` is materialized speculatively but
 not appended. The terminal mutation replays the staged start against the
@@ -132,19 +125,9 @@ disabled, then enable writers in a second rollout. This is the same
 mixed-version rule as checkpoint schema evolution: an old reader must never
 observe a record it cannot decode.
 
-The execution fence is the pre-body linearization and crash-recovery boundary.
-Claimed terminal transactions verify the same queue source, token, and
-generation before their record-tail-guarded append.
-If the handler dies, no speculative step event is visible and queue redelivery
-can claim a newer generation or re-run the owned lazy step. If an old claimed
-handler later returns, the generation check rejects its terminal write.
-External run events committed after the claim do not revoke the owner;
-terminal materialization rebases on them under `Stream-Record-Match`.
+The terminal commit is a group-local Ursula transaction containing the complete run step and a queue `lease_extended` transition. Both operations carry their observed record tails. If a redelivery has installed a newer lease, its queue append changes the tail and the stale handler's transaction fails atomically; if the old handler wins first, its lease extension prevents the redelivery from claiming that message. No speculative step event is visible when a handler dies before this boundary. External run events cause the run precondition to fail and the reducer rebases before retrying.
 
-For a queue invocation that executes `N` staged steps, the opt-in run write
-cost is one execution-fence append plus `N` atomic step appends instead of
-`2N` step appends. Transports without a queue delivery lease and deployments
-with the option disabled fall back to the literal two-append contract.
+For a queue invocation that executes `N` staged steps, the opt-in write cost is `N` group-local Raft commits instead of one execution-fence commit plus `N` step commits or the literal `2N` step commits. Each successful commit advances both the run and queue journals but crosses one HTTP and consensus boundary. Transports without a queue delivery lease and deployments with the option disabled fall back to the literal two-append contract.
 
 The queue journal still owns ready-message discovery, delivery attempts,
 delays, and acknowledgement. A later phase can move continuation readiness

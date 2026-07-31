@@ -13,6 +13,7 @@ import {
   isUrsulaRequestError,
   type UrsulaClient,
   type UrsulaReadResult,
+  type UrsulaTransactionOperation,
 } from './client.js';
 
 export interface EntityChange<T> {
@@ -68,6 +69,11 @@ export interface RunJournalOptions {
    * option only in a second rollout.
    */
   compactCompletedStepCommits?: boolean;
+}
+
+export interface PreparedRunAppend {
+  operation: UrsulaTransactionOperation;
+  apply(): void;
 }
 
 type CompactCompletedStepFieldsV2 = [
@@ -1229,6 +1235,25 @@ export class RunJournal {
     commit: Omit<RunCommit, 'version' | 'runId' | 'previousRecord'>,
     options: { cache?: boolean } = {}
   ): Promise<RunJournalState> {
+    const prepared = this.prepareAppend(state, commit, options);
+    await this.clientFor(state.runId).append(
+      prepared.operation.stream,
+      prepared.operation.values,
+      {
+        operationId: prepared.operation.operationId,
+        expectedRecord: prepared.operation.expectedRecord,
+        createIfMissing: state.nextRecord === 0,
+      }
+    );
+    prepared.apply();
+    return state;
+  }
+
+  prepareAppend(
+    state: RunJournalState,
+    commit: Omit<RunCommit, 'version' | 'runId' | 'previousRecord'>,
+    options: { cache?: boolean } = {}
+  ): PreparedRunAppend {
     const useCache = options.cache !== false;
     const value: RunCommit = {
       ...commit,
@@ -1239,38 +1264,42 @@ export class RunJournal {
     const storedValue = this.compactCompletedStepCommits
       ? (compactCompletedStepCommit(value) ?? value)
       : value;
-    await this.clientFor(state.runId).append(streamId(state.runId), storedValue, {
-      operationId: commit.operationId,
-      expectedRecord: state.nextRecord,
-      createIfMissing: state.nextRecord === 0,
-    });
-    // `value` was built from already validated World entities above. Parsing
-    // it again here would run Zod over every event twice on the hot path.
-    applyCommit(state, value, state.nextRecord);
-    if (useCache) {
-      const cached = this.cache.get(state.runId);
-      if (cached && cached.nextRecord === value.previousRecord) {
-        applyCommit(cached, value, cached.nextRecord);
-      } else {
-        this.rememberState(state.runId, state);
-      }
-      if (state.run && isTerminalWorkflowRunStatus(state.run.status)) {
-        this.cache.delete(state.runId);
-      }
-      const events = this.eventCache.get(state.runId);
-      if (events && events.nextRecord === value.previousRecord) {
-        events.events.push(...value.events);
-        events.nextRecord = value.previousRecord + 1;
-      } else if (!events && value.previousRecord === 0) {
-        this.rememberEvents(state.runId, {
-          nextRecord: 1,
-          events: [...value.events],
-        });
-      } else if (events) {
-        this.rememberEvents(state.runId, events);
-      }
-    }
-    this.scheduleCheckpoint(state);
-    return state;
+    return {
+      operation: {
+        stream: streamId(state.runId),
+        values: storedValue,
+        operationId: commit.operationId,
+        expectedRecord: state.nextRecord,
+      },
+      apply: () => {
+        // `value` was built from already validated World entities above.
+        // Parsing it again here would run Zod over every event twice.
+        applyCommit(state, value, state.nextRecord);
+        if (useCache) {
+          const cached = this.cache.get(state.runId);
+          if (cached && cached.nextRecord === value.previousRecord) {
+            applyCommit(cached, value, cached.nextRecord);
+          } else {
+            this.rememberState(state.runId, state);
+          }
+          if (state.run && isTerminalWorkflowRunStatus(state.run.status)) {
+            this.cache.delete(state.runId);
+          }
+          const events = this.eventCache.get(state.runId);
+          if (events && events.nextRecord === value.previousRecord) {
+            events.events.push(...value.events);
+            events.nextRecord = value.previousRecord + 1;
+          } else if (!events && value.previousRecord === 0) {
+            this.rememberEvents(state.runId, {
+              nextRecord: 1,
+              events: [...value.events],
+            });
+          } else if (events) {
+            this.rememberEvents(state.runId, events);
+          }
+        }
+        this.scheduleCheckpoint(state);
+      },
+    };
   }
 }

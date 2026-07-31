@@ -824,6 +824,26 @@ export function createQueue(
     };
   };
 
+  if (runLocalQueues && executions) {
+    executions.setOwnedStepCommitter(async (delivery, append) => {
+      const journal = journalForTarget(
+        delivery.queueName as ValidQueueName,
+        delivery.queuePartition,
+        delivery.runId
+      );
+      if (!journal) {
+        throw new Error(
+          `Invalid Ursula queue partition ${delivery.queuePartition}`
+        );
+      }
+      await journal.commitOwnedStep(
+        delivery,
+        append,
+        new Date(Date.now() + leaseDurationMs)
+      );
+    });
+  }
+
   return {
     queue,
     createQueueHandler,

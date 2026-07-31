@@ -142,7 +142,7 @@ rather than throughput.
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_COUNT` | Optional static dispatcher pool size; use one stable shard index per replica to avoid every dispatcher racing every queue partition |
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_INDEX` | Zero-based static index for this dispatcher; every index must stay covered by a live replica |
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_REPLICAS` | Number of adjacent dispatcher indices allowed to claim each partition, default `1`; use `2` to trade some duplicate CAS attempts for failover and lower single-run latency |
-| `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS` | Set to `1` to fence a queue delivery in the run journal before its handler executes and combine each owned lazy step lifecycle into one record; keep disabled until its workload performance gate passes |
+| `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS` | Set to `1` together with group transactions to commit each owned step lifecycle and its queue-lease fence in one group-local Ursula transaction; keep disabled until its workload performance gate passes |
 | `WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS` | Set to `1` only after every process can read compact v2 records; removes duplicated owned-step fields from the authoritative run append |
 | `WORKFLOW_URSULA_EXPERIMENTAL_GROUP_TRANSACTIONS` | Set to `1` to route each run's journal, queue, and chunk streams through `/{bucket}/{runId}/...`; run-local queue dispatch uses background SSE watchers and Ursula group-local transactions are used where one operation spans run-owned streams |
 | `WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS` | Maximum graceful wait for in-flight handlers |
@@ -152,10 +152,7 @@ rather than throughput.
 - Each accepted workflow event and the resulting materialized entities are
   stored in the same conditional Ursula append.
 - Per-run mutation races are serialized with `Stream-Record-Match`.
-- With owned-step transactions enabled, a queue delivery durably fences its
-  execution lane in the run journal before entering the handler. Within that
-  delivery, each step's created, started, and terminal lifecycle is committed
-  in one Ursula record.
+- With owned-step and group transactions enabled, each step's created, started, and terminal lifecycle is committed in one Ursula record while the same group-local transaction validates and extends its durable queue lease. A stale delivery cannot commit after a newer lease generation takes over.
 - Hook tokens use dedicated Ursula claim streams to preserve global uniqueness.
 - Queue messages retain one stable ID across lease expiry and redelivery.
 - Local enqueues wake the dispatcher immediately; other instances wake through

@@ -4,6 +4,7 @@ import type {
   CreateEventParams,
   EventResult,
 } from '@workflow/world';
+import type { PreparedRunAppend } from './run-journal.js';
 
 export interface DeliveryExecution {
   runId: string;
@@ -17,10 +18,6 @@ export interface DeliveryExecution {
   expiresAt: Date;
 }
 
-export interface ClaimedExecutionFence extends DeliveryExecution {
-  epoch: number;
-}
-
 export interface StagedStepStart {
   request: AnyEventRequest & { eventType: 'step_started' };
   params: CreateEventParams | undefined;
@@ -29,33 +26,53 @@ export interface StagedStepStart {
   syntheticEventId: string;
   now: Date;
   result: EventResult;
-  fence?: ClaimedExecutionFence;
+  delivery?: DeliveryExecution;
 }
 
 interface DeliveryContext {
   runId: string;
   delivery: DeliveryExecution;
-  fence?: ClaimedExecutionFence;
   stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
 }
 
-type ExecutionFenceClaimer = (
-  delivery: DeliveryExecution
-) => Promise<ClaimedExecutionFence>;
+type OwnedStepCommitter = (
+  delivery: DeliveryExecution,
+  append: PreparedRunAppend
+) => Promise<void>;
+
+interface SharedDeliveryRegistry {
+  deliveries: Map<string, DeliveryExecution>;
+}
+
+const DELIVERY_REGISTRY = Symbol.for(
+  '@tonbo-io/world-ursula/delivery-registry'
+);
+
+function deliveryKey(runId: string, ownerMessageId: string): string {
+  return `${runId}\0${ownerMessageId}`;
+}
+
+function sharedDeliveries(): SharedDeliveryRegistry {
+  const globals = globalThis as typeof globalThis & {
+    [DELIVERY_REGISTRY]?: SharedDeliveryRegistry;
+  };
+  globals[DELIVERY_REGISTRY] ??= { deliveries: new Map() };
+  return globals[DELIVERY_REGISTRY];
+}
 
 /**
  * Coordinates owned step commits within one adapter process.
  *
- * The durable queue lease remains the delivery authority. The optional fence
- * claimer projects that ownership into the run journal before handler code is
- * allowed to execute.
+ * The durable queue lease remains the delivery authority. A complete owned
+ * step validates that lease and commits its run record in one group-local
+ * Ursula transaction.
  */
 export class RunExecutionCoordinator {
   private readonly contexts = new AsyncLocalStorage<DeliveryContext>();
   private readonly ownedStarts = new Map<string, StagedStepStart>();
   private readonly ownedTurns = new Map<string, Promise<void>>();
-  private fenceClaimer: ExecutionFenceClaimer | undefined;
+  private ownedStepCommitter: OwnedStepCommitter | undefined;
 
   constructor(
     private readonly options: { allowOwnedLazyStarts?: boolean } = {}
@@ -65,8 +82,18 @@ export class RunExecutionCoordinator {
     return this.options.allowOwnedLazyStarts === true;
   }
 
-  setFenceClaimer(claimer: ExecutionFenceClaimer): void {
-    this.fenceClaimer = claimer;
+  setOwnedStepCommitter(committer: OwnedStepCommitter): void {
+    this.ownedStepCommitter = committer;
+  }
+
+  async commitOwnedStep(
+    runId: string,
+    delivery: DeliveryExecution,
+    append: PreparedRunAppend
+  ): Promise<boolean> {
+    if (!this.ownedStepCommitter || delivery.runId !== runId) return false;
+    await this.ownedStepCommitter(delivery, append);
+    return true;
   }
 
   async run<T>(
@@ -76,28 +103,25 @@ export class RunExecutionCoordinator {
     if (!delivery || delivery.expiresAt.getTime() <= Date.now()) {
       return task();
     }
-    const fence = this.allowsOwnedLazyStarts()
-      ? await this.claimFence(delivery)
-      : undefined;
-    return this.contexts.run(
-      {
-        runId: delivery.runId,
-        delivery,
-        fence,
-        stagedStarts: new Map(),
-        turn: Promise.resolve(),
-      },
-      task
-    );
-  }
-
-  private async claimFence(
-    delivery: DeliveryExecution
-  ): Promise<ClaimedExecutionFence> {
-    if (!this.fenceClaimer) {
-      throw new Error('Ursula execution fence claimer is not configured');
+    const key = deliveryKey(delivery.runId, delivery.ownerMessageId);
+    const registry = sharedDeliveries().deliveries;
+    const previous = registry.get(key);
+    if (!previous || previous.generation <= delivery.generation) {
+      registry.set(key, delivery);
     }
-    return this.fenceClaimer(delivery);
+    try {
+      return await this.contexts.run(
+        {
+          runId: delivery.runId,
+          delivery,
+          stagedStarts: new Map(),
+          turn: Promise.resolve(),
+        },
+        task
+      );
+    } finally {
+      if (registry.get(key)?.token === delivery.token) registry.delete(key);
+    }
   }
 
   current(
@@ -110,24 +134,13 @@ export class RunExecutionCoordinator {
       (ownerMessageId !== undefined &&
         context.delivery.ownerMessageId !== ownerMessageId)
     ) {
-      return;
+      return ownerMessageId === undefined
+        ? undefined
+        : sharedDeliveries().deliveries.get(
+            deliveryKey(runId, ownerMessageId)
+          );
     }
     return context.delivery;
-  }
-
-  fence(
-    runId: string,
-    ownerMessageId?: string
-  ): ClaimedExecutionFence | undefined {
-    const context = this.contexts.getStore();
-    if (
-      context?.runId !== runId ||
-      (ownerMessageId !== undefined &&
-        context.delivery.ownerMessageId !== ownerMessageId)
-    ) {
-      return;
-    }
-    return context.fence;
   }
 
   staged(runId: string, stepId: string): StagedStepStart | undefined {
