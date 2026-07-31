@@ -1,21 +1,8 @@
-import { createHash } from 'node:crypto';
 import type { ValidQueueName } from '@workflow/world';
 import { ValidQueueName as ValidQueueNameSchema } from '@workflow/world';
 import { type UrsulaClient, UrsulaRequestError } from './client.js';
 
 const QUEUE_REGISTRY_STREAM = 'registry-queues';
-export const RUN_QUEUE_REGISTRY_SHARDS = 32;
-
-function runQueueRegistryStream(shard: number): string {
-  return `registry-run-queues-${shard.toString(16).padStart(2, '0')}`;
-}
-
-export function runQueueRegistryShard(runId: string): number {
-  return (
-    (createHash('sha256').update(runId).digest()[0] ?? 0) %
-    RUN_QUEUE_REGISTRY_SHARDS
-  );
-}
 
 interface QueueRegistration {
   version: 1 | 2 | 3;
@@ -34,7 +21,6 @@ export class QueueRegistry {
   private readonly queueNames = new Set<ValidQueueName>();
   private readonly partitionsByQueue = new Map<ValidQueueName, Set<number>>();
   private readonly targetsByKey = new Map<string, QueueTarget>();
-  private readonly runNextRecords = new Map<number, number>();
   private nextRecord = 0;
 
   constructor(private readonly client: UrsulaClient) {}
@@ -109,9 +95,8 @@ export class QueueRegistry {
     const target = { queueName, partition: 0, runId } satisfies QueueTarget;
     const key = this.targetKey(target);
     if (this.targetsByKey.has(key)) return;
-    const shard = runQueueRegistryShard(runId);
     await this.client.append(
-      runQueueRegistryStream(shard),
+      QUEUE_REGISTRY_STREAM,
       { version: 3, queueName, partition: 0, runId } satisfies QueueRegistration,
       {
         operationId: `register-run-queue:${queueName}:${runId}`,
@@ -120,67 +105,6 @@ export class QueueRegistry {
     );
     this.queueNames.add(queueName);
     this.targetsByKey.set(key, target);
-  }
-
-  private applyRunRecords(
-    shard: number,
-    records: { record: number; value: QueueRegistration }[]
-  ): void {
-    let nextRecord = this.runNextRecords.get(shard) ?? 0;
-    for (const { record, value } of records) {
-      if (record < nextRecord) continue;
-      if (record !== nextRecord) {
-        throw new Error(
-          `Ursula run queue registry shard ${shard} is discontinuous at record ${nextRecord}`
-        );
-      }
-      if (
-        value.version === 3 &&
-        typeof value.runId === 'string' &&
-        value.runId.length > 0
-      ) {
-        const queueName = ValidQueueNameSchema.parse(value.queueName);
-        const target = {
-          queueName,
-          partition: value.partition ?? 0,
-          runId: value.runId,
-        } satisfies QueueTarget;
-        this.queueNames.add(queueName);
-        this.targetsByKey.set(this.targetKey(target), target);
-      }
-      nextRecord = record + 1;
-    }
-    this.runNextRecords.set(shard, nextRecord);
-  }
-
-  async watchRunChanges(
-    onChange: () => void,
-    shards: readonly number[],
-    signal?: AbortSignal
-  ): Promise<void> {
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    signal?.addEventListener('abort', abort, { once: true });
-    try {
-      await Promise.all(
-        shards.map(async (shard) => {
-          const stream = runQueueRegistryStream(shard);
-          await this.client.ensureJsonStream(stream);
-          await this.client.watchRecords<QueueRegistration>(
-            stream,
-            this.runNextRecords.get(shard) ?? 0,
-            (records) => {
-              this.applyRunRecords(shard, records);
-              if (records.length > 0) onChange();
-            },
-            controller.signal
-          );
-        })
-      );
-    } finally {
-      controller.abort();
-      signal?.removeEventListener('abort', abort);
-    }
   }
 
   current(): ValidQueueName[] {
