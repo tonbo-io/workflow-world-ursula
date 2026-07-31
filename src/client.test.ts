@@ -102,64 +102,6 @@ describe('UrsulaClient', () => {
     expect(request?.body).toBe('{"event":"created"}');
   });
 
-  it('encodes guarded appends from one affinity as a group transaction', async () => {
-    const fetch = vi
-      .fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(response(null, { status: 201 }))
-      .mockResolvedValueOnce(
-        response('{"acknowledgements":[]}', {
-          status: 200,
-          headers: {
-            'stream-extensions': 'group-append-transaction-v1',
-          },
-        })
-      );
-    const client = new UrsulaClient({
-      baseUrl: 'https://ursula.test',
-      bucket: 'workflow',
-      fetch,
-    }).withAffinity('run-1');
-
-    await client.appendTransaction([
-      {
-        stream: 'run-run-1',
-        values: { event: 'completed' },
-        operationId: 'run-completed',
-        expectedRecord: 7,
-      },
-      {
-        stream: 'queue-test',
-        values: { type: 'acked' },
-        operationId: 'queue-acked',
-        expectedRecord: 11,
-      },
-    ]);
-
-    expect(fetch).toHaveBeenCalledTimes(3);
-    expect(String(fetch.mock.calls[2]?.[0])).toBe(
-      'https://ursula.test/workflow/run-1/$transaction'
-    );
-    const request = fetch.mock.calls[2]?.[1];
-    const body = JSON.parse(String(request?.body)) as {
-      operations: Array<{
-        stream: string;
-        record_match: number;
-        payload_base64: string;
-      }>;
-    };
-    expect(body.operations.map(({ stream, record_match }) => [
-      stream,
-      record_match,
-    ])).toEqual([
-      ['run-run-1', 7],
-      ['queue-test', 11],
-    ]);
-    expect(
-      Buffer.from(body.operations[0]?.payload_base64 ?? '', 'base64').toString()
-    ).toBe('{"event":"completed"}');
-  });
-
   it('retries a leader-unknown create with the same producer operation', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

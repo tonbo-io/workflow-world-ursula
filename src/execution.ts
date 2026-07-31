@@ -4,7 +4,6 @@ import type {
   CreateEventParams,
   EventResult,
 } from '@workflow/world';
-import type { PreparedRunAppend } from './run-journal.js';
 
 export interface DeliveryExecution {
   runId: string;
@@ -45,11 +44,6 @@ type ExecutionFenceClaimer = (
   delivery: DeliveryExecution
 ) => Promise<ClaimedExecutionFence>;
 
-type TerminalCommitter = (
-  delivery: DeliveryExecution,
-  append: PreparedRunAppend
-) => Promise<void>;
-
 /**
  * Coordinates owned step commits within one adapter process.
  *
@@ -62,8 +56,6 @@ export class RunExecutionCoordinator {
   private readonly ownedStarts = new Map<string, StagedStepStart>();
   private readonly ownedTurns = new Map<string, Promise<void>>();
   private fenceClaimer: ExecutionFenceClaimer | undefined;
-  private terminalCommitter: TerminalCommitter | undefined;
-  private readonly transactionallyAcked = new Set<string>();
 
   constructor(
     private readonly options: { allowOwnedLazyStarts?: boolean } = {}
@@ -75,25 +67,6 @@ export class RunExecutionCoordinator {
 
   setFenceClaimer(claimer: ExecutionFenceClaimer): void {
     this.fenceClaimer = claimer;
-  }
-
-  setTerminalCommitter(committer: TerminalCommitter): void {
-    this.terminalCommitter = committer;
-  }
-
-  async commitTerminal(
-    runId: string,
-    append: PreparedRunAppend
-  ): Promise<boolean> {
-    const context = this.contexts.getStore();
-    if (context?.runId !== runId || !this.terminalCommitter) return false;
-    await this.terminalCommitter(context.delivery, append);
-    this.transactionallyAcked.add(context.delivery.token);
-    return true;
-  }
-
-  consumeTransactionalAck(token: string): boolean {
-    return this.transactionallyAcked.delete(token);
   }
 
   async run<T>(
