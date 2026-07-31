@@ -59,6 +59,14 @@ export interface UrsulaStreamerConfig {
   streamFlushIntervalMs?: number;
   /** Fetch implementation override for tests or custom transports. */
   fetch?: typeof globalThis.fetch;
+  /**
+   * Co-locates streams owned by one run and atomically commits a stream's
+   * first chunks together with its discovery registration.
+   *
+   * Requires Ursula's `path-affinity-v1` and
+   * `group-append-transaction-v1` extensions.
+   */
+  experimentalGroupTransactions?: boolean;
 }
 
 export class UrsulaStreamError extends Error {
@@ -192,6 +200,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
   const longPollTimeoutMs =
     config.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
+  const groupTransactions = config.experimentalGroupTransactions === true;
   const producerByStream = new Map<string, Producer>();
   const registeredStreams = new Set<string>();
   const registryOperations = new Map<string, Promise<void>>();
@@ -215,17 +224,34 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     return result;
   }
 
-  function streamId(runId: string, name: string): string {
-    const nameHash = createHash('sha256')
+  function nameHash(name: string): string {
+    return createHash('sha256')
       .update(name)
       .digest('base64url')
       .slice(0, 32);
-    return `${runId}-${nameHash}`;
+  }
+
+  function streamId(runId: string, name: string): string {
+    if (groupTransactions) {
+      return name === '__workflow_streams'
+        ? 'stream-registry'
+        : `stream-${nameHash(name)}`;
+    }
+    return `${runId}-${nameHash(name)}`;
   }
 
   function streamUrl(runId: string, name: string): URL {
+    const affinity = groupTransactions
+      ? `/${encodePathSegment(runId)}`
+      : '';
     return new URL(
-      `${baseUrl}/${encodePathSegment(bucket)}/${encodePathSegment(streamId(runId, name))}`
+      `${baseUrl}/${encodePathSegment(bucket)}${affinity}/${encodePathSegment(streamId(runId, name))}`
+    );
+  }
+
+  function transactionUrl(runId: string): URL {
+    return new URL(
+      `${baseUrl}/${encodePathSegment(bucket)}/${encodePathSegment(runId)}/$transaction`
     );
   }
 
@@ -320,6 +346,66 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     return tracked;
   }
 
+  function registrationProducerId(runId: string, name: string): string {
+    return `workflow-registry-${createHash('sha256')
+      .update(`${bucket}\0${runId}\0${name}`)
+      .digest('base64url')}`;
+  }
+
+  async function appendFirstChunksAndRegister(
+    runId: string,
+    name: string,
+    body: string,
+    producer: Producer
+  ): Promise<void> {
+    const dataUrl = streamUrl(runId, name);
+    const registry = registryUrl(runId);
+    await Promise.all([ensureStream(dataUrl), ensureStream(registry)]);
+    const response = await expectSuccess(
+      'append stream and register it',
+      await fetchImpl(transactionUrl(runId), {
+        method: 'POST',
+        headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
+        body: JSON.stringify({
+          operations: [
+            {
+              stream: streamId(runId, name),
+              content_type: RECORD_CONTENT_TYPE,
+              payload_base64: Buffer.from(body).toString('base64'),
+              producer: {
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                producer_seq: producer.nextSequence,
+              },
+            },
+            {
+              stream: streamId(runId, '__workflow_streams'),
+              content_type: RECORD_CONTENT_TYPE,
+              payload_base64: Buffer.from(JSON.stringify({ name })).toString(
+                'base64'
+              ),
+              producer: {
+                producer_id: registrationProducerId(runId, name),
+                producer_epoch: 0,
+                producer_seq: 0,
+              },
+            },
+          ],
+        }),
+      })
+    );
+    const extensions = response.headers.get('stream-extensions') ?? '';
+    if (!extensions.split(',').map((value) => value.trim()).includes(
+      'group-append-transaction-v1'
+    )) {
+      throw new Error(
+        'Ursula did not advertise group-append-transaction-v1 after committing the transaction'
+      );
+    }
+    producer.nextSequence += 1;
+    registeredStreams.add(`${runId}\0${name}`);
+  }
+
   function producerFor(key: string): Producer {
     let producer = producerByStream.get(key);
     if (!producer) {
@@ -366,6 +452,12 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     if (records.length === 0) return;
     const url = streamUrl(runId, name);
     await serializeStream(url, async (producer) => {
+      const cacheKey = `${runId}\0${name}`;
+      const body = JSON.stringify(records.length === 1 ? records[0] : records);
+      if (groupTransactions && !registeredStreams.has(cacheKey)) {
+        await appendFirstChunksAndRegister(runId, name, body, producer);
+        return;
+      }
       // Discovery metadata and the data append target different streams (and
       // therefore potentially different Raft groups). Registration is a
       // rebuildable projection, so keep it off the latency-sensitive write
@@ -383,7 +475,6 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         'producer-epoch': String(producer.epoch),
         'producer-seq': String(sequence),
       });
-      const body = JSON.stringify(records.length === 1 ? records[0] : records);
       const key = url.toString();
       if (!ensuredStreams.has(key)) {
         const created = await fetchImpl(url, {

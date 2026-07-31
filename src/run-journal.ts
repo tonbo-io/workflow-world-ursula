@@ -58,6 +58,8 @@ export interface RunJournalState {
 }
 
 export interface RunJournalOptions {
+  /** Route every run-owned stream through that run's path-affinity key. */
+  pathAffinity?: boolean;
   /**
    * Writes the common owned successful-step transaction as a compact tuple.
    *
@@ -858,7 +860,9 @@ export class RunJournal {
   private readonly checkpointTasks = new Map<string, Promise<void>>();
   private readonly cache = new Map<string, RunJournalState>();
   private readonly eventCache = new Map<string, EventCache>();
+  private readonly affinityClients = new Map<string, UrsulaClient>();
   private readonly compactCompletedStepCommits: boolean;
+  private readonly pathAffinity: boolean;
 
   constructor(
     private readonly client: UrsulaClient,
@@ -866,6 +870,24 @@ export class RunJournal {
   ) {
     this.compactCompletedStepCommits =
       options.compactCompletedStepCommits ?? false;
+    this.pathAffinity = options.pathAffinity ?? false;
+  }
+
+  private clientFor(runId: string): UrsulaClient {
+    if (!this.pathAffinity) return this.client;
+    let client = this.affinityClients.get(runId);
+    if (!client) {
+      client = this.client.withAffinity(runId);
+      this.affinityClients.set(runId, client);
+      while (this.affinityClients.size > STATE_CACHE_MAX_RUNS) {
+        const oldest = this.affinityClients.keys().next().value;
+        if (typeof oldest === 'string') this.affinityClients.delete(oldest);
+      }
+    } else {
+      this.affinityClients.delete(runId);
+      this.affinityClients.set(runId, client);
+    }
+    return client;
   }
 
   private rememberState(runId: string, state: RunJournalState): void {
@@ -941,7 +963,7 @@ export class RunJournal {
   private async loadCheckpoint(runId: string): Promise<RunJournalState> {
     let records: { value: unknown }[];
     try {
-      records = (await this.client.readTail<unknown>(checkpointStreamId(runId)))
+      records = (await this.clientFor(runId).readTail<unknown>(checkpointStreamId(runId)))
         .records;
     } catch (error) {
       if (isUrsulaRequestError(error, 404)) {
@@ -969,16 +991,17 @@ export class RunJournal {
     checkpoint: RunCheckpoint
   ): Promise<void> {
     const stream = checkpointStreamId(runId);
-    const receipt = await this.client.append(stream, checkpoint, {
+    const client = this.clientFor(runId);
+    const receipt = await client.append(stream, checkpoint, {
       operationId: `run-checkpoint:${runId}:${checkpoint.sourceNextRecord}`,
       createIfMissing: true,
     });
-    await this.client.publishSnapshotAtRecord(
+    await client.publishSnapshotAtRecord(
       stream,
       receipt.nextRecord,
       checkpoint
     );
-    await this.client.advanceRetentionAtRecord(stream, receipt.startRecord);
+    await client.advanceRetentionAtRecord(stream, receipt.startRecord);
   }
 
   private scheduleCheckpoint(state: RunJournalState): void {
@@ -1054,7 +1077,7 @@ export class RunJournal {
       while (true) {
         let page: UrsulaReadResult<unknown>;
         try {
-          page = await this.client.read<unknown>(stream, cursor);
+          page = await this.clientFor(runId).read<unknown>(stream, cursor);
         } catch (error) {
           if (
             isCursorBeyondLocalTail(error) &&
@@ -1093,7 +1116,7 @@ export class RunJournal {
     // reports that more source records remain.
     const prefix = emptyState(runId);
     try {
-      const page = await this.client.read<unknown>(
+      const page = await this.clientFor(runId).read<unknown>(
         stream,
         0,
         CHECKPOINT_INTERVAL_RECORDS
@@ -1120,7 +1143,7 @@ export class RunJournal {
     const state = await this.loadCheckpoint(runId);
     this.applyRecords(
       state,
-      await this.client.readAll<unknown>(stream, state.nextRecord)
+      await this.clientFor(runId).readAll<unknown>(stream, state.nextRecord)
     );
     if (useCache) this.rememberState(runId, state);
     return useCache ? cloneState(state) : state;
@@ -1151,7 +1174,7 @@ export class RunJournal {
     while (true) {
       let page: UrsulaReadResult<unknown>;
       try {
-        page = await this.client.read<unknown>(streamId(runId), cursor);
+        page = await this.clientFor(runId).read<unknown>(streamId(runId), cursor);
       } catch (error) {
         if (
           isCursorBeyondLocalTail(error) &&
@@ -1216,7 +1239,7 @@ export class RunJournal {
     const storedValue = this.compactCompletedStepCommits
       ? (compactCompletedStepCommit(value) ?? value)
       : value;
-    await this.client.append(streamId(state.runId), storedValue, {
+    await this.clientFor(state.runId).append(streamId(state.runId), storedValue, {
       operationId: commit.operationId,
       expectedRecord: state.nextRecord,
       createIfMissing: state.nextRecord === 0,

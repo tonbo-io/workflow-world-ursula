@@ -409,4 +409,48 @@ describe('UrsulaClient', () => {
       payload: { __type: 'Uint8Array', data: 'AP8=' },
     });
   });
+
+  it('places affinity between the bucket and local stream id', () => {
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      bucket: 'workflow',
+    }).withAffinity('run-42');
+
+    expect(client.streamUrl('queue main').pathname).toBe(
+      '/workflow/run-42/queue%20main'
+    );
+  });
+
+  it('delivers record-envelope SSE events in wire order', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'event: data\ndata:{"record":4,"value":{"id":1}}\n\n'
+          )
+        );
+        controller.enqueue(
+          new TextEncoder().encode(
+            'event: control\ndata:{"streamNextRecord":5}\n\n'
+          )
+        );
+        controller.close();
+      },
+    });
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValue(response(body, { status: 200 }));
+    const client = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+    const records: unknown[] = [];
+
+    await client.watchRecords('queue', 4, (batch) => records.push(...batch));
+
+    expect(records).toEqual([{ record: 4, value: { id: 1 } }]);
+    const url = new URL(String(fetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('live')).toBe('sse');
+    expect(url.searchParams.get('record')).toBe('4');
+  });
 });

@@ -118,6 +118,8 @@ export interface QueueLease {
   leaseId: string;
   generation: number;
   partition: number;
+  /** Run path-affinity key for a run-local queue journal. */
+  affinity?: string;
 }
 
 function queueStream(queueName: ValidQueueName, partition: number): string {
@@ -268,10 +270,14 @@ export class QueueJournal {
   private readonly enqueueTurns = new Map<ValidQueueName, Promise<void>>();
   private readonly checkpointTasks = new Map<ValidQueueName, Promise<void>>();
 
+  private readonly client: UrsulaClient;
+
   constructor(
-    private readonly client: UrsulaClient,
-    readonly partition = 0
+    client: UrsulaClient,
+    readonly partition = 0,
+    readonly affinity?: string
   ) {
+    this.client = affinity ? client.withAffinity(affinity) : client;
     if (!Number.isSafeInteger(partition) || partition < 0) {
       throw new Error('Ursula queue partition must be a non-negative integer');
     }
@@ -722,6 +728,7 @@ export class QueueJournal {
           leaseId,
           generation,
           partition: this.partition,
+          affinity: this.affinity,
           message: {
             ...message,
             status: 'leased',
@@ -868,6 +875,7 @@ export class QueueJournal {
             leaseId: nextLeaseId,
             generation,
             partition: this.partition,
+            affinity: this.affinity,
             message: { ...committed },
           };
         }
@@ -923,6 +931,7 @@ export class QueueJournal {
           leaseId: nextLeaseId,
           generation,
           partition: this.partition,
+          affinity: this.affinity,
           message: {
             ...candidate,
             status: 'leased',
@@ -1095,6 +1104,33 @@ export class QueueJournal {
       this.cache.delete(queueName);
       await this.load(queueName);
       return true;
+    }
+  }
+
+  async watchChanges(
+    queueName: ValidQueueName,
+    onChange: () => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    await this.client.ensureJsonStream(
+      queueStream(queueName, this.partition)
+    );
+    const state = this.cache.get(queueName) ?? (await this.load(queueName));
+    try {
+      await this.client.watchRecords<QueueTransition>(
+        queueStream(queueName, this.partition),
+        state.nextRecord,
+        async (records) => {
+          this.applyRecords(state, records);
+          if (records.length > 0) onChange();
+        },
+        signal
+      );
+    } catch (error) {
+      if (!isUrsulaRequestError(error, 410)) throw error;
+      this.cache.delete(queueName);
+      await this.load(queueName);
+      onChange();
     }
   }
 }

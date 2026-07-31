@@ -10,6 +10,8 @@ type HeaderSource = ConstructorParameters<typeof Headers>[0];
 export interface UrsulaClientConfig {
   baseUrl: string;
   bucket?: string;
+  /** Optional path-affinity key shared by a run's related streams. */
+  affinity?: string;
   token?: string;
   headers?: HeaderSource;
   fetch?: typeof globalThis.fetch;
@@ -219,6 +221,7 @@ export class UrsulaClient {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly token?: string;
   private readonly defaultHeaders?: HeaderSource;
+  private readonly affinity?: string;
 
   constructor(config: UrsulaClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -226,14 +229,31 @@ export class UrsulaClient {
     this.fetchImpl = config.fetch ?? globalThis.fetch;
     this.token = config.token;
     this.defaultHeaders = config.headers;
+    this.affinity = config.affinity;
     if (!this.baseUrl) throw new Error('Ursula baseUrl is required');
     if (!this.bucket) throw new Error('Ursula bucket is required');
   }
 
   streamUrl(stream: string): URL {
+    const affinity = this.affinity
+      ? `/${encodeURIComponent(this.affinity)}`
+      : '';
     return new URL(
-      `${this.baseUrl}/${encodeURIComponent(this.bucket)}/${encodeURIComponent(stream)}`
+      `${this.baseUrl}/${encodeURIComponent(this.bucket)}${affinity}/${encodeURIComponent(stream)}`
     );
+  }
+
+  /** Returns a client whose streams are routed through one affinity key. */
+  withAffinity(affinity: string): UrsulaClient {
+    if (!affinity) throw new Error('Ursula affinity key is required');
+    return new UrsulaClient({
+      baseUrl: this.baseUrl,
+      bucket: this.bucket,
+      affinity,
+      token: this.token,
+      headers: this.defaultHeaders,
+      fetch: this.fetchImpl,
+    });
   }
 
   private headers(extra?: HeaderSource): Headers {
@@ -467,6 +487,54 @@ export class UrsulaClient {
       closed: response.headers.get('stream-closed') === 'true',
       upToDate: response.headers.get('stream-up-to-date') === 'true',
     };
+  }
+
+  /**
+   * Tails one record stream over SSE until it closes or the signal aborts.
+   * Each callback runs in wire order before the next event is consumed.
+   */
+  async watchRecords<T>(
+    stream: string,
+    start: number,
+    onRecords: (records: UrsulaRecord<T>[]) => void | Promise<void>,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const url = this.streamUrl(stream);
+    url.searchParams.set('record', String(start));
+    url.searchParams.set('record_view', 'envelope');
+    url.searchParams.set('live', 'sse');
+    const response = await this.success(
+      'watch records',
+      await this.request(url, { headers: this.headers(), signal })
+    );
+    this.ensuredStreams.add(stream);
+    if (!response.body) throw new Error('Ursula SSE response has no body');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const event = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const lines = event.split('\n');
+          if (lines.some((line) => line === 'event: data')) {
+            const data = lines
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5))
+              .join('\n');
+            if (data) await onRecords([parseRecord<T>(data)]);
+          }
+          boundary = buffer.indexOf('\n\n');
+        }
+        if (done) return;
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   async publishSnapshotAtRecord(

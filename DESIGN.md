@@ -35,10 +35,10 @@ All names are hashed where necessary to stay within Ursula's stream-ID limit.
 
 | Stream family | Authority |
 | --- | --- |
-| `run/{runId}` | Ordered event log plus post-event Run/Step/Hook/Wait state |
-| `stream/{runId}/{nameHash}` | Workflow chunk stream |
+| `/{bucket}/{runId}/run-{hash}` | Ordered event log plus post-event Run/Step/Hook/Wait state; path affinity places all run-owned streams in one Raft group |
+| `/{bucket}/{runId}/stream-{nameHash}` | Workflow chunk stream |
 | `hook/{tokenHash}` | Hook-token reservation, ownership, retention, release |
-| `queue/{queueHash}/{partition}` | Enqueue, lease, ack, retry and dead-letter transitions |
+| `/{bucket}/{runId}/queue-{queueHash}` | Run-local enqueue, lease, ack, retry and dead-letter transitions |
 | `registry/runs/{shard}` | Durable run registration used for discovery and index repair |
 | `index/*` | Rebuildable query projections; never canonical state |
 
@@ -199,11 +199,7 @@ window.
 
 ## Queue state
 
-Each logical Workflow queue is split into a fixed set of physical, append-only
-queue journals. The stable execution-lane key (`runId` plus `stepId` when
-present) selects one partition, so one lane remains ordered while unrelated
-runs no longer contend on one global record tail. No ordering is promised
-between independent execution lanes:
+With path affinity enabled, each run owns one append-only queue journal next to its authoritative run journal. Different runs therefore never contend on one queue record tail, while all workflow and background-step messages for one run retain a single ordered queue state machine. Without path affinity, the adapter retains the legacy fixed-partition layout. No ordering is promised between independent runs:
 
 ```text
 enqueued(availableAt)
@@ -213,15 +209,10 @@ enqueued(availableAt)
   -> leased(...)
 ```
 
-Claiming a message is a record-tail-guarded append scoped to its partition.
+Claiming a message is a record-tail-guarded append scoped to its run queue.
 Dispatchers incrementally replay queue transitions and may lease several
 messages from one workflow topic. Active leases are keyed by execution lane:
-messages for one lane stay serialized, while different runs or parallel steps
-execute concurrently up to the configured process limit. The queue registry
-records a partition only when its first message is enqueued, so workers keep
-one long-lived watcher per active partition rather than eagerly opening every
-possible partition on every replica. A local enqueue or completed delivery
-wakes the pump immediately. Polling is used only as error backoff.
+messages for one lane stay serialized, while different runs or parallel steps execute concurrently up to the configured process limit. The queue registry records a run only when its first message is enqueued, so an owning dispatcher opens one background SSE tail for that run queue. A local enqueue or completed delivery wakes the pump immediately. Registry long-polling repairs discovery, and polling is used only as error backoff.
 
 Small deployments use the zero-configuration topology in which every process
 can dispatch. Larger deployments SHOULD separate request serving from queue
