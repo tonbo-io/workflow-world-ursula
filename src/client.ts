@@ -224,19 +224,23 @@ function parseRecords<T>(body: string): UrsulaRecord<T>[] {
 export class UrsulaClient {
   readonly bucket: string;
   readonly baseUrl: string;
-  private readonly ensuredStreams = new Set<string>();
+  private readonly ensuredStreams: Set<string>;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly token?: string;
   private readonly defaultHeaders?: HeaderSource;
   private readonly affinity?: string;
 
-  constructor(config: UrsulaClientConfig) {
+  constructor(
+    config: UrsulaClientConfig,
+    ensuredStreams: Set<string> = new Set()
+  ) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.bucket = config.bucket ?? 'workflow';
     this.fetchImpl = config.fetch ?? globalThis.fetch;
     this.token = config.token;
     this.defaultHeaders = config.headers;
     this.affinity = config.affinity;
+    this.ensuredStreams = ensuredStreams;
     if (!this.baseUrl) throw new Error('Ursula baseUrl is required');
     if (!this.bucket) throw new Error('Ursula bucket is required');
   }
@@ -253,14 +257,21 @@ export class UrsulaClient {
   /** Returns a client whose streams are routed through one affinity key. */
   withAffinity(affinity: string): UrsulaClient {
     if (!affinity) throw new Error('Ursula affinity key is required');
-    return new UrsulaClient({
-      baseUrl: this.baseUrl,
-      bucket: this.bucket,
-      affinity,
-      token: this.token,
-      headers: this.defaultHeaders,
-      fetch: this.fetchImpl,
-    });
+    return new UrsulaClient(
+      {
+        baseUrl: this.baseUrl,
+        bucket: this.bucket,
+        affinity,
+        token: this.token,
+        headers: this.defaultHeaders,
+        fetch: this.fetchImpl,
+      },
+      this.ensuredStreams
+    );
+  }
+
+  private streamKey(stream: string): string {
+    return this.streamUrl(stream).href;
   }
 
   private headers(extra?: HeaderSource): Headers {
@@ -310,7 +321,8 @@ export class UrsulaClient {
   }
 
   async ensureJsonStream(stream: string): Promise<void> {
-    if (this.ensuredStreams.has(stream)) return;
+    const key = this.streamKey(stream);
+    if (this.ensuredStreams.has(key)) return;
     await this.success(
       'create stream',
       await this.request(this.streamUrl(stream), {
@@ -318,7 +330,7 @@ export class UrsulaClient {
         headers: this.headers({ 'content-type': JSON_CONTENT_TYPE }),
       })
     );
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(key);
   }
 
   async head(stream: string): Promise<UrsulaHead> {
@@ -329,7 +341,7 @@ export class UrsulaClient {
         headers: this.headers(),
       })
     );
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(this.streamKey(stream));
     return {
       nextRecord: nonNegativeInteger(response.headers, 'stream-record-next', 0),
       closed: response.headers.get('stream-closed') === 'true',
@@ -357,7 +369,8 @@ export class UrsulaClient {
     const body = stringifyUrsulaJson(
       records.length === 1 ? records[0] : records
     );
-    if (options.createIfMissing && !this.ensuredStreams.has(stream)) {
+    const key = this.streamKey(stream);
+    if (options.createIfMissing && !this.ensuredStreams.has(key)) {
       const createHeaders = new Headers(headers);
       createHeaders.delete('stream-record-match');
       const created = await this.request(this.streamUrl(stream), {
@@ -366,7 +379,7 @@ export class UrsulaClient {
         body,
       });
       if (created.status === 201) {
-        this.ensuredStreams.add(stream);
+        this.ensuredStreams.add(key);
         return {
           startRecord: nonNegativeInteger(
             created.headers,
@@ -385,7 +398,7 @@ export class UrsulaClient {
         (created.status === 409 &&
           created.headers.get('stream-closed') === 'true')
       ) {
-        this.ensuredStreams.add(stream);
+        this.ensuredStreams.add(key);
       } else {
         await this.success(`create stream "${stream}" with records`, created);
       }
@@ -492,7 +505,7 @@ export class UrsulaClient {
     url.searchParams.set('record_view', 'envelope');
     const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204) await this.success('read records', response);
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(this.streamKey(stream));
     return {
       records:
         response.status === 204 ? [] : parseRecords<T>(await response.text()),
@@ -516,7 +529,7 @@ export class UrsulaClient {
     const response = await this.request(url, { headers: this.headers() });
     if (response.status !== 204)
       await this.success('read tail records', response);
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(this.streamKey(stream));
     const records =
       response.status === 204 ? [] : parseRecords<T>(await response.text());
     return {
@@ -549,7 +562,7 @@ export class UrsulaClient {
     });
     if (response.status !== 204)
       await this.success('wait for records', response);
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(this.streamKey(stream));
     return {
       records:
         response.status === 204 ? [] : parseRecords<T>(await response.text()),
@@ -581,7 +594,7 @@ export class UrsulaClient {
       'watch records',
       await this.request(url, { headers: this.headers(), signal })
     );
-    this.ensuredStreams.add(stream);
+    this.ensuredStreams.add(this.streamKey(stream));
     if (!response.body) throw new Error('Ursula SSE response has no body');
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

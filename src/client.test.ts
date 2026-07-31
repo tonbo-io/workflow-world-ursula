@@ -421,6 +421,32 @@ describe('UrsulaClient', () => {
     );
   });
 
+  it('shares known streams between clients for the same affinity', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        response(null, {
+          status: 200,
+          headers: { 'stream-record-next': '4' },
+        })
+      )
+      .mockResolvedValueOnce(response(null, { status: 201 }));
+    const root = new UrsulaClient({
+      baseUrl: 'https://ursula.test',
+      bucket: 'workflow',
+      fetch,
+    });
+
+    await root.withAffinity('run-1').head('run');
+    await root.withAffinity('run-1').ensureJsonStream('run');
+    await root.withAffinity('run-2').ensureJsonStream('run');
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(String(fetch.mock.calls[1]?.[0])).toBe(
+      'https://ursula.test/workflow/run-2/run'
+    );
+  });
+
   it('encodes guarded affinity appends as one group transaction', async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
