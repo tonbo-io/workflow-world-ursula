@@ -4,10 +4,8 @@ import {
   type UrsulaAppendOptions,
   type UrsulaClient,
   type UrsulaRecord,
-  type UrsulaTransactionOperation,
   UrsulaRequestError,
 } from './client.js';
-import type { DeliveryExecution } from './execution.js';
 import { QueueJournal, queuePartition } from './queue-journal.js';
 
 class MemoryClient {
@@ -21,10 +19,6 @@ class MemoryClient {
   reads = 0;
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
-
-  withAffinity(): this {
-    return this;
-  }
 
   async ensureJsonStream(stream: string): Promise<void> {
     if (!this.streams.has(stream)) this.streams.set(stream, []);
@@ -62,30 +56,6 @@ class MemoryClient {
       throw new TypeError('simulated lost append response');
     }
     return { startRecord, nextRecord: current.length };
-  }
-
-  async appendTransaction(
-    operations: readonly UrsulaTransactionOperation[]
-  ): Promise<void> {
-    for (const operation of operations) {
-      const current = this.streams.get(operation.stream) ?? [];
-      if (
-        operation.expectedRecord !== undefined &&
-        operation.expectedRecord !== current.length
-      ) {
-        throw new UrsulaRequestError(
-          'append group transaction',
-          new Response('record tail mismatch', { status: 412 }),
-          'record tail mismatch'
-        );
-      }
-    }
-    for (const operation of operations) {
-      await this.append(operation.stream, operation.values, {
-        operationId: operation.operationId,
-        expectedRecord: operation.expectedRecord,
-      });
-    }
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
@@ -401,46 +371,6 @@ describe('QueueJournal', () => {
     expect(memory.appendedBatchSizes.at(-1)).toBe(2);
     const otherRun = await journal.claim(queueName, now, 10_000);
     expect(otherRun?.message.message).toMatchObject({ runId: 'run-two' });
-  });
-
-  it('atomically appends a terminal run commit and acks its queue delivery', async () => {
-    const memory = new MemoryClient();
-    const journal = new QueueJournal(
-      memory as unknown as UrsulaClient,
-      0,
-      'run-terminal'
-    );
-    await journal.enqueue(queueName, { runId: 'run-terminal' });
-    const lease = await journal.claim(queueName, new Date(), 10_000);
-    if (!lease) throw new Error('expected terminal delivery lease');
-    let applied = false;
-    const delivery: DeliveryExecution = {
-      runId: 'run-terminal',
-      lane: 'run',
-      queueName,
-      queuePartition: 0,
-      token: lease.leaseId,
-      generation: lease.generation,
-      ownerMessageId: lease.message.messageId,
-      attempt: lease.message.attempt,
-      expiresAt: lease.message.leaseExpiresAt ?? new Date(Date.now() + 10_000),
-    };
-
-    await journal.ackWithRunAppend(delivery, {
-      operation: {
-        stream: 'run-run-terminal',
-        values: { event: 'run_completed' },
-        operationId: 'run-terminal-completed',
-        expectedRecord: 0,
-      },
-      apply: () => {
-        applied = true;
-      },
-    });
-
-    expect(applied).toBe(true);
-    expect(await journal.claim(queueName, new Date(), 10_000)).toBeNull();
-    expect(memory.appendedBatchSizes.slice(-2)).toEqual([1, 1]);
   });
 
   it('recovers the successor lease after an ack-and-claim response is lost', async () => {

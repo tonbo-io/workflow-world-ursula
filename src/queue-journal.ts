@@ -15,8 +15,6 @@ import {
   type UrsulaClient,
   type UrsulaRecord,
 } from './client.js';
-import type { DeliveryExecution } from './execution.js';
-import type { PreparedRunAppend } from './run-journal.js';
 
 const MAX_CAS_RETRIES = 32;
 const MAX_ENQUEUE_CAS_RETRIES = 128;
@@ -827,65 +825,6 @@ export class QueueJournal {
       leaseId: lease.leaseId,
       createdAt: new Date().toISOString(),
     });
-  }
-
-  /** Atomically commits a terminal run event and acknowledges its delivery. */
-  async ackWithRunAppend(
-    delivery: DeliveryExecution,
-    runAppend: PreparedRunAppend
-  ): Promise<void> {
-    const queueName = delivery.queueName as ValidQueueName;
-    const messageId = MessageIdSchema.parse(delivery.ownerMessageId);
-    for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
-      let state = await this.loadForMutation(queueName);
-      let current = state.messages.get(messageId);
-      if (current?.status !== 'leased' || current.leaseId !== delivery.token) {
-        state = await this.load(queueName);
-        current = state.messages.get(messageId);
-      }
-      if (!current) return;
-      if (current.status !== 'leased' || current.leaseId !== delivery.token) {
-        throw new Error(
-          `Delivery "${delivery.token}" no longer owns queue message "${messageId}"`
-        );
-      }
-      const expectedRecord = state.nextRecord;
-      const transition = {
-        version: 1,
-        type: 'acked',
-        messageId,
-        leaseId: delivery.token,
-        createdAt: new Date().toISOString(),
-      } satisfies QueueTransition;
-      try {
-        await this.client.appendTransaction([
-          runAppend.operation,
-          {
-            stream: queueStream(queueName, this.partition),
-            values: transition,
-            operationId: `queue-terminal-acked:${delivery.token}`,
-            expectedRecord,
-          },
-        ]);
-        if (state.nextRecord === expectedRecord) {
-          applyTransition(state, transition, expectedRecord);
-          state.nextRecord += 1;
-          this.scheduleCheckpoint(queueName, state, expectedRecord);
-        }
-        runAppend.apply();
-        return;
-      } catch (error) {
-        if (isUrsulaRequestError(error, 412)) {
-          await this.refreshAfterContention(queueName);
-          await contentionBackoff(retry);
-          continue;
-        }
-        throw error;
-      }
-    }
-    throw new Error(
-      `Queue "${queueName}" remained contended during terminal transaction`
-    );
   }
 
   async ownsLease(
