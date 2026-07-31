@@ -31,6 +31,8 @@ import {
   type UrsulaClientConfig,
 } from './client.js';
 import {
+  type ClaimedExecutionFence,
+  type DeliveryExecution,
   RunExecutionCoordinator,
   type StagedStepStart,
 } from './execution.js';
@@ -41,6 +43,7 @@ import {
   RunJournal,
   type EntityChange,
   type RunCommit,
+  type RunExecutionFence,
   type RunJournalState,
 } from './run-journal.js';
 
@@ -93,6 +96,38 @@ function combineStepCommits(
         ? { externalStateUpdatedAt: started.externalStateUpdatedAt }
         : {}),
   };
+}
+
+function executionFence(
+  delivery: DeliveryExecution,
+  epoch: number
+): RunExecutionFence {
+  return {
+    lane: delivery.lane,
+    epoch,
+    queueName: delivery.queueName,
+    queuePartition: delivery.queuePartition,
+    token: delivery.token,
+    generation: delivery.generation,
+    ownerMessageId: delivery.ownerMessageId,
+    attempt: delivery.attempt,
+  };
+}
+
+function ownsExecutionFence(
+  state: RunJournalState,
+  delivery: ClaimedExecutionFence
+): boolean {
+  const current = state.executionFences.get(delivery.lane);
+  return (
+    current?.epoch === delivery.epoch &&
+    current?.token === delivery.token &&
+    current.queueName === delivery.queueName &&
+    current.queuePartition === delivery.queuePartition &&
+    current.generation === delivery.generation &&
+    current.ownerMessageId === delivery.ownerMessageId &&
+    current.attempt === delivery.attempt
+  );
 }
 
 async function mapWithConcurrency<T, R>(
@@ -410,13 +445,14 @@ export function createStorage(
     callId: string
   ): Promise<EventResult | undefined> {
     const coordinator = executions;
-    const delivery = coordinator?.current(runId);
     const stepId = request.correlationId;
+    const ownerMessageId = request.eventData?.ownerMessageId;
+    const delivery = coordinator?.current(runId, ownerMessageId);
+    if (!coordinator || !delivery || !stepId) return;
     const ownedLazyStart =
       coordinator?.allowsOwnedLazyStarts() === true &&
       request.eventData?.input !== undefined &&
-      request.eventData.ownerMessageId !== undefined;
-    if (!coordinator || (!delivery && !ownedLazyStart) || !stepId) return;
+      ownerMessageId !== undefined;
     const existing = coordinator.staged(runId, stepId);
     if (existing) return existing.result;
     const state = await journal.loadForMutation(runId);
@@ -446,8 +482,10 @@ export function createStorage(
       // materializes the same creation and is told it won the claim too.
       // Falling through to the ordinary path appends the creation first, so
       // the claim is decided by the record tail rather than by local memory.
-      return;
+      if (!ownedLazyStart) return;
     }
+    const fence = coordinator.fence(runId, ownerMessageId);
+    if (ownedLazyStart && !fence) return;
     const staged: StagedStepStart = {
       request,
       params,
@@ -456,6 +494,7 @@ export function createStorage(
       syntheticEventId,
       now,
       result: materialized.result,
+      ...(fence ? { fence } : {}),
     };
     coordinator.stage(runId, stepId, staged);
     return staged.result;
@@ -489,6 +528,12 @@ export function createStorage(
             request,
             params,
             state.nextRecord
+          );
+        }
+        if (staged.fence && !ownsExecutionFence(state, staged.fence)) {
+          coordinator.finish(runId, stepId);
+          throw new PreconditionFailedError(
+            `Delivery "${staged.fence.token}" no longer owns lane "${staged.fence.lane}" for run "${runId}"`
           );
         }
         if (existingStep?.status === 'running') {
@@ -620,6 +665,66 @@ export function createStorage(
       );
     });
   }
+
+  async function claimExecutionFence(
+    delivery: DeliveryExecution
+  ): Promise<ClaimedExecutionFence> {
+    if (!executions) {
+      throw new WorkflowWorldError(
+        'Ursula execution coordinator is unavailable'
+      );
+    }
+    return executions.exclusive(delivery.runId, async () => {
+      for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
+        const current = await journal.loadForMutation(delivery.runId);
+        const active = current.executionFences.get(delivery.lane);
+        const sameDelivery =
+          active?.token === delivery.token &&
+          active.queueName === delivery.queueName &&
+          active.queuePartition === delivery.queuePartition &&
+          active.generation === delivery.generation &&
+          active.ownerMessageId === delivery.ownerMessageId &&
+          active.attempt === delivery.attempt;
+        if (sameDelivery) {
+          return { ...delivery, epoch: active.epoch };
+        }
+        if (
+          active &&
+          active.queueName === delivery.queueName &&
+          active.queuePartition === delivery.queuePartition &&
+          active.generation >= delivery.generation
+        ) {
+          throw new PreconditionFailedError(
+            `Delivery "${delivery.token}" is older than generation ${active.generation} for lane "${delivery.lane}" of run "${delivery.runId}"`
+          );
+        }
+        const epoch = (active?.epoch ?? 0) + 1;
+        const claimed = { ...delivery, epoch };
+        try {
+          await journal.append(current, {
+            operationId: `run-execution-fence:${delivery.runId}:${delivery.lane}:${delivery.token}`,
+            events: [],
+            executionFence: executionFence(delivery, epoch),
+          });
+          return claimed;
+        } catch (error) {
+          if (isUrsulaRequestError(error, 412)) {
+            journal.evict(delivery.runId);
+            if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
+            throw new PreconditionFailedError(
+              `Run "${delivery.runId}" changed while fencing delivery "${delivery.token}": ${error.message}`
+            );
+          }
+          throw error;
+        }
+      }
+      throw new WorkflowWorldError(
+        `Run "${delivery.runId}" remained contended while fencing delivery "${delivery.token}"`
+      );
+    });
+  }
+
+  executions?.setFenceClaimer(claimExecutionFence);
 
   const storage: Storage = {
     runs: {

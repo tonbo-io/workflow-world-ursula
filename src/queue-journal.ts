@@ -84,6 +84,7 @@ export interface QueueMessageState {
   attempt: number;
   status: 'pending' | 'leased' | 'acked';
   leaseId?: string;
+  leaseGeneration?: number;
   leaseExpiresAt?: Date;
 }
 
@@ -115,6 +116,7 @@ interface QueueCheckpoint {
 export interface QueueLease {
   message: QueueMessageState;
   leaseId: string;
+  generation: number;
   partition: number;
 }
 
@@ -185,11 +187,17 @@ function replay(
     messages: new Map(),
     idempotency: new Map(),
   };
-  for (const { value } of records) applyTransition(state, value);
+  for (const { record, value } of records) {
+    applyTransition(state, value, record);
+  }
   return state;
 }
 
-function applyTransition(state: QueueState, value: QueueTransition): void {
+function applyTransition(
+  state: QueueState,
+  value: QueueTransition,
+  record: number
+): void {
   if (value.version !== 1) {
     throw new Error('Unsupported Ursula queue journal version');
   }
@@ -226,6 +234,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
   if (value.type === 'leased') {
     message.status = 'leased';
     message.leaseId = value.leaseId;
+    message.leaseGeneration = record;
     message.leaseExpiresAt = new Date(value.expiresAt);
     message.attempt = value.attempt;
   } else if (
@@ -248,6 +257,7 @@ function applyTransition(state: QueueState, value: QueueTransition): void {
     message.status = 'pending';
     message.availableAt = new Date(value.availableAt);
     message.leaseId = undefined;
+    message.leaseGeneration = undefined;
     message.leaseExpiresAt = undefined;
   }
 }
@@ -489,8 +499,8 @@ export class QueueJournal {
       // records before the append response arrived. Never replay the same
       // transitions twice into the shared cache.
       if (state.nextRecord === expectedRecord) {
-        for (const transition of transitions) {
-          applyTransition(state, transition);
+        for (const [index, transition] of transitions.entries()) {
+          applyTransition(state, transition, expectedRecord + index);
           state.nextRecord += 1;
         }
       }
@@ -514,7 +524,7 @@ export class QueueJournal {
           `Queue journal is discontinuous at record ${state.nextRecord}`
         );
       }
-      applyTransition(state, value);
+      applyTransition(state, value, record);
       state.nextRecord = record + 1;
     }
   }
@@ -691,6 +701,7 @@ export class QueueJournal {
       }
       if (!message) return null;
       const leaseId = randomUUID();
+      const generation = state.nextRecord;
       const transition: QueueTransition = {
         version: 1,
         type: 'leased',
@@ -709,6 +720,7 @@ export class QueueJournal {
         );
         return {
           leaseId,
+          generation,
           partition: this.partition,
           message: {
             ...message,
@@ -808,6 +820,23 @@ export class QueueJournal {
     });
   }
 
+  async ownsLease(
+    queueName: ValidQueueName,
+    lease: Pick<QueueLease, 'generation' | 'leaseId'> & {
+      messageId: MessageId;
+    },
+    now = new Date()
+  ): Promise<boolean> {
+    const state = await this.load(queueName);
+    const current = state.messages.get(lease.messageId);
+    return (
+      current?.status === 'leased' &&
+      current.leaseId === lease.leaseId &&
+      current.leaseGeneration === lease.generation &&
+      (current.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
+    );
+  }
+
   /**
    * Completes one delivery and, when work is immediately available, leases
    * its successor in the same durable append. This preserves the queue state
@@ -831,8 +860,13 @@ export class QueueJournal {
             message.status === 'leased' && message.leaseId === nextLeaseId
         );
         if (committed) {
+          const generation = committed.leaseGeneration;
+          if (generation === undefined) {
+            throw new Error('Recovered Ursula queue lease has no generation');
+          }
           return {
             leaseId: nextLeaseId,
+            generation,
             partition: this.partition,
             message: { ...committed },
           };
@@ -880,8 +914,14 @@ export class QueueJournal {
             : `queue-acked:${lease.leaseId}`
         );
         if (!candidate || !leased) return null;
+        const committed = state.messages.get(candidate.messageId);
+        const generation = committed?.leaseGeneration;
+        if (generation === undefined) {
+          throw new Error('Ursula queue lease has no generation');
+        }
         return {
           leaseId: nextLeaseId,
+          generation,
           partition: this.partition,
           message: {
             ...candidate,

@@ -142,7 +142,7 @@ rather than throughput.
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_COUNT` | Optional static dispatcher pool size; use one stable shard index per replica to avoid every dispatcher racing every queue partition |
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_INDEX` | Zero-based static index for this dispatcher; every index must stay covered by a live replica |
 | `WORKFLOW_URSULA_QUEUE_PARTITION_SHARD_REPLICAS` | Number of adjacent dispatcher indices allowed to claim each partition, default `1`; use `2` to trade some duplicate CAS attempts for failover and lower single-run latency |
-| `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS` | Set to `1` only when the runtime guarantees one active handler for an optimistic owned-lazy step; lets Turbo commit started + terminal state in one record |
+| `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS` | Set to `1` to fence a queue delivery in the run journal before its handler executes and combine each owned lazy step lifecycle into one record; keep disabled until its workload performance gate passes |
 | `WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS` | Set to `1` only after every process can read compact v2 records; removes duplicated owned-step fields from the authoritative run append |
 | `WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS` | Maximum graceful wait for in-flight handlers |
 
@@ -151,10 +151,10 @@ rather than throughput.
 - Each accepted workflow event and the resulting materialized entities are
   stored in the same conditional Ursula append.
 - Per-run mutation races are serialized with `Stream-Record-Match`.
-- Within a claimed queue delivery, each step's started and terminal lifecycle
-  is committed in one Ursula record. The experimental owned-step option also
-  lets Turbo's optimistic owned-lazy path reuse the durable owner message as
-  its fence and avoid the extra claim append.
+- With owned-step transactions enabled, a queue delivery durably fences its
+  execution lane in the run journal before entering the handler. Within that
+  delivery, each step's created, started, and terminal lifecycle is committed
+  in one Ursula record.
 - Hook tokens use dedicated Ursula claim streams to preserve global uniqueness.
 - Queue messages retain one stable ID across lease expiry and redelivery.
 - Local enqueues wake the dispatcher immediately; other instances wake through

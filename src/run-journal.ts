@@ -20,6 +20,17 @@ export interface EntityChange<T> {
   value: T | null;
 }
 
+export interface RunExecutionFence {
+  lane: string;
+  epoch: number;
+  queueName: string;
+  queuePartition: number;
+  token: string;
+  generation: number;
+  ownerMessageId: string;
+  attempt: number;
+}
+
 export interface RunCommit {
   version: 1;
   operationId: string;
@@ -31,6 +42,7 @@ export interface RunCommit {
   hooks?: EntityChange<Hook>[];
   waits?: EntityChange<Wait>[];
   externalStateUpdatedAt?: number;
+  executionFence?: RunExecutionFence;
 }
 
 export interface RunJournalState {
@@ -42,6 +54,7 @@ export interface RunJournalState {
   hookRetentionUntil: Map<string, Date>;
   waits: Map<string, Wait>;
   externalStateUpdatedAt?: number;
+  executionFences: Map<string, RunExecutionFence>;
 }
 
 export interface RunJournalOptions {
@@ -106,6 +119,7 @@ interface RunCheckpoint {
   hookRetentionUntil: [string, string][];
   waits: Wait[];
   externalStateUpdatedAt?: number;
+  executionFences?: RunExecutionFence[];
 }
 
 interface EventCache {
@@ -149,6 +163,7 @@ function emptyState(runId: string): RunJournalState {
     hooks: new Map(),
     hookRetentionUntil: new Map(),
     waits: new Map(),
+    executionFences: new Map(),
   };
 }
 
@@ -167,6 +182,7 @@ function cloneStateForPreview(state: RunJournalState): RunJournalState {
     hooks: new Map(state.hooks),
     hookRetentionUntil: new Map(state.hookRetentionUntil),
     waits: new Map(state.waits),
+    executionFences: new Map(state.executionFences),
   };
 }
 
@@ -183,6 +199,7 @@ function checkpointFromState(state: RunJournalState): RunCheckpoint {
       value.toISOString(),
     ]),
     waits: [...state.waits.values()],
+    executionFences: [...state.executionFences.values()],
     ...(state.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: state.externalStateUpdatedAt }
       : {}),
@@ -238,6 +255,12 @@ function stateFromCheckpoint(
           return [parsed.waitId, parsed];
         })
       ),
+      executionFences: new Map(
+        (checkpoint.executionFences ?? []).map((fence) => {
+          const parsed = parseExecutionFence(fence);
+          return [parsed.lane, parsed];
+        })
+      ),
       ...(checkpoint.externalStateUpdatedAt !== undefined
         ? { externalStateUpdatedAt: checkpoint.externalStateUpdatedAt }
         : {}),
@@ -254,6 +277,41 @@ function objectHasOnlyKeys(
   return Object.entries(value).every(
     ([key, nested]) => nested === undefined || allowed.has(key)
   );
+}
+
+function parseExecutionFence(value: unknown): RunExecutionFence {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    typeof (value as { lane?: unknown }).lane !== 'string' ||
+    !Number.isSafeInteger((value as { epoch?: unknown }).epoch) ||
+    ((value as { epoch: number }).epoch ?? 0) < 1 ||
+    typeof (value as { queueName?: unknown }).queueName !== 'string' ||
+    !Number.isSafeInteger(
+      (value as { queuePartition?: unknown }).queuePartition
+    ) ||
+    ((value as { queuePartition: number }).queuePartition ?? -1) < 0 ||
+    typeof (value as { token?: unknown }).token !== 'string' ||
+    !Number.isSafeInteger((value as { generation?: unknown }).generation) ||
+    ((value as { generation: number }).generation ?? -1) < 0 ||
+    typeof (value as { ownerMessageId?: unknown }).ownerMessageId !==
+      'string' ||
+    !Number.isSafeInteger((value as { attempt?: unknown }).attempt) ||
+    ((value as { attempt: number }).attempt ?? 0) < 1
+  ) {
+    throw new Error('Invalid Ursula World execution fence');
+  }
+  const fence = value as RunExecutionFence;
+  return {
+    lane: fence.lane,
+    epoch: fence.epoch,
+    queueName: fence.queueName,
+    queuePartition: fence.queuePartition,
+    token: fence.token,
+    generation: fence.generation,
+    ownerMessageId: fence.ownerMessageId,
+    attempt: fence.attempt,
+  };
 }
 
 function sameInstant(left: unknown, right: unknown): boolean {
@@ -721,6 +779,9 @@ function parseCommit(
     ...(commit.externalStateUpdatedAt !== undefined
       ? { externalStateUpdatedAt: commit.externalStateUpdatedAt }
       : {}),
+    ...(commit.executionFence
+      ? { executionFence: parseExecutionFence(commit.executionFence) }
+      : {}),
   };
 }
 
@@ -778,6 +839,12 @@ function applyCommit(
   applyChanges(state.waits, commit.waits);
   if (commit.externalStateUpdatedAt !== undefined) {
     state.externalStateUpdatedAt = commit.externalStateUpdatedAt;
+  }
+  if (commit.executionFence) {
+    state.executionFences.set(
+      commit.executionFence.lane,
+      commit.executionFence
+    );
   }
   state.nextRecord = record + 1;
 }
