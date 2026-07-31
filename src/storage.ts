@@ -31,8 +31,6 @@ import {
   type UrsulaClientConfig,
 } from './client.js';
 import {
-  type ClaimedExecutionFence,
-  type DeliveryExecution,
   RunExecutionCoordinator,
   type StagedStepStart,
 } from './execution.js';
@@ -43,7 +41,6 @@ import {
   RunJournal,
   type EntityChange,
   type RunCommit,
-  type RunExecutionFence,
   type RunJournalState,
 } from './run-journal.js';
 
@@ -96,38 +93,6 @@ function combineStepCommits(
         ? { externalStateUpdatedAt: started.externalStateUpdatedAt }
         : {}),
   };
-}
-
-function executionFence(
-  delivery: DeliveryExecution,
-  epoch: number
-): RunExecutionFence {
-  return {
-    lane: delivery.lane,
-    epoch,
-    queueName: delivery.queueName,
-    queuePartition: delivery.queuePartition,
-    token: delivery.token,
-    generation: delivery.generation,
-    ownerMessageId: delivery.ownerMessageId,
-    attempt: delivery.attempt,
-  };
-}
-
-function ownsExecutionFence(
-  state: RunJournalState,
-  delivery: ClaimedExecutionFence
-): boolean {
-  const current = state.executionFences.get(delivery.lane);
-  return (
-    current?.epoch === delivery.epoch &&
-    current?.token === delivery.token &&
-    current.queueName === delivery.queueName &&
-    current.queuePartition === delivery.queuePartition &&
-    current.generation === delivery.generation &&
-    current.ownerMessageId === delivery.ownerMessageId &&
-    current.attempt === delivery.attempt
-  );
 }
 
 async function mapWithConcurrency<T, R>(
@@ -475,17 +440,13 @@ export function createStorage(
     if (!materialized.commit) return materialized.result;
     if (materialized.result.stepCreated) {
       // `stepCreated` is the runtime's exactly-once create-ownership signal:
-      // it runs the step body inline only for the caller that created the
-      // step. A staged start is not appended until its terminal event commits,
-      // so answering `true` from one would promise ownership backed by nothing
-      // durable — and a discarded stage leaves no record, so the next delivery
-      // materializes the same creation and is told it won the claim too.
-      // Falling through to the ordinary path appends the creation first, so
-      // the claim is decided by the record tail rather than by local memory.
+      // the ordinary path persists creation before running the body. An owned
+      // lazy start instead relies on the already-durable queue lease. Its
+      // terminal group transaction validates that lease while appending the
+      // complete create/start/terminal lifecycle. A crash leaves no partial
+      // event, and redelivery can safely materialize the same start again.
       if (!ownedLazyStart) return;
     }
-    const fence = coordinator.fence(runId, ownerMessageId);
-    if (ownedLazyStart && !fence) return;
     const staged: StagedStepStart = {
       request,
       params,
@@ -494,7 +455,7 @@ export function createStorage(
       syntheticEventId,
       now,
       result: materialized.result,
-      ...(fence ? { fence } : {}),
+      ...(ownedLazyStart ? { delivery } : {}),
     };
     coordinator.stage(runId, stepId, staged);
     return staged.result;
@@ -509,9 +470,9 @@ export function createStorage(
     const coordinator = executions;
     const stepId =
       'correlationId' in request ? request.correlationId : undefined;
-    const delivery = coordinator?.current(runId);
     const staged = stepId ? coordinator?.staged(runId, stepId) : undefined;
     if (!coordinator || !stepId || !staged) return;
+    const delivery = staged.delivery ?? coordinator.current(runId);
     const terminalEventId = `evnt_${ulid()}`;
     const terminalSyntheticEventId = `evnt_${ulid()}`;
     const terminalNow = new Date();
@@ -530,12 +491,6 @@ export function createStorage(
             state.nextRecord
           );
         }
-        if (staged.fence && !ownsExecutionFence(state, staged.fence)) {
-          coordinator.finish(runId, stepId);
-          throw new PreconditionFailedError(
-            `Delivery "${staged.fence.token}" no longer owns lane "${staged.fence.lane}" for run "${runId}"`
-          );
-        }
         if (existingStep?.status === 'running') {
           const current = materializeEvent(state, request, {
             eventId: terminalEventId,
@@ -550,7 +505,16 @@ export function createStorage(
             params,
           });
           try {
-            if (current.commit) await journal.append(state, current.commit);
+            if (current.commit) {
+              const committed = delivery
+                ? await coordinator.commitOwnedStep(
+                    runId,
+                    delivery,
+                    journal.prepareAppend(state, current.commit)
+                  )
+                : false;
+              if (!committed) await journal.append(state, current.commit);
+            }
             coordinator.finish(runId, stepId);
             return withEventPage(
               current.result,
@@ -639,7 +603,14 @@ export function createStorage(
           terminal.commit
         );
         try {
-          await journal.append(state, commit);
+          const committed = delivery
+            ? await coordinator.commitOwnedStep(
+                runId,
+                delivery,
+                journal.prepareAppend(state, commit)
+              )
+            : false;
+          if (!committed) await journal.append(state, commit);
           coordinator.finish(runId, stepId);
           return withEventPage(
             terminal.result,
@@ -665,66 +636,6 @@ export function createStorage(
       );
     });
   }
-
-  async function claimExecutionFence(
-    delivery: DeliveryExecution
-  ): Promise<ClaimedExecutionFence> {
-    if (!executions) {
-      throw new WorkflowWorldError(
-        'Ursula execution coordinator is unavailable'
-      );
-    }
-    return executions.exclusive(delivery.runId, async () => {
-      for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
-        const current = await journal.loadForMutation(delivery.runId);
-        const active = current.executionFences.get(delivery.lane);
-        const sameDelivery =
-          active?.token === delivery.token &&
-          active.queueName === delivery.queueName &&
-          active.queuePartition === delivery.queuePartition &&
-          active.generation === delivery.generation &&
-          active.ownerMessageId === delivery.ownerMessageId &&
-          active.attempt === delivery.attempt;
-        if (sameDelivery) {
-          return { ...delivery, epoch: active.epoch };
-        }
-        if (
-          active &&
-          active.queueName === delivery.queueName &&
-          active.queuePartition === delivery.queuePartition &&
-          active.generation >= delivery.generation
-        ) {
-          throw new PreconditionFailedError(
-            `Delivery "${delivery.token}" is older than generation ${active.generation} for lane "${delivery.lane}" of run "${delivery.runId}"`
-          );
-        }
-        const epoch = (active?.epoch ?? 0) + 1;
-        const claimed = { ...delivery, epoch };
-        try {
-          await journal.append(current, {
-            operationId: `run-execution-fence:${delivery.runId}:${delivery.lane}:${delivery.token}`,
-            events: [],
-            executionFence: executionFence(delivery, epoch),
-          });
-          return claimed;
-        } catch (error) {
-          if (isUrsulaRequestError(error, 412)) {
-            journal.evict(delivery.runId);
-            if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
-            throw new PreconditionFailedError(
-              `Run "${delivery.runId}" changed while fencing delivery "${delivery.token}": ${error.message}`
-            );
-          }
-          throw error;
-        }
-      }
-      throw new WorkflowWorldError(
-        `Run "${delivery.runId}" remained contended while fencing delivery "${delivery.token}"`
-      );
-    });
-  }
-
-  executions?.setFenceClaimer(claimExecutionFence);
 
   const storage: Storage = {
     runs: {

@@ -162,6 +162,14 @@ export function withUrsulaStreams(
 export function createWorld(
   config: UrsulaWorldConfig = environmentConfig()
 ): World {
+  if (
+    config.experimentalOwnedStepTransactions &&
+    !config.experimentalGroupTransactions
+  ) {
+    throw new Error(
+      'experimentalOwnedStepTransactions requires experimentalGroupTransactions'
+    );
+  }
   const client = new UrsulaClient(config);
   const journal = new RunJournal(client, {
     compactCompletedStepCommits:

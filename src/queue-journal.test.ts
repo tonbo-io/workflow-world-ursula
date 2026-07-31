@@ -1,12 +1,17 @@
+import { PreconditionFailedError } from '@workflow/errors';
 import type { QueuePayload, ValidQueueName } from '@workflow/world';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  isUrsulaRequestError,
   type UrsulaAppendOptions,
   type UrsulaClient,
   type UrsulaRecord,
   UrsulaRequestError,
+  type UrsulaTransactionOperation,
 } from './client.js';
+import type { DeliveryExecution } from './execution.js';
 import { QueueJournal, queuePartition } from './queue-journal.js';
+import type { PreparedRunAppend } from './run-journal.js';
 
 class MemoryClient {
   readonly appendedBatchSizes: number[] = [];
@@ -19,6 +24,10 @@ class MemoryClient {
   reads = 0;
   private readonly firstRecords = new Map<string, number>();
   private readonly streams = new Map<string, unknown[]>();
+
+  withAffinity(): this {
+    return this;
+  }
 
   async ensureJsonStream(stream: string): Promise<void> {
     if (!this.streams.has(stream)) this.streams.set(stream, []);
@@ -56,6 +65,33 @@ class MemoryClient {
       throw new TypeError('simulated lost append response');
     }
     return { startRecord, nextRecord: current.length };
+  }
+
+  async appendTransaction(
+    operations: readonly UrsulaTransactionOperation[]
+  ): Promise<void> {
+    for (const operation of operations) {
+      const current = this.streams.get(operation.stream) ?? [];
+      if (
+        operation.expectedRecord !== undefined &&
+        operation.expectedRecord !== current.length
+      ) {
+        throw new UrsulaRequestError(
+          'append group transaction',
+          new Response('record tail mismatch', { status: 412 }),
+          'record tail mismatch'
+        );
+      }
+    }
+    for (const operation of operations) {
+      const current = this.streams.get(operation.stream) ?? [];
+      const records = Array.isArray(operation.values)
+        ? [...operation.values]
+        : [operation.values];
+      current.push(...records);
+      this.streams.set(operation.stream, current);
+      this.appendedBatchSizes.push(records.length);
+    }
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
@@ -163,6 +199,120 @@ const payload = {
 } satisfies QueuePayload;
 
 describe('QueueJournal', () => {
+  it('commits an owned run step and lease fence in one transaction', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-owned'
+    );
+    const messageId = await journal.enqueue(queueName, {
+      runId: 'run-owned',
+    });
+    const lease = await journal.claim(queueName, new Date(), 10_000);
+    if (!lease) throw new Error('expected owned queue lease');
+    let applied = false;
+    const append: PreparedRunAppend = {
+      operation: {
+        stream: 'run-run-owned',
+        values: { type: 'step_completed' },
+        operationId: 'run-owned-step',
+        expectedRecord: 0,
+      },
+      apply: () => {
+        applied = true;
+      },
+    };
+    const delivery: DeliveryExecution = {
+      runId: 'run-owned',
+      lane: 'run',
+      queueName,
+      queuePartition: 0,
+      token: lease.leaseId,
+      generation: lease.generation,
+      ownerMessageId: messageId,
+      attempt: lease.message.attempt,
+      expiresAt: lease.message.leaseExpiresAt ?? new Date(),
+    };
+
+    await journal.commitOwnedStep(
+      delivery,
+      append,
+      new Date(Date.now() + 20_000)
+    );
+
+    expect(applied).toBe(true);
+    expect(
+      await journal.ownsLease(queueName, {
+        messageId,
+        leaseId: lease.leaseId,
+        generation: lease.generation,
+      })
+    ).toBe(true);
+    expect(memory.appendedBatchSizes.slice(-2)).toEqual([1, 1]);
+  });
+
+  it('rejects an owned run step after a redelivery supersedes its lease', async () => {
+    const memory = new MemoryClient();
+    const first = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-stale'
+    );
+    const messageId = await first.enqueue(queueName, { runId: 'run-stale' });
+    const base = Date.now() + 1000;
+    const stale = await first.claim(queueName, new Date(base), 100);
+    if (!stale) throw new Error('expected initial queue lease');
+    const second = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-stale'
+    );
+    const current = await second.claim(queueName, new Date(base + 101), 100);
+    if (!current) throw new Error('expected replacement queue lease');
+    let applied = false;
+    const append: PreparedRunAppend = {
+      operation: {
+        stream: 'run-run-stale',
+        values: { type: 'step_completed' },
+        operationId: 'run-stale-step',
+        expectedRecord: 0,
+      },
+      apply: () => {
+        applied = true;
+      },
+    };
+
+    await expect(
+      first.commitOwnedStep(
+        {
+          runId: 'run-stale',
+          lane: 'run',
+          queueName,
+          queuePartition: 0,
+          token: stale.leaseId,
+          generation: stale.generation,
+          ownerMessageId: messageId,
+          attempt: stale.message.attempt,
+          expiresAt: stale.message.leaseExpiresAt ?? new Date(),
+        },
+        append,
+        new Date(base + 1000)
+      )
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        PreconditionFailedError.is(error) || isUrsulaRequestError(error, 412)
+    );
+    expect(applied).toBe(false);
+    expect(
+      await second.ownsLease(queueName, {
+        messageId,
+        leaseId: current.leaseId,
+        generation: current.generation,
+      })
+    ).toBe(true);
+  });
+
   it('keeps one execution lane on one stable queue partition', () => {
     const first = queuePartition(
       { runId: 'run-one', stepId: 'step-one', attempt: 1 },

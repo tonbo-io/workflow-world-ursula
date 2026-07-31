@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { PreconditionFailedError } from '@workflow/errors';
 import type {
   MessageId,
   QueueOptions,
@@ -15,6 +16,8 @@ import {
   type UrsulaClient,
   type UrsulaRecord,
 } from './client.js';
+import type { DeliveryExecution } from './execution.js';
+import type { PreparedRunAppend } from './run-journal.js';
 
 const MAX_CAS_RETRIES = 32;
 const MAX_ENQUEUE_CAS_RETRIES = 128;
@@ -842,6 +845,70 @@ export class QueueJournal {
       current.leaseGeneration === lease.generation &&
       (current.leaseExpiresAt?.getTime() ?? 0) > now.getTime()
     );
+  }
+
+  /**
+   * Commits one complete run step while atomically proving that its queue
+   * delivery still owns the durable lease.
+   *
+   * The lease extension and run append share one Ursula group transaction,
+   * so a redelivery and an old handler cannot both cross the commit boundary.
+   */
+  async commitOwnedStep(
+    delivery: DeliveryExecution,
+    runAppend: PreparedRunAppend,
+    expiresAt: Date
+  ): Promise<void> {
+    const queueName = delivery.queueName as ValidQueueName;
+    const messageId = MessageIdSchema.parse(delivery.ownerMessageId);
+    let state = await this.loadForMutation(queueName);
+    let current = state.messages.get(messageId);
+    if (
+      current?.status !== 'leased' ||
+      current.leaseId !== delivery.token ||
+      current.leaseGeneration !== delivery.generation
+    ) {
+      state = await this.load(queueName);
+      current = state.messages.get(messageId);
+    }
+    if (
+      current?.status !== 'leased' ||
+      current.leaseId !== delivery.token ||
+      current.leaseGeneration !== delivery.generation
+    ) {
+      throw new PreconditionFailedError(
+        `Delivery "${delivery.token}" no longer owns queue message "${messageId}"`
+      );
+    }
+    const expectedRecord = state.nextRecord;
+    const transition = {
+      version: 1,
+      type: 'lease_extended',
+      messageId,
+      leaseId: delivery.token,
+      expiresAt: expiresAt.toISOString(),
+      createdAt: new Date().toISOString(),
+    } satisfies QueueTransition;
+    try {
+      await this.client.appendTransaction([
+        runAppend.operation,
+        {
+          stream: queueStream(queueName, this.partition),
+          values: transition,
+          operationId: `queue-owned-step:${delivery.token}:${runAppend.operation.operationId}`,
+          expectedRecord,
+        },
+      ]);
+    } catch (error) {
+      if (isUrsulaRequestError(error, 412)) this.cache.delete(queueName);
+      throw error;
+    }
+    if (state.nextRecord === expectedRecord) {
+      applyTransition(state, transition, expectedRecord);
+      state.nextRecord += 1;
+      this.scheduleCheckpoint(queueName, state, expectedRecord);
+    }
+    runAppend.apply();
   }
 
   /**
