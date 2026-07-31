@@ -34,6 +34,11 @@ const DEFAULT_PARTITION_COUNT = 8;
 
 type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
+interface DeliveryResult {
+  timeoutSeconds?: number;
+  transactionallyAcked?: boolean;
+}
+
 export interface UrsulaQueueConfig {
   /** Store every run's queue in the same Ursula affinity group as its journal. */
   runLocalQueues?: boolean;
@@ -405,7 +410,7 @@ export function createQueue(
   async function invokeHttp(
     queueName: ValidQueueName,
     lease: QueueLease
-  ): Promise<{ timeoutSeconds?: number } | undefined> {
+  ): Promise<DeliveryResult | undefined> {
     const baseUrl = deliveryBaseUrl();
     if (!baseUrl) {
       throw new Error(
@@ -450,17 +455,25 @@ export function createQueue(
       );
     }
     if (!text) return;
-    const result = JSON.parse(text) as { timeoutSeconds?: unknown };
-    return typeof result.timeoutSeconds === 'number'
-      ? { timeoutSeconds: result.timeoutSeconds }
-      : undefined;
+    const result = JSON.parse(text) as {
+      timeoutSeconds?: unknown;
+      __ursulaTransactionallyAcked?: unknown;
+    };
+    return {
+      ...(typeof result.timeoutSeconds === 'number'
+        ? { timeoutSeconds: result.timeoutSeconds }
+        : {}),
+      ...(result.__ursulaTransactionallyAcked === true
+        ? { transactionallyAcked: true }
+        : {}),
+    };
   }
 
   async function invoke(
     queueName: ValidQueueName,
     lease: QueueLease,
     handler: QueueHandler | undefined
-  ): Promise<{ timeoutSeconds?: number } | undefined> {
+  ): Promise<DeliveryResult | undefined> {
     if (!handler) return invokeHttp(queueName, lease);
     const call = async () =>
       (await handler(lease.message.message, {
@@ -469,9 +482,15 @@ export function createQueue(
         messageId: lease.message.messageId,
         requestId: lease.message.headers?.['x-vercel-id'],
       })) ?? undefined;
-    return executions
-      ? executions.run(deliveryExecution(queueName, lease), call)
-      : call();
+    const result = executions
+      ? await executions.run(deliveryExecution(queueName, lease), call)
+      : await call();
+    return {
+      ...(result ?? {}),
+      ...(executions?.consumeTransactionalAck(lease.leaseId)
+        ? { transactionallyAcked: true }
+        : {}),
+    };
   }
 
   async function heartbeat(
@@ -509,6 +528,7 @@ export function createQueue(
     );
     try {
       const result = await invoke(queueName, lease, handler);
+      if (result?.transactionallyAcked) return null;
       if (typeof result?.timeoutSeconds === 'number') {
         const timeoutMs = Math.max(0, result.timeoutSeconds) * 1000;
         await journalForLease(lease).retry(
@@ -817,12 +837,35 @@ export function createQueue(
         const result = executions
           ? await executions.run(execution, call)
           : await call();
-        return Response.json(result ?? { ok: true });
+        const transactionallyAcked =
+          execution && executions?.consumeTransactionalAck(execution.token);
+        return Response.json({
+          ...(result ?? { ok: true }),
+          ...(transactionallyAcked
+            ? { __ursulaTransactionallyAcked: true }
+            : {}),
+        });
       } catch (error) {
         return Response.json(String(error), { status: 500 });
       }
     };
   };
+
+  if (runLocalQueues && executions) {
+    executions.setTerminalCommitter(async (delivery, append) => {
+      const journal = journalForTarget(
+        delivery.queueName as ValidQueueName,
+        delivery.queuePartition,
+        delivery.runId
+      );
+      if (!journal) {
+        throw new Error(
+          `Invalid Ursula queue partition ${delivery.queuePartition}`
+        );
+      }
+      await journal.ackWithRunAppend(delivery, append);
+    });
+  }
 
   return {
     queue,
