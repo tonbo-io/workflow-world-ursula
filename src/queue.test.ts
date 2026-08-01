@@ -264,6 +264,48 @@ describe('Ursula queue runtime', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it('defers full-delivery fencing to the atomic terminal commit', async () => {
+    const client = new MemoryClient() as unknown as UrsulaClient;
+    const run = vi.fn(
+      async (_delivery: unknown, task: () => Promise<unknown>) => task()
+    );
+    const executions = {
+      allowsOwnedLazyStarts: () => false,
+      allowsDeliveryTransactions: () => true,
+      finishDelivery: async () => false,
+      run,
+    } as unknown as RunExecutionCoordinator;
+    const queueName = '__wkf_workflow_delivery_fence' as ValidQueueName;
+    const handler = createQueue(client, {}, executions).createQueueHandler(
+      '__wkf_workflow_',
+      async () => undefined
+    );
+
+    const response = await handler(
+      new Request('http://workflow.test/flow', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-vqs-queue-name': queueName,
+          'x-vqs-message-id': 'msg_delivery_fence',
+          'x-vqs-message-attempt': '1',
+          'x-ursula-run-id': 'wrun_delivery_fence',
+          'x-ursula-execution-lane': 'run',
+          'x-ursula-execution-partition': '0',
+          'x-ursula-execution-token': 'lease_delivery_fence',
+          'x-ursula-execution-generation': '1',
+          'x-ursula-execution-expires-at': new Date(
+            Date.now() + 60_000
+          ).toISOString(),
+        },
+        body: JSON.stringify({ runId: 'wrun_delivery_fence' }),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(run).toHaveBeenCalledOnce();
+  });
+
   it('recovers an enqueued message in a fresh dispatcher', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const queueName = '__wkf_workflow_recovery' as ValidQueueName;

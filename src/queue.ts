@@ -821,11 +821,7 @@ export function createQueue(
                 expiresAt,
               }
             : undefined;
-        if (
-          execution &&
-          (executions?.allowsOwnedLazyStarts() ||
-            executions?.allowsDeliveryTransactions())
-        ) {
+        if (execution && executions?.allowsOwnedLazyStarts()) {
           const journal = journalForTarget(
             queueName.data,
             execution.queuePartition,
