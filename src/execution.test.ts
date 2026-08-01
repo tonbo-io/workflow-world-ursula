@@ -290,6 +290,195 @@ async function setup(allowOwnedLazyStarts = true) {
 }
 
 describe('atomic step transactions', () => {
+  it('commits a complete delivery journal as one run record', async () => {
+    const memory = new MemoryClient();
+    const journal = new RunJournal(memory);
+    const executions = new RunExecutionCoordinator({
+      allowDeliveryTransactions: true,
+    });
+    executions.setDeliveryCommitter(
+      async (_delivery, append, _timeoutSeconds) => {
+        await memory.appendTransaction([append.operation]);
+        append.apply();
+      }
+    );
+    const { storage } = createStorage(memory, { journal, executions });
+    await storage.events.create('wrun_delivery', {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_delivery',
+        workflowName: 'workflow//test//delivery',
+        input: Uint8Array.from([0]),
+      },
+      specVersion: 5,
+    });
+    const before = memory.runCommits().length;
+
+    await executions.run(
+      delivery('lease-delivery', { runId: 'wrun_delivery' }),
+      async () => {
+        await storage.events.create('wrun_delivery', {
+          eventType: 'run_started',
+          specVersion: 5,
+        });
+        await storage.events.create(
+          'wrun_delivery',
+          stepStarted('step-delivery')
+        );
+        await storage.events.create(
+          'wrun_delivery',
+          stepCompleted('step-delivery')
+        );
+
+        expect(memory.runCommits()).toHaveLength(before);
+        await expect(
+          storage.steps.get('wrun_delivery', 'step-delivery')
+        ).resolves.toMatchObject({ status: 'completed' });
+        await expect(
+          storage.events.list({ runId: 'wrun_delivery' })
+        ).resolves.toMatchObject({
+          data: expect.arrayContaining([
+            expect.objectContaining({ eventType: 'step_completed' }),
+          ]),
+        });
+        await expect(
+          executions.finishDelivery('wrun_delivery', undefined)
+        ).resolves.toBe(true);
+      }
+    );
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(1);
+    expect(commits[0]?.events.map(({ eventType }) => eventType)).toEqual([
+      'run_started',
+      'step_created',
+      'step_started',
+      'step_completed',
+    ]);
+  });
+
+  it('serializes parallel run mutations into the same delivery record', async () => {
+    const memory = new MemoryClient();
+    const journal = new RunJournal(memory);
+    const executions = new RunExecutionCoordinator({
+      allowDeliveryTransactions: true,
+    });
+    executions.setDeliveryCommitter(
+      async (_delivery, append, _timeoutSeconds) => {
+        await memory.appendTransaction([append.operation]);
+        append.apply();
+      }
+    );
+    const { storage } = createStorage(memory, { journal, executions });
+    await storage.events.create('wrun_parallel_delivery', {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_delivery',
+        workflowName: 'workflow//test//atomic',
+        input: Uint8Array.from([0]),
+      },
+      specVersion: 5,
+    });
+    await storage.events.create('wrun_parallel_delivery', {
+      eventType: 'run_started',
+      specVersion: 5,
+    });
+    const before = memory.runCommits().length;
+
+    await executions.run(
+      delivery('lease-parallel', { runId: 'wrun_parallel_delivery' }),
+      async () => {
+        await Promise.all([
+          storage.events.create(
+            'wrun_parallel_delivery',
+            stepStarted('step-parallel-a')
+          ),
+          storage.events.create(
+            'wrun_parallel_delivery',
+            stepStarted('step-parallel-b')
+          ),
+        ]);
+        await Promise.all([
+          storage.events.create(
+            'wrun_parallel_delivery',
+            stepCompleted('step-parallel-a')
+          ),
+          storage.events.create(
+            'wrun_parallel_delivery',
+            stepCompleted('step-parallel-b')
+          ),
+        ]);
+        await executions.finishDelivery(
+          'wrun_parallel_delivery',
+          undefined
+        );
+      }
+    );
+
+    const commits = memory.runCommits().slice(before);
+    expect(commits).toHaveLength(1);
+    expect(
+      commits[0]?.events.filter(
+        ({ eventType }) => eventType === 'step_completed'
+      )
+    ).toHaveLength(2);
+  });
+
+  it('does not expose an abandoned delivery batch after redelivery', async () => {
+    const memory = new MemoryClient();
+    const journal = new RunJournal(memory);
+    const first = new RunExecutionCoordinator({
+      allowDeliveryTransactions: true,
+    });
+    const { storage: firstStorage } = createStorage(memory, {
+      journal,
+      executions: first,
+    });
+    await firstStorage.events.create('wrun_abandoned_delivery', {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_delivery',
+        workflowName: 'workflow//test//delivery',
+        input: Uint8Array.from([0]),
+      },
+      specVersion: 5,
+    });
+    const before = memory.runCommits().length;
+
+    await first.run(
+      delivery('lease-abandoned', { runId: 'wrun_abandoned_delivery' }),
+      async () => {
+        await firstStorage.events.create(
+          'wrun_abandoned_delivery',
+          stepStarted('step-abandoned')
+        );
+        await expect(
+          firstStorage.steps.get(
+            'wrun_abandoned_delivery',
+            'step-abandoned'
+          )
+        ).resolves.toMatchObject({ status: 'running' });
+        // Simulate a process crash by leaving the delivery without calling
+        // finishDelivery(). The preview must remain process-local only.
+      }
+    );
+
+    const second = new RunExecutionCoordinator({
+      allowDeliveryTransactions: true,
+    });
+    const { storage: secondStorage } = createStorage(memory, {
+      journal: new RunJournal(memory),
+      executions: second,
+    });
+    expect(memory.runCommits()).toHaveLength(before);
+    await expect(
+      secondStorage.steps.get(
+        'wrun_abandoned_delivery',
+        'step-abandoned'
+      )
+    ).rejects.toThrow();
+  });
+
   it('keeps the public contract without a queue delivery lease', async () => {
     const { memory, storage } = await setup();
     const before = memory.runCommits().length;
@@ -323,17 +512,18 @@ describe('atomic step transactions', () => {
     await first;
   });
 
-  it('keeps delivery contexts isolated between World coordinators', async () => {
+  it('shares the active async delivery context between server bundles', async () => {
     const first = new RunExecutionCoordinator();
     const second = new RunExecutionCoordinator();
 
     await first.run(delivery('lease-first'), async () => {
       expect(first.current('wrun_atomic')?.token).toBe('lease-first');
-      expect(second.current('wrun_atomic')).toBeUndefined();
+      expect(second.current('wrun_atomic')?.token).toBe('lease-first');
       await second.run(delivery('lease-second'), async () => {
-        expect(first.current('wrun_atomic')?.token).toBe('lease-first');
+        expect(first.current('wrun_atomic')?.token).toBe('lease-second');
         expect(second.current('wrun_atomic')?.token).toBe('lease-second');
       });
+      expect(second.current('wrun_atomic')?.token).toBe('lease-first');
     });
   });
 
@@ -350,7 +540,7 @@ describe('atomic step transactions', () => {
       expect(
         storageBundle.current(current.runId, current.ownerMessageId)
       ).toEqual(current);
-      expect(storageBundle.current(current.runId)).toBeUndefined();
+      expect(storageBundle.current(current.runId)).toEqual(current);
     });
     expect(
       storageBundle.current(current.runId, current.ownerMessageId)

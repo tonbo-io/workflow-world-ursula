@@ -912,6 +912,82 @@ export class QueueJournal {
   }
 
   /**
+   * Commits all run mutations produced by one handler invocation together
+   * with the queue outcome that makes that invocation final.
+   *
+   * A successful response cannot expose a partially committed delivery: the
+   * run append and ACK (or retry scheduling) are one group-local transaction.
+   */
+  async commitDelivery(
+    delivery: DeliveryExecution,
+    runAppend: PreparedRunAppend,
+    timeoutSeconds: number | undefined
+  ): Promise<void> {
+    const queueName = delivery.queueName as ValidQueueName;
+    const messageId = MessageIdSchema.parse(delivery.ownerMessageId);
+    let state = await this.loadForMutation(queueName);
+    let current = state.messages.get(messageId);
+    if (
+      current?.status !== 'leased' ||
+      current.leaseId !== delivery.token ||
+      current.leaseGeneration !== delivery.generation
+    ) {
+      state = await this.load(queueName);
+      current = state.messages.get(messageId);
+    }
+    if (
+      current?.status !== 'leased' ||
+      current.leaseId !== delivery.token ||
+      current.leaseGeneration !== delivery.generation
+    ) {
+      throw new PreconditionFailedError(
+        `Delivery "${delivery.token}" no longer owns queue message "${messageId}"`
+      );
+    }
+    const now = new Date();
+    const expectedRecord = state.nextRecord;
+    const transition: QueueTransition =
+      timeoutSeconds === undefined
+        ? {
+            version: 1,
+            type: 'acked',
+            messageId,
+            leaseId: delivery.token,
+            createdAt: now.toISOString(),
+          }
+        : {
+            version: 1,
+            type: 'retry_scheduled',
+            messageId,
+            leaseId: delivery.token,
+            availableAt: new Date(
+              now.getTime() + Math.max(0, timeoutSeconds) * 1000
+            ).toISOString(),
+            createdAt: now.toISOString(),
+          };
+    try {
+      await this.client.appendTransaction([
+        runAppend.operation,
+        {
+          stream: queueStream(queueName, this.partition),
+          values: transition,
+          operationId: `queue-delivery:${delivery.token}:${runAppend.operation.operationId}`,
+          expectedRecord,
+        },
+      ]);
+    } catch (error) {
+      if (isUrsulaRequestError(error, 412)) this.cache.delete(queueName);
+      throw error;
+    }
+    if (state.nextRecord === expectedRecord) {
+      applyTransition(state, transition, expectedRecord);
+      state.nextRecord += 1;
+      this.scheduleCheckpoint(queueName, state, expectedRecord);
+    }
+    runAppend.apply();
+  }
+
+  /**
    * Completes one delivery and, when work is immediately available, leases
    * its successor in the same durable append. This preserves the queue state
    * machine while removing one Raft round trip from suspension-heavy runs.

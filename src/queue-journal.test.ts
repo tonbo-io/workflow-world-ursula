@@ -252,6 +252,172 @@ describe('QueueJournal', () => {
     expect(memory.appendedBatchSizes.slice(-2)).toEqual([1, 1]);
   });
 
+  it('commits a delivery journal and ACK in one transaction', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-delivery'
+    );
+    const messageId = await journal.enqueue(queueName, {
+      runId: 'run-delivery',
+    });
+    const lease = await journal.claim(queueName, new Date(), 10_000);
+    if (!lease) throw new Error('expected delivery queue lease');
+    let applied = false;
+    const append: PreparedRunAppend = {
+      operation: {
+        stream: 'run-run-delivery',
+        values: { type: 'delivery' },
+        operationId: 'run-delivery-commit',
+        expectedRecord: 0,
+      },
+      apply: () => {
+        applied = true;
+      },
+    };
+
+    await journal.commitDelivery(
+      {
+        runId: 'run-delivery',
+        lane: 'run',
+        queueName,
+        queuePartition: 0,
+        token: lease.leaseId,
+        generation: lease.generation,
+        ownerMessageId: messageId,
+        attempt: lease.message.attempt,
+        expiresAt: lease.message.leaseExpiresAt ?? new Date(),
+      },
+      append,
+      undefined
+    );
+
+    expect(applied).toBe(true);
+    expect(
+      await journal.ownsLease(queueName, {
+        messageId,
+        leaseId: lease.leaseId,
+        generation: lease.generation,
+      })
+    ).toBe(false);
+    expect(memory.appendedBatchSizes.slice(-2)).toEqual([1, 1]);
+  });
+
+  it('commits a delivery journal and delayed retry in one transaction', async () => {
+    const memory = new MemoryClient();
+    const journal = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-delivery-retry'
+    );
+    const messageId = await journal.enqueue(queueName, {
+      runId: 'run-delivery-retry',
+    });
+    const now = new Date();
+    const lease = await journal.claim(queueName, now, 10_000);
+    if (!lease) throw new Error('expected delivery queue lease');
+    let applied = false;
+
+    await journal.commitDelivery(
+      {
+        runId: 'run-delivery-retry',
+        lane: 'run',
+        queueName,
+        queuePartition: 0,
+        token: lease.leaseId,
+        generation: lease.generation,
+        ownerMessageId: messageId,
+        attempt: lease.message.attempt,
+        expiresAt: lease.message.leaseExpiresAt ?? new Date(),
+      },
+      {
+        operation: {
+          stream: 'run-run-delivery-retry',
+          values: { type: 'delivery' },
+          operationId: 'run-delivery-retry-commit',
+          expectedRecord: 0,
+        },
+        apply: () => {
+          applied = true;
+        },
+      },
+      10
+    );
+
+    expect(applied).toBe(true);
+    await expect(journal.claim(queueName, now, 10_000)).resolves.toBeNull();
+    const redelivery = await journal.claim(
+      queueName,
+      new Date(now.getTime() + 10_001),
+      10_000
+    );
+    expect(redelivery?.message.messageId).toBe(messageId);
+    expect(redelivery?.message.attempt).toBe(2);
+  });
+
+  it('rejects a delivery commit after redelivery supersedes its lease', async () => {
+    const memory = new MemoryClient();
+    const first = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-delivery-stale'
+    );
+    const messageId = await first.enqueue(queueName, {
+      runId: 'run-delivery-stale',
+    });
+    const base = Date.now() + 1000;
+    const stale = await first.claim(queueName, new Date(base), 100);
+    if (!stale) throw new Error('expected initial delivery lease');
+    const second = new QueueJournal(
+      memory as unknown as UrsulaClient,
+      0,
+      'run-delivery-stale'
+    );
+    const current = await second.claim(queueName, new Date(base + 101), 100);
+    if (!current) throw new Error('expected replacement delivery lease');
+    let applied = false;
+
+    await expect(
+      first.commitDelivery(
+        {
+          runId: 'run-delivery-stale',
+          lane: 'run',
+          queueName,
+          queuePartition: 0,
+          token: stale.leaseId,
+          generation: stale.generation,
+          ownerMessageId: messageId,
+          attempt: stale.message.attempt,
+          expiresAt: stale.message.leaseExpiresAt ?? new Date(),
+        },
+        {
+          operation: {
+            stream: 'run-run-delivery-stale',
+            values: { type: 'delivery' },
+            operationId: 'run-delivery-stale-commit',
+            expectedRecord: 0,
+          },
+          apply: () => {
+            applied = true;
+          },
+        },
+        undefined
+      )
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        PreconditionFailedError.is(error) || isUrsulaRequestError(error, 412)
+    );
+    expect(applied).toBe(false);
+    expect(
+      await second.ownsLease(queueName, {
+        messageId,
+        leaseId: current.leaseId,
+        generation: current.generation,
+      })
+    ).toBe(true);
+  });
+
   it('rejects an owned run step after a redelivery supersedes its lease', async () => {
     const memory = new MemoryClient();
     const first = new QueueJournal(

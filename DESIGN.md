@@ -129,6 +129,10 @@ The terminal commit is a group-local Ursula transaction containing the complete 
 
 For a queue invocation that executes `N` staged steps, the opt-in write cost is `N` group-local Raft commits instead of one execution-fence commit plus `N` step commits or the literal `2N` step commits. Each successful commit advances both the run and queue journals but crosses one HTTP and consensus boundary. Transports without a queue delivery lease and deployments with the option disabled fall back to the literal two-append contract.
 
+With `WORKFLOW_URSULA_EXPERIMENTAL_DELIVERY_TRANSACTIONS=1`, compatible run mutations produced by one queue handler are reduced against a delivery-local preview instead of being appended individually. Reads performed by that handler observe the preview. Enqueuing a continuation flushes the preceding run batch before making the continuation visible; hook claim side effects also force a flush because their authority lives outside the run journal. At handler return, the remaining run batch and the queue `acked` or `retry_scheduled` transition are one group-local Ursula transaction.
+
+The delivery-local preview is never durable state. A process crash discards it, so redelivery recomputes the same transition from the last committed journal. The final queue lease token and generation fence the transaction: a superseded handler cannot append run state, while a successful response cannot expose a run commit without its matching queue outcome. The run and queue CAS preconditions remain the correctness boundary across leader changes and competing writers.
+
 The queue journal still owns ready-message discovery, delivery attempts,
 delays, and acknowledgement. A later phase can move continuation readiness
 into the run transaction and make the queue a rebuildable projection, but that
