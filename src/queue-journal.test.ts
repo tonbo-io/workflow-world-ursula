@@ -69,7 +69,7 @@ class MemoryClient {
 
   async appendTransaction(
     operations: readonly UrsulaTransactionOperation[]
-  ): Promise<void> {
+  ): Promise<Array<{ deduplicated: boolean }>> {
     for (const operation of operations) {
       const current = this.streams.get(operation.stream) ?? [];
       if (
@@ -92,6 +92,7 @@ class MemoryClient {
       this.streams.set(operation.stream, current);
       this.appendedBatchSizes.push(records.length);
     }
+    return operations.map(() => ({ deduplicated: false }));
   }
 
   async readAll<T>(stream: string, start = 0): Promise<UrsulaRecord<T>[]> {
@@ -222,6 +223,7 @@ describe('QueueJournal', () => {
       apply: () => {
         applied = true;
       },
+      deduplicated: () => undefined,
     };
     const delivery: DeliveryExecution = {
       runId: 'run-owned',
@@ -275,6 +277,7 @@ describe('QueueJournal', () => {
       apply: () => {
         applied = true;
       },
+      deduplicated: () => undefined,
     };
 
     await journal.commitDelivery(
@@ -447,6 +450,7 @@ describe('QueueJournal', () => {
       apply: () => {
         applied = true;
       },
+      deduplicated: () => undefined,
     };
 
     await expect(

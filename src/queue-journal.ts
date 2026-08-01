@@ -889,8 +889,10 @@ export class QueueJournal {
       expiresAt: expiresAt.toISOString(),
       createdAt: new Date().toISOString(),
     } satisfies QueueTransition;
+    let runDeduplicated = false;
+    let queueDeduplicated = false;
     try {
-      await this.client.appendTransaction([
+      const [runResult, queueResult] = await this.client.appendTransaction([
         runAppend.operation,
         {
           stream: queueStream(queueName, this.partition),
@@ -899,16 +901,21 @@ export class QueueJournal {
           expectedRecord,
         },
       ]);
+      runDeduplicated = runResult?.deduplicated ?? false;
+      queueDeduplicated = queueResult?.deduplicated ?? false;
     } catch (error) {
       if (isUrsulaRequestError(error, 412)) this.cache.delete(queueName);
       throw error;
     }
-    if (state.nextRecord === expectedRecord) {
+    if (!queueDeduplicated && state.nextRecord === expectedRecord) {
       applyTransition(state, transition, expectedRecord);
       state.nextRecord += 1;
       this.scheduleCheckpoint(queueName, state, expectedRecord);
+    } else if (queueDeduplicated) {
+      this.cache.delete(queueName);
     }
-    runAppend.apply();
+    if (runDeduplicated) runAppend.deduplicated();
+    else runAppend.apply();
   }
 
   /**
@@ -925,66 +932,76 @@ export class QueueJournal {
   ): Promise<void> {
     const queueName = delivery.queueName as ValidQueueName;
     const messageId = MessageIdSchema.parse(delivery.ownerMessageId);
-    let state = await this.loadForMutation(queueName);
-    let current = state.messages.get(messageId);
-    if (
-      current?.status !== 'leased' ||
-      current.leaseId !== delivery.token ||
-      current.leaseGeneration !== delivery.generation
-    ) {
-      state = await this.load(queueName);
-      current = state.messages.get(messageId);
+    for (let retry = 0; retry < MAX_CAS_RETRIES; retry += 1) {
+      let state = await this.loadForMutation(queueName);
+      let current = state.messages.get(messageId);
+      if (
+        current?.status !== 'leased' ||
+        current.leaseId !== delivery.token ||
+        current.leaseGeneration !== delivery.generation
+      ) {
+        state = await this.load(queueName);
+        current = state.messages.get(messageId);
+      }
+      if (
+        current?.status !== 'leased' ||
+        current.leaseId !== delivery.token ||
+        current.leaseGeneration !== delivery.generation
+      ) {
+        throw new PreconditionFailedError(
+          `Delivery "${delivery.token}" no longer owns queue message "${messageId}"`
+        );
+      }
+      const now = new Date();
+      const expectedRecord = state.nextRecord;
+      const transition: QueueTransition =
+        timeoutSeconds === undefined
+          ? {
+              version: 1,
+              type: 'acked',
+              messageId,
+              leaseId: delivery.token,
+              createdAt: now.toISOString(),
+            }
+          : {
+              version: 1,
+              type: 'retry_scheduled',
+              messageId,
+              leaseId: delivery.token,
+              availableAt: new Date(
+                now.getTime() + Math.max(0, timeoutSeconds) * 1000
+              ).toISOString(),
+              createdAt: now.toISOString(),
+            };
+      try {
+        const [runResult, queueResult] = await this.client.appendTransaction([
+          runAppend.operation,
+          {
+            stream: queueStream(queueName, this.partition),
+            values: transition,
+            operationId: `queue-delivery:${delivery.token}:${runAppend.operation.operationId}`,
+            expectedRecord,
+          },
+        ]);
+        if (!queueResult?.deduplicated && state.nextRecord === expectedRecord) {
+          applyTransition(state, transition, expectedRecord);
+          state.nextRecord += 1;
+          this.scheduleCheckpoint(queueName, state, expectedRecord);
+        } else if (queueResult?.deduplicated) {
+          this.cache.delete(queueName);
+        }
+        if (runResult?.deduplicated) runAppend.deduplicated();
+        else runAppend.apply();
+        return;
+      } catch (error) {
+        if (!isUrsulaRequestError(error, 412)) throw error;
+        this.cache.delete(queueName);
+        await contentionBackoff(retry);
+      }
     }
-    if (
-      current?.status !== 'leased' ||
-      current.leaseId !== delivery.token ||
-      current.leaseGeneration !== delivery.generation
-    ) {
-      throw new PreconditionFailedError(
-        `Delivery "${delivery.token}" no longer owns queue message "${messageId}"`
-      );
-    }
-    const now = new Date();
-    const expectedRecord = state.nextRecord;
-    const transition: QueueTransition =
-      timeoutSeconds === undefined
-        ? {
-            version: 1,
-            type: 'acked',
-            messageId,
-            leaseId: delivery.token,
-            createdAt: now.toISOString(),
-          }
-        : {
-            version: 1,
-            type: 'retry_scheduled',
-            messageId,
-            leaseId: delivery.token,
-            availableAt: new Date(
-              now.getTime() + Math.max(0, timeoutSeconds) * 1000
-            ).toISOString(),
-            createdAt: now.toISOString(),
-          };
-    try {
-      await this.client.appendTransaction([
-        runAppend.operation,
-        {
-          stream: queueStream(queueName, this.partition),
-          values: transition,
-          operationId: `queue-delivery:${delivery.token}:${runAppend.operation.operationId}`,
-          expectedRecord,
-        },
-      ]);
-    } catch (error) {
-      if (isUrsulaRequestError(error, 412)) this.cache.delete(queueName);
-      throw error;
-    }
-    if (state.nextRecord === expectedRecord) {
-      applyTransition(state, transition, expectedRecord);
-      state.nextRecord += 1;
-      this.scheduleCheckpoint(queueName, state, expectedRecord);
-    }
-    runAppend.apply();
+    throw new PreconditionFailedError(
+      `Delivery "${delivery.token}" could not commit after contention retries`
+    );
   }
 
   /**

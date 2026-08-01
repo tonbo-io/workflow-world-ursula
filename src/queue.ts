@@ -14,6 +14,10 @@ import {
   type UrsulaClient,
 } from './client.js';
 import {
+  DEFAULT_RUN_AFFINITY_LANES,
+  runAffinity,
+} from './affinity.js';
+import {
   RunExecutionCoordinator,
   type DeliveryExecution,
 } from './execution.js';
@@ -30,7 +34,7 @@ const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_CONCURRENCY = 64;
 const DEFAULT_SHUTDOWN_GRACE_MS = 30_000;
 const DEFAULT_CROSS_INSTANCE_WAKE_TIMEOUT_MS = 25_000;
-const DEFAULT_PARTITION_COUNT = 8;
+const DEFAULT_PARTITION_COUNT = DEFAULT_RUN_AFFINITY_LANES;
 
 type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
@@ -237,13 +241,12 @@ export function createQueue(
 
   function affinityForMessage(message: Parameters<Queue['queue']>[1]): string {
     if ('__healthCheck' in message) {
-      if (message.runId) return message.runId;
-      return `health-${createHash('sha256')
-        .update(message.correlationId)
-        .digest('base64url')
-        .slice(0, 32)}`;
+      return runAffinity(
+        message.runId ?? `health:${message.correlationId}`,
+        partitionCount
+      );
     }
-    return message.runId;
+    return runAffinity(message.runId, partitionCount);
   }
 
   function ownsRun(runId: string): boolean {
@@ -825,7 +828,9 @@ export function createQueue(
           const journal = journalForTarget(
             queueName.data,
             execution.queuePartition,
-            runLocalQueues ? execution.runId : undefined
+            runLocalQueues
+              ? runAffinity(execution.runId, partitionCount)
+              : undefined
           );
           const ownsLease =
             journal &&
@@ -868,7 +873,7 @@ export function createQueue(
       const journal = journalForTarget(
         delivery.queueName as ValidQueueName,
         delivery.queuePartition,
-        delivery.runId
+        runAffinity(delivery.runId, partitionCount)
       );
       if (!journal) {
         throw new Error(
@@ -883,11 +888,11 @@ export function createQueue(
     });
     executions.setDeliveryCommitter(
       async (delivery, append, timeoutSeconds) => {
-        const journal = journalForTarget(
-          delivery.queueName as ValidQueueName,
-          delivery.queuePartition,
-          delivery.runId
-        );
+      const journal = journalForTarget(
+        delivery.queueName as ValidQueueName,
+        delivery.queuePartition,
+        runAffinity(delivery.runId, partitionCount)
+      );
         if (!journal) {
           throw new Error(
             `Invalid Ursula queue partition ${delivery.queuePartition}`
