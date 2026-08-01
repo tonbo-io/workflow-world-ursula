@@ -1,10 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
-  AnyEventRequest,
-  CreateEventParams,
-  EventResult,
-} from '@workflow/world';
-import type {
   PreparedRunAppend,
   RunCommit,
   RunJournalState,
@@ -22,21 +17,9 @@ export interface DeliveryExecution {
   expiresAt: Date;
 }
 
-export interface StagedStepStart {
-  request: AnyEventRequest & { eventType: 'step_started' };
-  params: CreateEventParams | undefined;
-  callId: string;
-  eventId: string;
-  syntheticEventId: string;
-  now: Date;
-  result: EventResult;
-  delivery?: DeliveryExecution;
-}
-
 interface DeliveryContext {
   runId: string;
   delivery: DeliveryExecution;
-  stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
   runTransaction?: DeliveryRunTransaction;
 }
@@ -53,7 +36,7 @@ export interface DeliveryRunTransaction {
   append: PreparedRunAppend;
 }
 
-type OwnedStepCommitter = (
+type RunCommitter = (
   delivery: DeliveryExecution,
   append: PreparedRunAppend
 ) => Promise<void>;
@@ -89,36 +72,20 @@ function sharedDeliveries(): SharedDeliveryRegistry {
 }
 
 /**
- * Coordinates owned step commits within one adapter process.
+ * Coordinates run mutations produced by one queue delivery.
  *
- * The durable queue lease remains the delivery authority. A complete owned
- * step validates that lease and commits its run record in one group-local
+ * The durable queue lease remains the delivery authority. A complete
+ * delivery validates that lease and commits its run record in one group-local
  * Ursula transaction.
  */
 export class RunExecutionCoordinator {
   private readonly contexts = sharedDeliveries().contexts;
-  private readonly ownedStarts = new Map<string, StagedStepStart>();
-  private readonly ownedTurns = new Map<string, Promise<void>>();
-  private ownedStepCommitter: OwnedStepCommitter | undefined;
+  private readonly turns = new Map<string, Promise<void>>();
+  private runCommitter: RunCommitter | undefined;
   private deliveryCommitter: DeliveryCommitter | undefined;
 
-  constructor(
-    private readonly options: {
-      allowOwnedLazyStarts?: boolean;
-      allowDeliveryTransactions?: boolean;
-    } = {}
-  ) {}
-
-  allowsOwnedLazyStarts(): boolean {
-    return this.options.allowOwnedLazyStarts === true;
-  }
-
-  allowsDeliveryTransactions(): boolean {
-    return this.options.allowDeliveryTransactions === true;
-  }
-
-  setOwnedStepCommitter(committer: OwnedStepCommitter): void {
-    this.ownedStepCommitter = committer;
+  setRunCommitter(committer: RunCommitter): void {
+    this.runCommitter = committer;
   }
 
   setDeliveryCommitter(committer: DeliveryCommitter): void {
@@ -161,8 +128,8 @@ export class RunExecutionCoordinator {
     const context = this.contexts.getStore();
     const transaction =
       context?.runId === runId ? context.runTransaction : undefined;
-    if (!context || !transaction || !this.ownedStepCommitter) return false;
-    await this.ownedStepCommitter(context.delivery, transaction.append);
+    if (!context || !transaction || !this.runCommitter) return false;
+    await this.runCommitter(context.delivery, transaction.append);
     context.runTransaction = undefined;
     return true;
   }
@@ -184,16 +151,6 @@ export class RunExecutionCoordinator {
     return true;
   }
 
-  async commitOwnedStep(
-    runId: string,
-    delivery: DeliveryExecution,
-    append: PreparedRunAppend
-  ): Promise<boolean> {
-    if (!this.ownedStepCommitter || delivery.runId !== runId) return false;
-    await this.ownedStepCommitter(delivery, append);
-    return true;
-  }
-
   async run<T>(
     delivery: DeliveryExecution | undefined,
     task: () => Promise<T>
@@ -212,7 +169,6 @@ export class RunExecutionCoordinator {
         {
           runId: delivery.runId,
           delivery,
-          stagedStarts: new Map(),
           turn: Promise.resolve(),
         },
         task
@@ -241,42 +197,18 @@ export class RunExecutionCoordinator {
     return context.delivery;
   }
 
-  staged(runId: string, stepId: string): StagedStepStart | undefined {
-    const context = this.contexts.getStore();
-    if (context?.runId === runId) {
-      const staged = context.stagedStarts.get(stepId);
-      if (staged) return staged;
-    }
-    return this.ownedStarts.get(`${runId}\0${stepId}`);
-  }
-
-  stage(runId: string, stepId: string, start: StagedStepStart): void {
-    const context = this.contexts.getStore();
-    if (context?.runId === runId) {
-      context.stagedStarts.set(stepId, start);
-      return;
-    }
-    this.ownedStarts.set(`${runId}\0${stepId}`, start);
-  }
-
-  finish(runId: string, stepId: string): void {
-    const context = this.contexts.getStore();
-    if (context?.runId === runId) context.stagedStarts.delete(stepId);
-    this.ownedStarts.delete(`${runId}\0${stepId}`);
-  }
-
   async exclusive<T>(runId: string, task: () => Promise<T>): Promise<T> {
     const context = this.contexts.getStore();
     const previous =
       context?.runId === runId
         ? context.turn
-        : (this.ownedTurns.get(runId) ?? Promise.resolve());
+        : (this.turns.get(runId) ?? Promise.resolve());
     let release = () => {};
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
     if (context?.runId === runId) context.turn = next;
-    else this.ownedTurns.set(runId, next);
+    else this.turns.set(runId, next);
     await previous;
     try {
       return await task();
@@ -284,9 +216,9 @@ export class RunExecutionCoordinator {
       release();
       if (
         context?.runId !== runId &&
-        this.ownedTurns.get(runId) === next
+        this.turns.get(runId) === next
       ) {
-        this.ownedTurns.delete(runId);
+        this.turns.delete(runId);
       }
     }
   }

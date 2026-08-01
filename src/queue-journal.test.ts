@@ -10,7 +10,7 @@ import {
   type UrsulaTransactionOperation,
 } from './client.js';
 import type { DeliveryExecution } from './execution.js';
-import { QueueJournal, queuePartition } from './queue-journal.js';
+import { QueueJournal } from './queue-journal.js';
 import type { PreparedRunAppend } from './run-journal.js';
 
 class MemoryClient {
@@ -237,7 +237,7 @@ describe('QueueJournal', () => {
       expiresAt: lease.message.leaseExpiresAt ?? new Date(),
     };
 
-    await journal.commitOwnedStep(
+    await journal.commitRunBatch(
       delivery,
       append,
       new Date(Date.now() + 20_000)
@@ -454,7 +454,7 @@ describe('QueueJournal', () => {
     };
 
     await expect(
-      first.commitOwnedStep(
+      first.commitRunBatch(
         {
           runId: 'run-stale',
           lane: 'run',
@@ -481,24 +481,6 @@ describe('QueueJournal', () => {
         generation: current.generation,
       })
     ).toBe(true);
-  });
-
-  it('keeps one execution lane on one stable queue partition', () => {
-    const first = queuePartition(
-      { runId: 'run-one', stepId: 'step-one', attempt: 1 },
-      64
-    );
-    const retry = queuePartition(
-      { runId: 'run-one', stepId: 'step-one', attempt: 2 },
-      64
-    );
-    const workflowLane = queuePartition({ runId: 'run-one' }, 64);
-
-    expect(retry).toBe(first);
-    expect(first).toBeGreaterThanOrEqual(0);
-    expect(first).toBeLessThan(64);
-    expect(workflowLane).toBeGreaterThanOrEqual(0);
-    expect(workflowLane).toBeLessThan(64);
   });
 
   it('uses the cached record tail after initial queue discovery', async () => {

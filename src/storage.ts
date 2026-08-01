@@ -20,7 +20,6 @@ import type {
   WorkflowRun,
 } from '@workflow/world';
 import {
-  isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
   stripEventDataRefs,
 } from '@workflow/world';
@@ -30,10 +29,7 @@ import {
   UrsulaClient,
   type UrsulaClientConfig,
 } from './client.js';
-import {
-  RunExecutionCoordinator,
-  type StagedStepStart,
-} from './execution.js';
+import { RunExecutionCoordinator } from './execution.js';
 import { HookClaims, isExpiredReservation } from './hook-claims.js';
 import { materializeEvent } from './reducer.js';
 import { RunRegistry } from './registry.js';
@@ -448,11 +444,7 @@ export function createStorage(
   ): Promise<EventResult | undefined> {
     const coordinator = executions;
     const delivery = coordinator?.current(runId);
-    if (
-      !coordinator?.allowsDeliveryTransactions() ||
-      !delivery ||
-      delivery.runId !== runId
-    ) {
+    if (!coordinator || !delivery || delivery.runId !== runId) {
       return;
     }
 
@@ -504,240 +496,6 @@ export function createStorage(
         runId,
         request,
         params
-      );
-    });
-  }
-
-  async function stageStepStart(
-    runId: string,
-    request: AnyEventRequest & { eventType: 'step_started' },
-    params: CreateEventParams | undefined,
-    callId: string
-  ): Promise<EventResult | undefined> {
-    const coordinator = executions;
-    const stepId = request.correlationId;
-    const ownerMessageId = request.eventData?.ownerMessageId;
-    const delivery = coordinator?.current(runId, ownerMessageId);
-    if (!coordinator || !delivery || !stepId) return;
-    const ownedLazyStart =
-      coordinator?.allowsOwnedLazyStarts() === true &&
-      request.eventData?.input !== undefined &&
-      ownerMessageId !== undefined;
-    const existing = coordinator.staged(runId, stepId);
-    if (existing) return existing.result;
-    const state = await journal.loadForMutation(runId);
-    const operationId = mutationOperationId(
-      state,
-      request,
-      callId,
-      params?.requestId
-    );
-    const eventId = `evnt_${ulid()}`;
-    const syntheticEventId = `evnt_${ulid()}`;
-    const now = new Date();
-    const materialized = materializeEvent(state, request, {
-      eventId,
-      syntheticEventId,
-      operationId,
-      now,
-      params,
-    });
-    if (!materialized.commit) return materialized.result;
-    if (materialized.result.stepCreated) {
-      // `stepCreated` is the runtime's exactly-once create-ownership signal:
-      // the ordinary path persists creation before running the body. An owned
-      // lazy start instead relies on the already-durable queue lease. Its
-      // terminal group transaction validates that lease while appending the
-      // complete create/start/terminal lifecycle. A crash leaves no partial
-      // event, and redelivery can safely materialize the same start again.
-      if (!ownedLazyStart) return;
-    }
-    const staged: StagedStepStart = {
-      request,
-      params,
-      callId,
-      eventId,
-      syntheticEventId,
-      now,
-      result: materialized.result,
-      ...(ownedLazyStart ? { delivery } : {}),
-    };
-    coordinator.stage(runId, stepId, staged);
-    return staged.result;
-  }
-
-  async function commitStagedStep(
-    runId: string,
-    request: AnyEventRequest,
-    params: CreateEventParams | undefined,
-    callId: string
-  ): Promise<EventResult | undefined> {
-    const coordinator = executions;
-    const stepId =
-      'correlationId' in request ? request.correlationId : undefined;
-    const staged = stepId ? coordinator?.staged(runId, stepId) : undefined;
-    if (!coordinator || !stepId || !staged) return;
-    const delivery = staged.delivery ?? coordinator.current(runId);
-    const terminalEventId = `evnt_${ulid()}`;
-    const terminalSyntheticEventId = `evnt_${ulid()}`;
-    const terminalNow = new Date();
-    return coordinator.exclusive(runId, async () => {
-      for (let attempt = 0; attempt < MAX_COMMIT_RETRIES; attempt += 1) {
-        const state = await journal.loadForMutation(runId);
-        const existingStep = state.steps.get(stepId);
-        if (existingStep && isTerminalStepStatus(existingStep.status)) {
-          coordinator.finish(runId, stepId);
-          return withEventPage(
-            { step: existingStep },
-            runId,
-            journal,
-            request,
-            params,
-            state.nextRecord
-          );
-        }
-        if (existingStep?.status === 'running') {
-          const current = materializeEvent(state, request, {
-            eventId: terminalEventId,
-            syntheticEventId: terminalSyntheticEventId,
-            operationId: mutationOperationId(
-              state,
-              request,
-              callId,
-              params?.requestId
-            ),
-            now: terminalNow,
-            params,
-          });
-          try {
-            if (current.commit) {
-              const committed = delivery
-                ? await coordinator.commitOwnedStep(
-                    runId,
-                    delivery,
-                    journal.prepareAppend(state, current.commit)
-                  )
-                : false;
-              if (!committed) await journal.append(state, current.commit);
-            }
-            coordinator.finish(runId, stepId);
-            return withEventPage(
-              current.result,
-              runId,
-              journal,
-              request,
-              params,
-              state.nextRecord
-            );
-          } catch (error) {
-            if (isUrsulaRequestError(error, 412)) {
-              journal.evict(runId);
-              if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
-              throw new PreconditionFailedError(
-                `Run "${runId}" changed while committing step "${stepId}": ${error.message}`
-              );
-            }
-            throw error;
-          }
-        }
-        const startOperationId = mutationOperationId(
-          state,
-          staged.request,
-          staged.callId,
-          staged.params?.requestId
-        );
-        const startParams = staged.params
-          ? { ...staged.params, stateUpdatedAt: undefined }
-          : undefined;
-        const started = materializeEvent(state, staged.request, {
-          eventId: staged.eventId,
-          syntheticEventId: staged.syntheticEventId,
-          operationId: startOperationId,
-          now: staged.now,
-          params: startParams,
-        });
-        if (!started.commit) {
-          coordinator.finish(runId, stepId);
-          const current = materializeEvent(state, request, {
-            eventId: terminalEventId,
-            syntheticEventId: terminalSyntheticEventId,
-            operationId: mutationOperationId(
-              state,
-              request,
-              callId,
-              params?.requestId
-            ),
-            now: terminalNow,
-            params,
-          });
-          if (current.commit) {
-            await journal.append(state, current.commit);
-          }
-          return withEventPage(
-            current.result,
-            runId,
-            journal,
-            request,
-            params,
-            state.nextRecord
-          );
-        }
-        const preview = journal.preview(state, started.commit);
-        const terminalOperationId = mutationOperationId(
-          preview,
-          request,
-          callId,
-          params?.requestId
-        );
-        const terminal = materializeEvent(preview, request, {
-          eventId: terminalEventId,
-          syntheticEventId: terminalSyntheticEventId,
-          operationId: terminalOperationId,
-          now: terminalNow,
-          params,
-        });
-        if (!terminal.commit) return terminal.result;
-        const owner =
-          delivery?.token ??
-          staged.request.eventData?.ownerMessageId ??
-          staged.callId;
-        const operationId = `run-step-transaction:${runId}:${owner}:${stepId}:${requestDigest(request)}`;
-        const commit = combineRunCommits(
-          operationId,
-          started.commit,
-          terminal.commit
-        );
-        try {
-          const committed = delivery
-            ? await coordinator.commitOwnedStep(
-                runId,
-                delivery,
-                journal.prepareAppend(state, commit)
-              )
-            : false;
-          if (!committed) await journal.append(state, commit);
-          coordinator.finish(runId, stepId);
-          return withEventPage(
-            terminal.result,
-            runId,
-            journal,
-            request,
-            params,
-            state.nextRecord
-          );
-        } catch (error) {
-          if (isUrsulaRequestError(error, 412)) {
-            journal.evict(runId);
-            if (attempt + 1 < MAX_COMMIT_RETRIES) continue;
-            throw new PreconditionFailedError(
-              `Run "${runId}" changed while committing step "${stepId}": ${error.message}`
-            );
-          }
-          throw error;
-        }
-      }
-      throw new WorkflowWorldError(
-        `Step "${stepId}" remained contended after ${MAX_COMMIT_RETRIES} attempts`
       );
     });
   }
@@ -833,27 +591,6 @@ export function createStorage(
           callId
         );
         if (deliveryResult) return deliveryResult;
-        if (data.eventType === 'step_started') {
-          const staged = await stageStepStart(
-            effectiveRunId,
-            data,
-            params,
-            callId
-          );
-          if (staged) return staged;
-        } else if (
-          data.eventType === 'step_completed' ||
-          data.eventType === 'step_failed' ||
-          data.eventType === 'step_retrying'
-        ) {
-          const committed = await commitStagedStep(
-            effectiveRunId,
-            data,
-            params,
-            callId
-          );
-          if (committed) return committed;
-        }
         const lazyRunStart =
           data.eventType === 'run_started' &&
           data.eventData?.deploymentId !== undefined &&

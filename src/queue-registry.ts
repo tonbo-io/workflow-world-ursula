@@ -1,25 +1,23 @@
 import type { ValidQueueName } from '@workflow/world';
 import { ValidQueueName as ValidQueueNameSchema } from '@workflow/world';
-import { type UrsulaClient, UrsulaRequestError } from './client.js';
+import type { UrsulaClient } from './client.js';
 
 const QUEUE_REGISTRY_STREAM = 'registry-queues';
 
 interface QueueRegistration {
-  version: 1 | 2 | 3;
+  version: 3;
   queueName: ValidQueueName;
-  partition?: number;
-  runId?: string;
+  partition: number;
+  runId: string;
 }
 
 export interface QueueTarget {
   queueName: ValidQueueName;
   partition: number;
-  runId?: string;
+  runId: string;
 }
 
 export class QueueRegistry {
-  private readonly queueNames = new Set<ValidQueueName>();
-  private readonly partitionsByQueue = new Map<ValidQueueName, Set<number>>();
   private readonly targetsByKey = new Map<string, QueueTarget>();
   private nextRecord = 0;
 
@@ -39,56 +37,27 @@ export class QueueRegistry {
         );
       }
       const queueName = ValidQueueNameSchema.parse(value.queueName);
-      this.queueNames.add(queueName);
       if (
-        value.version === 2 &&
-        Number.isSafeInteger(value.partition) &&
-        (value.partition ?? -1) >= 0
+        value.version !== 3 ||
+        !Number.isSafeInteger(value.partition) ||
+        value.partition < 0 ||
+        typeof value.runId !== 'string' ||
+        value.runId.length === 0
       ) {
-        let partitions = this.partitionsByQueue.get(queueName);
-        if (!partitions) {
-          partitions = new Set();
-          this.partitionsByQueue.set(queueName, partitions);
-        }
-        partitions.add(value.partition as number);
+        throw new Error('Invalid Ursula run-queue registry record');
       }
-      if (
-        value.version === 3 &&
-        typeof value.runId === 'string' &&
-        value.runId.length > 0
-      ) {
-        const target = {
-          queueName,
-          partition: value.partition ?? 0,
-          runId: value.runId,
-        } satisfies QueueTarget;
-        this.targetsByKey.set(this.targetKey(target), target);
-      }
+      const target = {
+        queueName,
+        partition: value.partition,
+        runId: value.runId,
+      } satisfies QueueTarget;
+      this.targetsByKey.set(this.targetKey(target), target);
       this.nextRecord = record + 1;
     }
   }
 
   private targetKey(target: QueueTarget): string {
-    return `${target.queueName}\u0000${target.runId ?? ''}\u0000${target.partition}`;
-  }
-
-  async register(queueName: ValidQueueName, partition: number): Promise<void> {
-    if (this.partitionsByQueue.get(queueName)?.has(partition)) return;
-    await this.client.append(
-      QUEUE_REGISTRY_STREAM,
-      { version: 2, queueName, partition } satisfies QueueRegistration,
-      {
-        operationId: `register-queue:${queueName}:partition:${partition}`,
-        createIfMissing: true,
-      }
-    );
-    this.queueNames.add(queueName);
-    let partitions = this.partitionsByQueue.get(queueName);
-    if (!partitions) {
-      partitions = new Set();
-      this.partitionsByQueue.set(queueName, partitions);
-    }
-    partitions.add(partition);
+    return `${target.queueName}\u0000${target.runId}\u0000${target.partition}`;
   }
 
   async registerRun(queueName: ValidQueueName, runId: string): Promise<void> {
@@ -103,50 +72,13 @@ export class QueueRegistry {
         createIfMissing: true,
       }
     );
-    this.queueNames.add(queueName);
     this.targetsByKey.set(key, target);
-  }
-
-  current(): ValidQueueName[] {
-    return [...this.queueNames];
-  }
-
-  partitions(queueName: ValidQueueName): number[] {
-    return [...(this.partitionsByQueue.get(queueName) ?? [])].sort(
-      (left, right) => left - right
-    );
   }
 
   targets(): QueueTarget[] {
     return [...this.targetsByKey.values()];
   }
 
-  async list(): Promise<ValidQueueName[]> {
-    // The dispatcher may start before the first producer has created the
-    // bucket. Creating the registry stream here makes startup deterministic
-    // instead of letting an initial BucketNotFound terminate the poll loop.
-    await this.client.ensureJsonStream(QUEUE_REGISTRY_STREAM);
-    try {
-      let cursor = this.nextRecord;
-      while (true) {
-        const page = await this.client.read<QueueRegistration>(
-          QUEUE_REGISTRY_STREAM,
-          cursor
-        );
-        this.applyRecords(page.records);
-        if (page.records.length < 1000) return [...this.queueNames];
-        if (this.nextRecord <= cursor) {
-          throw new Error('Ursula queue registry pagination made no progress');
-        }
-        cursor = this.nextRecord;
-      }
-    } catch (error) {
-      if (error instanceof UrsulaRequestError && error.status === 404) {
-        return [];
-      }
-      throw error;
-    }
-  }
 
   async waitForChange(
     timeoutMs: number,
