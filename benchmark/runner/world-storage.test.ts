@@ -154,7 +154,6 @@ async function createBenchmarkWorld(): Promise<{
       token: process.env.WORKFLOW_URSULA_TOKEN,
       deploymentId: 'world-storage-benchmark',
       // Preserve the public two-call contract for a fair comparison.
-      experimentalOwnedStepTransactions: false,
     }),
   };
 }

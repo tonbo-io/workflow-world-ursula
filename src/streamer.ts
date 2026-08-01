@@ -5,6 +5,10 @@ import type {
   Streamer,
   StreamInfoResponse,
 } from '@workflow/world';
+import {
+  DEFAULT_RUN_AFFINITY_LANES,
+  runAffinity,
+} from './affinity.js';
 
 const DEFAULT_BUCKET = 'workflow';
 const DEFAULT_PAGE_SIZE = 100;
@@ -59,14 +63,8 @@ export interface UrsulaStreamerConfig {
   streamFlushIntervalMs?: number;
   /** Fetch implementation override for tests or custom transports. */
   fetch?: typeof globalThis.fetch;
-  /**
-   * Co-locates streams owned by one run and atomically commits a stream's
-   * first chunks together with its discovery registration.
-   *
-   * Requires Ursula's `path-affinity-v1` and
-   * `group-append-transaction-v1` extensions.
-   */
-  experimentalGroupTransactions?: boolean;
+  /** Number of bounded affinity lanes shared by run-owned streams. */
+  affinityLanes?: number;
 }
 
 export class UrsulaStreamError extends Error {
@@ -200,7 +198,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
   const baseUrl = config.baseUrl.replace(/\/+$/, '');
   const longPollTimeoutMs =
     config.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
-  const groupTransactions = config.experimentalGroupTransactions === true;
+  const affinityLanes = config.affinityLanes ?? DEFAULT_RUN_AFFINITY_LANES;
   const producerByStream = new Map<string, Producer>();
   const registeredStreams = new Set<string>();
   const registryOperations = new Map<string, Promise<void>>();
@@ -231,27 +229,23 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
       .slice(0, 32);
   }
 
-  function streamId(runId: string, name: string): string {
-    if (groupTransactions) {
-      return name === '__workflow_streams'
-        ? 'stream-registry'
-        : `stream-${nameHash(name)}`;
-    }
-    return `${runId}-${nameHash(name)}`;
+  function streamId(name: string): string {
+    return name === '__workflow_streams'
+      ? 'stream-registry'
+      : `stream-${nameHash(name)}`;
   }
 
   function streamUrl(runId: string, name: string): URL {
-    const affinity = groupTransactions
-      ? `/${encodePathSegment(runId)}`
-      : '';
+    const affinity = runAffinity(runId, affinityLanes);
     return new URL(
-      `${baseUrl}/${encodePathSegment(bucket)}${affinity}/${encodePathSegment(streamId(runId, name))}`
+      `${baseUrl}/${encodePathSegment(bucket)}/${encodePathSegment(affinity)}/${encodePathSegment(streamId(name))}`
     );
   }
 
   function transactionUrl(runId: string): URL {
+    const affinity = runAffinity(runId, affinityLanes);
     return new URL(
-      `${baseUrl}/${encodePathSegment(bucket)}/${encodePathSegment(runId)}/$transaction`
+      `${baseUrl}/${encodePathSegment(bucket)}/${encodePathSegment(affinity)}/$transaction`
     );
   }
 
@@ -384,7 +378,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         body: JSON.stringify({
           operations: [
             {
-              stream: streamId(runId, name),
+              stream: streamId(name),
               content_type: RECORD_CONTENT_TYPE,
               payload_base64: Buffer.from(body).toString('base64'),
               producer: {
@@ -394,7 +388,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
               },
             },
             {
-              stream: streamId(runId, '__workflow_streams'),
+              stream: streamId('__workflow_streams'),
               content_type: RECORD_CONTENT_TYPE,
               payload_base64: Buffer.from(JSON.stringify({ name })).toString(
                 'base64'
@@ -469,7 +463,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     await serializeStream(url, async (producer) => {
       const cacheKey = `${runId}\0${name}`;
       const body = JSON.stringify(records.length === 1 ? records[0] : records);
-      if (groupTransactions && !registeredStreams.has(cacheKey)) {
+      if (!registeredStreams.has(cacheKey)) {
         await appendFirstChunksAndRegister(runId, name, body, producer);
         return;
       }

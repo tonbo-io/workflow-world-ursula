@@ -149,19 +149,6 @@ export function queueConcurrencyKey(message: QueuePayload): string {
     : `run:${message.runId}:workflow`;
 }
 
-export function queuePartition(
-  message: QueuePayload,
-  partitionCount: number
-): number {
-  if (!Number.isSafeInteger(partitionCount) || partitionCount < 1) {
-    throw new Error('Ursula queue partitionCount must be a positive integer');
-  }
-  const digest = createHash('sha256')
-    .update(queueConcurrencyKey(message))
-    .digest();
-  return digest.readUInt32BE(0) % partitionCount;
-}
-
 function pruneIdempotency(state: QueueState, now: Date): void {
   for (const [key, entry] of state.idempotency) {
     if (entry.expiresAt.getTime() <= now.getTime()) {
@@ -854,7 +841,7 @@ export class QueueJournal {
    * The lease extension and run append share one Ursula group transaction,
    * so a redelivery and an old handler cannot both cross the commit boundary.
    */
-  async commitOwnedStep(
+  async commitRunBatch(
     delivery: DeliveryExecution,
     runAppend: PreparedRunAppend,
     expiresAt: Date

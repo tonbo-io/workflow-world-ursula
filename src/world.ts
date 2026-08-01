@@ -10,30 +10,7 @@ import { createStreamer, type UrsulaStreamerConfig } from './streamer.js';
 
 export interface UrsulaWorldConfig
   extends UrsulaStreamerConfig,
-    UrsulaQueueConfig {
-  /**
-   * Optimizes owned lazy steps behind a durable run-journal execution fence.
-   * Keep disabled until the workload-specific latency and throughput gate passes.
-   */
-  experimentalOwnedStepTransactions?: boolean;
-  /**
-   * Stages all compatible run mutations produced by one queue delivery and
-   * commits them with that delivery's ACK or retry transition.
-   */
-  experimentalDeliveryTransactions?: boolean;
-  /**
-   * Writes successful owned-step transactions in the compact journal format.
-   *
-   * Reader support is unconditional. Enable writing only after every process
-   * in a rolling deployment runs a version that understands the format.
-   */
-  experimentalCompactCompletedStepCommits?: boolean;
-  /**
-   * Uses Ursula path affinity and group-local append transactions for
-   * run-owned stream data and discovery metadata.
-   */
-  experimentalGroupTransactions?: boolean;
-}
+    UrsulaQueueConfig {}
 
 function positiveInteger(
   value: string | undefined,
@@ -132,15 +109,6 @@ function environmentConfig(): UrsulaWorldConfig {
       process.env.WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS,
       'WORKFLOW_URSULA_QUEUE_SHUTDOWN_GRACE_MS'
     ),
-    experimentalOwnedStepTransactions:
-      process.env.WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS === '1',
-    experimentalDeliveryTransactions:
-      process.env.WORKFLOW_URSULA_EXPERIMENTAL_DELIVERY_TRANSACTIONS === '1',
-    experimentalCompactCompletedStepCommits:
-      process.env
-        .WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS === '1',
-    experimentalGroupTransactions:
-      process.env.WORKFLOW_URSULA_EXPERIMENTAL_GROUP_TRANSACTIONS === '1',
   };
 }
 
@@ -170,36 +138,14 @@ export function withUrsulaStreams(
 export function createWorld(
   config: UrsulaWorldConfig = environmentConfig()
 ): World {
-  if (
-    (config.experimentalOwnedStepTransactions ||
-      config.experimentalDeliveryTransactions) &&
-    !config.experimentalGroupTransactions
-  ) {
-    throw new Error(
-      'Ursula delivery transactions require experimentalGroupTransactions'
-    );
-  }
   const client = new UrsulaClient(config);
   const journal = new RunJournal(client, {
-    compactCompletedStepCommits:
-      config.experimentalCompactCompletedStepCommits,
-    pathAffinity: config.experimentalGroupTransactions,
     pathAffinityLanes:
       config.partitionCount ?? DEFAULT_RUN_AFFINITY_LANES,
   });
-  const executions = new RunExecutionCoordinator({
-    allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
-    allowDeliveryTransactions: config.experimentalDeliveryTransactions,
-  });
+  const executions = new RunExecutionCoordinator();
   const { storage } = createStorage(client, { journal, executions });
-  const queue = createQueue(
-    client,
-    {
-      ...config,
-      runLocalQueues: config.experimentalGroupTransactions,
-    },
-    executions
-  );
+  const queue = createQueue(client, config, executions);
   return {
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {
@@ -208,7 +154,10 @@ export function createWorld(
     },
     processExitTriggersQueueRedelivery: false,
     ...storage,
-    ...createStreamer(config),
+    ...createStreamer({
+      ...config,
+      affinityLanes: config.partitionCount ?? DEFAULT_RUN_AFFINITY_LANES,
+    }),
     queue: queue.queue,
     createQueueHandler: queue.createQueueHandler,
     getDeploymentId: queue.getDeploymentId,

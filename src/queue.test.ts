@@ -8,7 +8,7 @@ import type {
 import { runAffinity } from './affinity.js';
 import type { RunExecutionCoordinator } from './execution.js';
 import { createQueue } from './queue.js';
-import { QueueJournal, queuePartition } from './queue-journal.js';
+import { QueueJournal } from './queue-journal.js';
 
 class MemoryClient {
   readonly waitedStreams: string[] = [];
@@ -153,7 +153,6 @@ describe('Ursula queue runtime', () => {
     const memory = new MemoryClient();
     const queueName = '__wkf_workflow_run_local' as ValidQueueName;
     const queue = createQueue(memory as unknown as UrsulaClient, {
-      runLocalQueues: true,
       pollIntervalMs: 5,
     });
     const delivered = vi.fn().mockResolvedValue(undefined);
@@ -196,6 +195,8 @@ describe('Ursula queue runtime', () => {
       ): Promise<unknown> => task()
     );
     const executions = {
+      setRunCommitter: vi.fn(),
+      setDeliveryCommitter: vi.fn(),
       run,
     } as unknown as RunExecutionCoordinator;
     const queueName =
@@ -224,55 +225,14 @@ describe('Ursula queue runtime', () => {
     });
   });
 
-  it('rejects an expired fenced HTTP delivery before invoking its handler', async () => {
-    const client = new MemoryClient() as unknown as UrsulaClient;
-    const run = vi.fn();
-    const executions = {
-      allowsOwnedLazyStarts: () => true,
-      run,
-    } as unknown as RunExecutionCoordinator;
-    const queueName = '__wkf_workflow_stale_http' as ValidQueueName;
-    const journal = new QueueJournal(client);
-    await journal.enqueue(queueName, { runId: 'wrun_stale_http' });
-    const lease = await journal.claim(queueName, new Date(), -1);
-    if (!lease) throw new Error('expected expired queue lease');
-    const handler = createQueue(client, {}, executions).createQueueHandler(
-      '__wkf_workflow_',
-      async () => undefined
-    );
-
-    const response = await handler(
-      new Request('http://workflow.test/flow', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-vqs-queue-name': queueName,
-          'x-vqs-message-id': lease.message.messageId,
-          'x-vqs-message-attempt': String(lease.message.attempt),
-          'x-ursula-run-id': 'wrun_stale_http',
-          'x-ursula-execution-lane': 'run',
-          'x-ursula-execution-partition': String(lease.partition),
-          'x-ursula-execution-token': lease.leaseId,
-          'x-ursula-execution-generation': String(lease.generation),
-          'x-ursula-execution-expires-at':
-            lease.message.leaseExpiresAt?.toISOString() ?? '',
-        },
-        body: JSON.stringify(lease.message.message),
-      })
-    );
-
-    expect(response.status).toBe(409);
-    expect(run).not.toHaveBeenCalled();
-  });
-
   it('defers full-delivery fencing to the atomic terminal commit', async () => {
     const client = new MemoryClient() as unknown as UrsulaClient;
     const run = vi.fn(
       async (_delivery: unknown, task: () => Promise<unknown>) => task()
     );
     const executions = {
-      allowsOwnedLazyStarts: () => false,
-      allowsDeliveryTransactions: () => true,
+      setRunCommitter: vi.fn(),
+      setDeliveryCommitter: vi.fn(),
       finishDelivery: async () => false,
       run,
     } as unknown as RunExecutionCoordinator;
@@ -415,7 +375,6 @@ describe('Ursula queue runtime', () => {
     const queueName =
       '__wkf_workflow_static_dispatcher_shard' as ValidQueueName;
     const runId = 'run-static-dispatcher-shard';
-    const partition = queuePartition({ runId }, 8);
     const handlers = [vi.fn(), vi.fn()];
     const dispatchers = handlers.map((handler, partitionShardIndex) => {
       const queue = createQueue(client, {
@@ -436,14 +395,18 @@ describe('Ursula queue runtime', () => {
 
     await Promise.all(dispatchers.map((dispatcher) => dispatcher.start()));
     await vi.waitFor(() => {
-      expect(handlers[partition % 2]).toHaveBeenCalledOnce();
+      expect(
+        handlers.reduce(
+          (sum, handler) => sum + handler.mock.calls.length,
+          0
+        )
+      ).toBe(1);
     });
     await Promise.all([
       producer.close(),
       ...dispatchers.map((dispatcher) => dispatcher.close()),
     ]);
 
-    expect(handlers[(partition + 1) % 2]).not.toHaveBeenCalled();
   });
 
   it('wakes immediately when this process enqueues work', async () => {
@@ -576,6 +539,7 @@ describe('Ursula queue runtime', () => {
     const queue = createQueue(client, {
       pollIntervalMs: 10_000,
       concurrency: 1,
+      partitionCount: 1,
     });
     const delivered: string[] = [];
     queue.createQueueHandler('__wkf_workflow_', async (message) => {

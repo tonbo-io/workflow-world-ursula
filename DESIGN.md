@@ -90,53 +90,17 @@ though the leader already acknowledged the source commit. The adapter retries
 `InvalidRecordBoundaries` on the same cursor during that bounded catch-up
 window; it never treats a follower's lower local tail as authoritative state.
 
-## Atomic step transactions
+## Atomic delivery transactions
 
-Workflow's public World contract exposes `step_started` and the terminal
-`step_completed`, `step_failed`, or `step_retrying` mutation as separate
-awaited calls. Persisting both literally costs two Raft commits per logical
-step even when one queue delivery owns the entire inline execution.
+Every run journal, queue journal, and chunk stream is routed through one of a fixed number of deterministic affinity lanes. A run's authoritative journal and its queue share the same lane, so Ursula can commit their mutations in one group-local transaction without introducing cross-group coordination. The bounded lane set also bounds dispatcher changefeed watchers independently of historical run count.
 
-With both `WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS=1` and `WORKFLOW_URSULA_EXPERIMENTAL_GROUP_TRANSACTIONS=1`, the durable queue lease is the execution fence. The adapter does not copy that fence into a second run-journal record before entering the handler. The delivery headers carry the queue source, token, owner message ID, attempt, and monotonically increasing lease generation into the application process. A process-global registry keyed by run and owner message bridges framework server bundles without becoming durable state.
+Compatible run mutations produced by one queue handler are reduced against a delivery-local preview instead of being appended individually. Reads performed by that handler observe the preview. Enqueuing a continuation flushes the preceding run batch before making the continuation visible; hook claim side effects also force a flush because their authority lives outside the run journal. At handler return, the remaining run batch and the queue `acked` or `retry_scheduled` transition are committed atomically.
 
-Inside that claimed handler, `step_started` is materialized speculatively but
-not appended. The terminal mutation replays the staged start against the
-current run state and appends one record containing:
+The delivery-local preview is never durable state. A process crash discards it, so redelivery recomputes the same transition from the last committed journal. The queue lease token and generation fence the transaction: a superseded handler cannot append run state, while a successful response cannot expose a run commit without its matching queue outcome. Run and queue CAS preconditions remain the correctness boundary across leader changes and competing writers.
 
-- `step_created` when the start was lazy;
-- `step_started`;
-- the terminal step event;
-- the final Step entity; and
-- background-lane lease release.
+Run records use one explicit v1 object schema. The adapter does not maintain a compact alternate encoding: reducing wire bytes is not worth a second authoritative schema and its mixed-version rules.
 
-The default record remains the explicit v1 object. With
-`WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS=1`, an exact
-owned `step_created` + `step_started` + `step_completed` transaction is written
-as a compact v2 tuple. The stream identity supplies `runId`, the record
-coordinate supplies `previousRecord`, and the tuple stores shared IDs, time,
-names, input, output, and telemetry once. Readers reconstruct the identical
-three World events and completed Step before applying the commit. Any extra
-field, retry/failure shape, mismatched entity, or schema extension falls back
-to v1 rather than being encoded lossily.
-
-Compact readers are unconditional, but compact writers are opt-in. A rolling
-deployment MUST first install reader support on every process with the option
-disabled, then enable writers in a second rollout. This is the same
-mixed-version rule as checkpoint schema evolution: an old reader must never
-observe a record it cannot decode.
-
-The terminal commit is a group-local Ursula transaction containing the complete run step and a queue `lease_extended` transition. Both operations carry their observed record tails. If a redelivery has installed a newer lease, its queue append changes the tail and the stale handler's transaction fails atomically; if the old handler wins first, its lease extension prevents the redelivery from claiming that message. No speculative step event is visible when a handler dies before this boundary. External run events cause the run precondition to fail and the reducer rebases before retrying.
-
-For a queue invocation that executes `N` staged steps, the opt-in write cost is `N` group-local Raft commits instead of one execution-fence commit plus `N` step commits or the literal `2N` step commits. Each successful commit advances both the run and queue journals but crosses one HTTP and consensus boundary. Transports without a queue delivery lease and deployments with the option disabled fall back to the literal two-append contract.
-
-With `WORKFLOW_URSULA_EXPERIMENTAL_DELIVERY_TRANSACTIONS=1`, compatible run mutations produced by one queue handler are reduced against a delivery-local preview instead of being appended individually. Reads performed by that handler observe the preview. Enqueuing a continuation flushes the preceding run batch before making the continuation visible; hook claim side effects also force a flush because their authority lives outside the run journal. At handler return, the remaining run batch and the queue `acked` or `retry_scheduled` transition are one group-local Ursula transaction.
-
-The delivery-local preview is never durable state. A process crash discards it, so redelivery recomputes the same transition from the last committed journal. The final queue lease token and generation fence the transaction: a superseded handler cannot append run state, while a successful response cannot expose a run commit without its matching queue outcome. The run and queue CAS preconditions remain the correctness boundary across leader changes and competing writers.
-
-The queue journal still owns ready-message discovery, delivery attempts,
-delays, and acknowledgement. A later phase can move continuation readiness
-into the run transaction and make the queue a rebuildable projection, but that
-requires a bucket changefeed or equivalent durable projection repair path.
+The queue journal still owns ready-message discovery, delivery attempts, delays, and acknowledgement. A later phase can move continuation readiness into the run transaction and make the queue a rebuildable projection, but that requires a bucket changefeed or equivalent durable projection repair path.
 
 ## Global indexes
 

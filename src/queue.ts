@@ -23,7 +23,6 @@ import {
 } from './execution.js';
 import {
   QueueJournal,
-  queuePartition,
   type QueueLease,
 } from './queue-journal.js';
 import { QueueRegistry } from './queue-registry.js';
@@ -44,8 +43,6 @@ interface InvocationResult {
 }
 
 export interface UrsulaQueueConfig {
-  /** Store every run's queue in the same Ursula affinity group as its journal. */
-  runLocalQueues?: boolean;
   deploymentId?: string;
   /**
    * Whether this process claims and delivers queue messages.
@@ -156,7 +153,6 @@ export function createQueue(
     1,
     'Ursula queue partitionShardReplicas'
   );
-  const runLocalQueues = config.runLocalQueues === true;
   if (
     !Number.isSafeInteger(partitionShardIndex) ||
     partitionShardIndex < 0 ||
@@ -171,10 +167,6 @@ export function createQueue(
       'Ursula queue partitionShardReplicas cannot exceed partitionShardCount'
     );
   }
-  const journals = Array.from(
-    { length: partitionCount },
-    (_, partition) => new QueueJournal(client, partition)
-  );
   const runJournals = new Map<string, QueueJournal>();
   const registry = new QueueRegistry(client);
   const handlers = new Map<QueuePrefix, QueueHandler>();
@@ -230,15 +222,6 @@ export function createQueue(
     return Boolean(deliveryBaseUrl() || handlerFor(queueName));
   }
 
-  function ownsPartition(partition: number): boolean {
-    const firstOwner = partition % partitionShardCount;
-    return (
-      (partitionShardIndex - firstOwner + partitionShardCount) %
-        partitionShardCount <
-      partitionShardReplicas
-    );
-  }
-
   function affinityForMessage(message: Parameters<Queue['queue']>[1]): string {
     if ('__healthCheck' in message) {
       return runAffinity(
@@ -271,9 +254,8 @@ export function createQueue(
   function journalForTarget(
     queueName: ValidQueueName,
     partition: number,
-    runId?: string
+    runId: string
   ): QueueJournal | undefined {
-    if (!runId) return journals[partition];
     const key = targetKey(queueName, partition, runId);
     let journal = runJournals.get(key);
     if (!journal) {
@@ -295,7 +277,7 @@ export function createQueue(
     const journal = journalForTarget(
       lease.message.queueName,
       lease.partition,
-      lease.affinity
+      lease.affinity ?? affinityForMessage(lease.message.message)
     );
     if (!journal) {
       throw new Error(`Invalid Ursula queue partition ${lease.partition}`);
@@ -344,7 +326,7 @@ export function createQueue(
   function ensureQueueWatcher(
     queueName: ValidQueueName,
     partition: number,
-    runId?: string
+    runId: string
   ): void {
     const key = partitionKey(queueName, partition, runId);
     if (queueWatchers.has(key)) return;
@@ -582,30 +564,20 @@ export function createQueue(
   interface DispatchTarget {
     queueName: ValidQueueName;
     partition: number;
-    runId?: string;
+    runId: string;
     journal: QueueJournal;
   }
 
   function dispatchTargets(): DispatchTarget[] {
-    if (runLocalQueues) {
-      return registry
-        .targets()
-        .filter(({ queueName, runId }) => canDeliver(queueName) && Boolean(runId))
-        .filter(({ runId }) => runId !== undefined && ownsRun(runId))
-        .flatMap(({ queueName, partition, runId }) => {
-          const journal = journalForTarget(queueName, partition, runId);
-          return journal ? [{ queueName, partition, runId, journal }] : [];
-        });
-    }
-    return registry.current().filter(canDeliver).flatMap((queueName) =>
-      registry
-        .partitions(queueName)
-        .filter(ownsPartition)
-        .flatMap((partition) => {
-          const journal = journalForTarget(queueName, partition);
-          return journal ? [{ queueName, partition, journal }] : [];
-        })
-    );
+    return registry
+      .targets()
+      .filter(({ queueName, runId }) => canDeliver(queueName) && Boolean(runId))
+      .filter(({ runId }) => runId !== undefined && ownsRun(runId))
+      .flatMap(({ queueName, partition, runId }) => {
+        if (runId === undefined) return [];
+        const journal = journalForTarget(queueName, partition, runId);
+        return journal ? [{ queueName, partition, runId, journal }] : [];
+      });
   }
 
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: queue discovery, capacity and per-run ownership checks belong in one dispatcher pass.
@@ -648,14 +620,6 @@ export function createQueue(
         }
         const logicalIndex = targets.indexOf(item);
         let nextIndex = (logicalIndex + 1) % targets.length;
-        if (!runLocalQueues) {
-          while (
-            nextIndex !== logicalIndex &&
-            targets[nextIndex]?.queueName === queueName
-          ) {
-            nextIndex = (nextIndex + 1) % targets.length;
-          }
-        }
         queueCursor = nextIndex;
         const task = deliverChain(queueName, lease, handler)
           .catch(() => {
@@ -730,8 +694,8 @@ export function createQueue(
       // lease extension keeps this delivery authoritative until its final ACK.
       await executions?.flushRunTransaction?.(message.runId);
     }
-    const runId = runLocalQueues ? affinityForMessage(message) : undefined;
-    const partition = runLocalQueues ? 0 : queuePartition(message, partitionCount);
+    const runId = affinityForMessage(message);
+    const partition = 0;
     const journal = journalForTarget(queueName, partition, runId);
     if (!journal) {
       throw new Error(`Invalid Ursula queue partition ${partition}`);
@@ -742,9 +706,7 @@ export function createQueue(
     // for both, preserving crash-safe discovery before it acknowledges work.
     const [messageId] = await Promise.all([
       journal.enqueue(queueName, message, options),
-      runId
-        ? registry.registerRun(queueName, runId)
-        : registry.register(queueName, partition),
+      registry.registerRun(queueName, runId),
     ]);
     markReady(queueName, partition, runId);
     wake();
@@ -824,28 +786,6 @@ export function createQueue(
                 expiresAt,
               }
             : undefined;
-        if (execution && executions?.allowsOwnedLazyStarts()) {
-          const journal = journalForTarget(
-            queueName.data,
-            execution.queuePartition,
-            runLocalQueues
-              ? runAffinity(execution.runId, partitionCount)
-              : undefined
-          );
-          const ownsLease =
-            journal &&
-            (await journal.ownsLease(queueName.data, {
-              messageId: messageId.data,
-              leaseId: execution.token,
-              generation: execution.generation,
-            }));
-          if (!ownsLease) {
-            return Response.json(
-              { error: 'Ursula queue delivery lease is no longer active' },
-              { status: 409 }
-            );
-          }
-        }
         const completed =
           executions && execution
             ? await executions.run(execution, async () => {
@@ -868,8 +808,8 @@ export function createQueue(
     };
   };
 
-  if (runLocalQueues && executions) {
-    executions.setOwnedStepCommitter(async (delivery, append) => {
+  if (executions) {
+    executions.setRunCommitter(async (delivery, append) => {
       const journal = journalForTarget(
         delivery.queueName as ValidQueueName,
         delivery.queuePartition,
@@ -880,7 +820,7 @@ export function createQueue(
           `Invalid Ursula queue partition ${delivery.queuePartition}`
         );
       }
-      await journal.commitOwnedStep(
+      await journal.commitRunBatch(
         delivery,
         append,
         new Date(Date.now() + leaseDurationMs)
