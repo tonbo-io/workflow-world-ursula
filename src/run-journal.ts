@@ -648,29 +648,40 @@ export class RunJournal {
     // their latest checkpoint; the bounded prefix is discarded once Ursula
     // reports that more source records remain.
     const prefix = emptyState(runId);
-    try {
-      const page = await this.clientFor(runId).read<unknown>(
-        stream,
-        0,
-        CHECKPOINT_INTERVAL_RECORDS
-      );
-      if (
-        page.upToDate &&
-        page.records.length < CHECKPOINT_INTERVAL_RECORDS
-      ) {
-        this.applyRecords(prefix, page.records);
-        if (useCache) this.rememberState(runId, prefix);
-        return useCache ? cloneState(prefix) : prefix;
+    for (
+      let catchUpAttempt = 0;
+      catchUpAttempt <= FOLLOWER_CATCH_UP_RETRIES;
+      catchUpAttempt += 1
+    ) {
+      try {
+        const page = await this.clientFor(runId).read<unknown>(
+          stream,
+          0,
+          CHECKPOINT_INTERVAL_RECORDS
+        );
+        if (
+          page.upToDate &&
+          page.records.length < CHECKPOINT_INTERVAL_RECORDS
+        ) {
+          this.applyRecords(prefix, page.records);
+          if (useCache) this.rememberState(runId, prefix);
+          return useCache ? cloneState(prefix) : prefix;
+        }
+        break;
+      } catch (error) {
+        if (options.createIfMissing && isUrsulaRequestError(error, 404)) {
+          if (useCache) this.rememberState(runId, prefix);
+          return useCache ? cloneState(prefix) : prefix;
+        }
+        if (
+          isUrsulaRequestError(error, 404) &&
+          catchUpAttempt < FOLLOWER_CATCH_UP_RETRIES
+        ) {
+          await waitForFollowerCatchUp(catchUpAttempt);
+          continue;
+        }
+        throw error;
       }
-    } catch (error) {
-      if (
-        options.createIfMissing &&
-        isUrsulaRequestError(error, 404)
-      ) {
-        if (useCache) this.rememberState(runId, prefix);
-        return useCache ? cloneState(prefix) : prefix;
-      }
-      throw error;
     }
 
     const state = await this.loadCheckpoint(runId);

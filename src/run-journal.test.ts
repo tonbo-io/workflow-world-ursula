@@ -15,6 +15,7 @@ function response(body: BodyInit | null, init: ResponseInit = {}): Response {
 class MemoryClient {
   checkpointGate?: Promise<void>;
   failNextReadAt?: number;
+  missingReads = 0;
   failedReads = 0;
   readonly readAllStarts: Array<{ stream: string; start: number }> = [];
   readonly reads: Array<{ stream: string; start: number; limit: number }> = [];
@@ -123,6 +124,14 @@ class MemoryClient {
     upToDate: boolean;
   }> {
     this.reads.push({ stream, start, limit });
+    if (this.missingReads > 0) {
+      this.missingReads -= 1;
+      throw new UrsulaRequestError(
+        'read records',
+        response('StreamNotFound', { status: 404 }),
+        'StreamNotFound'
+      );
+    }
     const values = this.streams.get(stream) ?? [];
     if (this.failNextReadAt === start) {
       this.failNextReadAt = undefined;
@@ -512,6 +521,26 @@ describe('RunJournal', () => {
 
     releaseCheckpoint();
     await journal.flushCheckpoints();
+  });
+
+  it('retries a cold 404 while a follower learns a committed run stream', async () => {
+    const client = new MemoryClient();
+    const journal = new RunJournal(client as unknown as UrsulaClient);
+    const state = await journal.loadForMutation('wrun_cold_follower', {
+      assumeEmpty: true,
+      createIfMissing: true,
+    });
+    await journal.append(state, {
+      operationId: 'cold-follower-1',
+      events: [],
+    });
+    journal.evict('wrun_cold_follower');
+    client.missingReads = 1;
+
+    await expect(journal.load('wrun_cold_follower')).resolves.toMatchObject({
+      nextRecord: 1,
+    });
+    expect(client.missingReads).toBe(0);
   });
 
   it('retries an incremental read while a follower applies an acknowledged commit', async () => {
