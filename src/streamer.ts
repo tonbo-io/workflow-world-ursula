@@ -267,19 +267,31 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
     throw new UrsulaStreamError(operation, response, await response.text());
   }
 
+  async function streamExistsAfterConflict(
+    url: URL,
+    response: Response
+  ): Promise<boolean> {
+    if (response.status !== 409) return false;
+    const existing = await fetchImpl(url, {
+      method: 'HEAD',
+      headers: headers(),
+    });
+    return existing.ok;
+  }
+
   async function ensureStream(url: URL): Promise<void> {
     const key = url.toString();
     if (ensuredStreams.has(key)) return;
     const pending = ensuringStreams.get(key);
     if (pending) return pending;
     const ensuring = (async () => {
-      await expectSuccess(
-        'create stream',
-        await fetchImpl(url, {
-          method: 'PUT',
-          headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
-        })
-      );
+      const created = await fetchImpl(url, {
+        method: 'PUT',
+        headers: headers({ 'content-type': RECORD_CONTENT_TYPE }),
+      });
+      if (!created.ok && !(await streamExistsAfterConflict(url, created))) {
+        await expectSuccess('create stream', created);
+      }
       ensuredStreams.add(key);
     })().finally(() => {
       ensuringStreams.delete(key);
@@ -316,7 +328,10 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
           registeredStreams.add(cacheKey);
           return;
         }
-        if (created.status === 200) {
+        if (
+          created.status === 200 ||
+          (await streamExistsAfterConflict(url, created))
+        ) {
           ensuredStreams.add(registryKey);
         } else {
           await expectSuccess('create stream registry', created);
@@ -489,8 +504,7 @@ export function createStreamer(config: UrsulaStreamerConfig): Streamer {
         }
         if (
           created.status === 200 ||
-          (created.status === 409 &&
-            created.headers.get('stream-closed') === 'true')
+          (await streamExistsAfterConflict(url, created))
         ) {
           ensuredStreams.add(key);
         } else {

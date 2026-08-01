@@ -269,6 +269,48 @@ describe('Ursula Workflow streamer', () => {
     await expect(
       streamer.streams.close('wrun_1', 'output')
     ).resolves.toBeUndefined();
+    await expect(
+      streamer.streams.close('wrun_1', 'output')
+    ).resolves.toBeUndefined();
+  });
+
+  it('recovers a close replay when create reports closed metadata conflict', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 201 }))
+      .mockResolvedValueOnce(response(null, { status: 204 }))
+      .mockResolvedValueOnce(
+        response('StreamAlreadyExistsConflict', { status: 409 })
+      )
+      .mockResolvedValueOnce(
+        response(null, {
+          status: 200,
+          headers: { 'stream-closed': 'true' },
+        })
+      )
+      .mockResolvedValueOnce(response(null, { status: 200 }))
+      .mockResolvedValueOnce(response(null, { status: 200 }))
+      .mockResolvedValueOnce(
+        response('already closed', {
+          status: 409,
+          headers: { 'stream-closed': 'true' },
+        })
+      );
+    const first = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+    await first.streams.close('wrun_1', 'output');
+
+    const replay = createStreamer({
+      baseUrl: 'https://ursula.test',
+      fetch,
+    });
+    await expect(
+      replay.streams.close('wrun_1', 'output')
+    ).resolves.toBeUndefined();
+    expect(fetch.mock.calls[4]?.[1]?.method).toBe('HEAD');
   });
 
   it('reports record tail and close state without reading payloads', async () => {
