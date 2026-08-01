@@ -453,7 +453,7 @@ describe('UrsulaClient', () => {
       .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockResolvedValueOnce(response(null, { status: 201 }))
       .mockResolvedValueOnce(
-        response('{"acknowledgements":[]}', {
+        response('[{"deduplicated":false},{"deduplicated":false}]', {
           status: 200,
           headers: {
             'stream-extensions': 'group-append-transaction-v1',
@@ -466,7 +466,7 @@ describe('UrsulaClient', () => {
       fetch,
     }).withAffinity('run-1');
 
-    await client.appendTransaction([
+    const results = await client.appendTransaction([
       {
         stream: 'run-run-1',
         values: { event: 'completed' },
@@ -482,6 +482,10 @@ describe('UrsulaClient', () => {
     ]);
 
     expect(fetch).toHaveBeenCalledTimes(3);
+    expect(results).toEqual([
+      { deduplicated: false },
+      { deduplicated: false },
+    ]);
     expect(String(fetch.mock.calls[2]?.[0])).toBe(
       'https://ursula.test/workflow/run-1/$transaction'
     );

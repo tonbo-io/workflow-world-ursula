@@ -56,6 +56,10 @@ export interface UrsulaTransactionOperation {
   expectedRecord?: number;
 }
 
+export interface UrsulaTransactionResult {
+  deduplicated: boolean;
+}
+
 export class UrsulaRequestError extends Error {
   readonly status: number;
   readonly operation: string;
@@ -430,7 +434,7 @@ export class UrsulaClient {
   /** Atomically appends to streams routed through this client's affinity key. */
   async appendTransaction(
     operations: readonly UrsulaTransactionOperation[]
-  ): Promise<void> {
+  ): Promise<UrsulaTransactionResult[]> {
     if (!this.affinity) {
       throw new Error('Ursula group transaction requires an affinity client');
     }
@@ -492,6 +496,22 @@ export class UrsulaClient {
         'Ursula did not advertise group-append-transaction-v1 after committing the transaction'
       );
     }
+    const results = parseUrsulaJson<unknown>(await response.text());
+    if (!Array.isArray(results) || results.length !== operations.length) {
+      throw new Error('Ursula returned an invalid group transaction result');
+    }
+    return results.map((result) => {
+      if (
+        typeof result !== 'object' ||
+        result === null ||
+        typeof (result as { deduplicated?: unknown }).deduplicated !== 'boolean'
+      ) {
+        throw new Error('Ursula returned an invalid group transaction item');
+      }
+      return {
+        deduplicated: (result as { deduplicated: boolean }).deduplicated,
+      };
+    });
   }
 
   async read<T>(

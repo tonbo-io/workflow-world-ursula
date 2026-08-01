@@ -1,5 +1,6 @@
 import type { World } from '@workflow/world';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { DEFAULT_RUN_AFFINITY_LANES } from './affinity.js';
 import { UrsulaClient } from './client.js';
 import { RunExecutionCoordinator } from './execution.js';
 import { createQueue, type UrsulaQueueConfig } from './queue.js';
@@ -183,6 +184,8 @@ export function createWorld(
     compactCompletedStepCommits:
       config.experimentalCompactCompletedStepCommits,
     pathAffinity: config.experimentalGroupTransactions,
+    pathAffinityLanes:
+      config.partitionCount ?? DEFAULT_RUN_AFFINITY_LANES,
   });
   const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,

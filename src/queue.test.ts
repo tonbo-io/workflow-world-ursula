@@ -5,6 +5,7 @@ import type {
   UrsulaClient,
   UrsulaRecord,
 } from './client.js';
+import { runAffinity } from './affinity.js';
 import type { RunExecutionCoordinator } from './execution.js';
 import { createQueue } from './queue.js';
 import { QueueJournal, queuePartition } from './queue-journal.js';
@@ -163,7 +164,7 @@ describe('Ursula queue runtime', () => {
     await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce());
     await queue.close();
 
-    expect(memory.affinities).toContain('wrun_local_1');
+    expect(memory.affinities).toContain(runAffinity('wrun_local_1', 8));
     expect(memory.waitedStreams).toContainEqual(
       expect.stringMatching(/^queue-/)
     );

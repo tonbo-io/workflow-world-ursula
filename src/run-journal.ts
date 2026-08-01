@@ -15,6 +15,10 @@ import {
   type UrsulaReadResult,
   type UrsulaTransactionOperation,
 } from './client.js';
+import {
+  DEFAULT_RUN_AFFINITY_LANES,
+  runAffinity,
+} from './affinity.js';
 
 export interface EntityChange<T> {
   id: string;
@@ -59,8 +63,10 @@ export interface RunJournalState {
 }
 
 export interface RunJournalOptions {
-  /** Route every run-owned stream through that run's path-affinity key. */
+  /** Route run-owned streams through a bounded path-affinity lane. */
   pathAffinity?: boolean;
+  /** Number of deterministic path-affinity lanes shared by run journals. */
+  pathAffinityLanes?: number;
   /**
    * Writes the common owned successful-step transaction as a compact tuple.
    *
@@ -74,6 +80,7 @@ export interface RunJournalOptions {
 export interface PreparedRunAppend {
   operation: UrsulaTransactionOperation;
   apply(): void;
+  deduplicated(): void;
 }
 
 type CompactCompletedStepFieldsV2 = [
@@ -869,6 +876,7 @@ export class RunJournal {
   private readonly affinityClients = new Map<string, UrsulaClient>();
   private readonly compactCompletedStepCommits: boolean;
   private readonly pathAffinity: boolean;
+  private readonly pathAffinityLanes: number;
 
   constructor(
     private readonly client: UrsulaClient,
@@ -877,21 +885,24 @@ export class RunJournal {
     this.compactCompletedStepCommits =
       options.compactCompletedStepCommits ?? false;
     this.pathAffinity = options.pathAffinity ?? false;
+    this.pathAffinityLanes =
+      options.pathAffinityLanes ?? DEFAULT_RUN_AFFINITY_LANES;
   }
 
   private clientFor(runId: string): UrsulaClient {
     if (!this.pathAffinity) return this.client;
-    let client = this.affinityClients.get(runId);
+    const affinity = runAffinity(runId, this.pathAffinityLanes);
+    let client = this.affinityClients.get(affinity);
     if (!client) {
-      client = this.client.withAffinity(runId);
-      this.affinityClients.set(runId, client);
+      client = this.client.withAffinity(affinity);
+      this.affinityClients.set(affinity, client);
       while (this.affinityClients.size > STATE_CACHE_MAX_RUNS) {
         const oldest = this.affinityClients.keys().next().value;
         if (typeof oldest === 'string') this.affinityClients.delete(oldest);
       }
     } else {
-      this.affinityClients.delete(runId);
-      this.affinityClients.set(runId, client);
+      this.affinityClients.delete(affinity);
+      this.affinityClients.set(affinity, client);
     }
     return client;
   }
@@ -1299,6 +1310,10 @@ export class RunJournal {
           }
         }
         this.scheduleCheckpoint(state);
+      },
+      deduplicated: () => {
+        this.cache.delete(state.runId);
+        this.eventCache.delete(state.runId);
       },
     };
   }
