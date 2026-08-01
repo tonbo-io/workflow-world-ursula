@@ -4,7 +4,11 @@ import type {
   CreateEventParams,
   EventResult,
 } from '@workflow/world';
-import type { PreparedRunAppend } from './run-journal.js';
+import type {
+  PreparedRunAppend,
+  RunCommit,
+  RunJournalState,
+} from './run-journal.js';
 
 export interface DeliveryExecution {
   runId: string;
@@ -34,6 +38,19 @@ interface DeliveryContext {
   delivery: DeliveryExecution;
   stagedStarts: Map<string, StagedStepStart>;
   turn: Promise<void>;
+  runTransaction?: DeliveryRunTransaction;
+}
+
+export type PendingRunCommit = Omit<
+  RunCommit,
+  'version' | 'runId' | 'previousRecord'
+>;
+
+export interface DeliveryRunTransaction {
+  baseState: RunJournalState;
+  state: RunJournalState;
+  commit: PendingRunCommit;
+  append: PreparedRunAppend;
 }
 
 type OwnedStepCommitter = (
@@ -41,8 +58,15 @@ type OwnedStepCommitter = (
   append: PreparedRunAppend
 ) => Promise<void>;
 
+type DeliveryCommitter = (
+  delivery: DeliveryExecution,
+  append: PreparedRunAppend,
+  timeoutSeconds: number | undefined
+) => Promise<void>;
+
 interface SharedDeliveryRegistry {
   deliveries: Map<string, DeliveryExecution>;
+  contexts: AsyncLocalStorage<DeliveryContext>;
 }
 
 const DELIVERY_REGISTRY = Symbol.for(
@@ -57,7 +81,10 @@ function sharedDeliveries(): SharedDeliveryRegistry {
   const globals = globalThis as typeof globalThis & {
     [DELIVERY_REGISTRY]?: SharedDeliveryRegistry;
   };
-  globals[DELIVERY_REGISTRY] ??= { deliveries: new Map() };
+  globals[DELIVERY_REGISTRY] ??= {
+    deliveries: new Map(),
+    contexts: new AsyncLocalStorage<DeliveryContext>(),
+  };
   return globals[DELIVERY_REGISTRY];
 }
 
@@ -69,21 +96,92 @@ function sharedDeliveries(): SharedDeliveryRegistry {
  * Ursula transaction.
  */
 export class RunExecutionCoordinator {
-  private readonly contexts = new AsyncLocalStorage<DeliveryContext>();
+  private readonly contexts = sharedDeliveries().contexts;
   private readonly ownedStarts = new Map<string, StagedStepStart>();
   private readonly ownedTurns = new Map<string, Promise<void>>();
   private ownedStepCommitter: OwnedStepCommitter | undefined;
+  private deliveryCommitter: DeliveryCommitter | undefined;
 
   constructor(
-    private readonly options: { allowOwnedLazyStarts?: boolean } = {}
+    private readonly options: {
+      allowOwnedLazyStarts?: boolean;
+      allowDeliveryTransactions?: boolean;
+    } = {}
   ) {}
 
   allowsOwnedLazyStarts(): boolean {
     return this.options.allowOwnedLazyStarts === true;
   }
 
+  allowsDeliveryTransactions(): boolean {
+    return this.options.allowDeliveryTransactions === true;
+  }
+
   setOwnedStepCommitter(committer: OwnedStepCommitter): void {
     this.ownedStepCommitter = committer;
+  }
+
+  setDeliveryCommitter(committer: DeliveryCommitter): void {
+    this.deliveryCommitter = committer;
+  }
+
+  stagedRunState(runId: string): RunJournalState | undefined {
+    const context = this.contexts.getStore();
+    return context?.runId === runId
+      ? context.runTransaction?.state
+      : undefined;
+  }
+
+  stagedRunCommit(runId: string): PendingRunCommit | undefined {
+    const context = this.contexts.getStore();
+    return context?.runId === runId
+      ? context.runTransaction?.commit
+      : undefined;
+  }
+
+  stagedRunBaseState(runId: string): RunJournalState | undefined {
+    const context = this.contexts.getStore();
+    return context?.runId === runId
+      ? context.runTransaction?.baseState
+      : undefined;
+  }
+
+  stageRunTransaction(
+    runId: string,
+    transaction: DeliveryRunTransaction
+  ): void {
+    const context = this.contexts.getStore();
+    if (context?.runId !== runId) {
+      throw new Error(`No active Ursula delivery transaction for run "${runId}"`);
+    }
+    context.runTransaction = transaction;
+  }
+
+  async flushRunTransaction(runId: string): Promise<boolean> {
+    const context = this.contexts.getStore();
+    const transaction =
+      context?.runId === runId ? context.runTransaction : undefined;
+    if (!context || !transaction || !this.ownedStepCommitter) return false;
+    await this.ownedStepCommitter(context.delivery, transaction.append);
+    context.runTransaction = undefined;
+    return true;
+  }
+
+  async finishDelivery(
+    runId: string,
+    timeoutSeconds: number | undefined
+  ): Promise<boolean> {
+    const context = this.contexts.getStore();
+    const transaction =
+      context?.runId === runId ? context.runTransaction : undefined;
+    if (!context || !transaction || !this.deliveryCommitter) return false;
+    await this.deliveryCommitter(
+      context.delivery,
+      transaction.append,
+      timeoutSeconds
+    );
+    context.runTransaction = undefined;
+    return true;
   }
 
   async commitOwnedStep(

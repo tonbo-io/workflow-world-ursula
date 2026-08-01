@@ -34,6 +34,11 @@ const DEFAULT_PARTITION_COUNT = 8;
 
 type QueueHandler = Parameters<Queue['createQueueHandler']>[1];
 
+interface InvocationResult {
+  timeoutSeconds?: number;
+  deliveryCommitted?: boolean;
+}
+
 export interface UrsulaQueueConfig {
   /** Store every run's queue in the same Ursula affinity group as its journal. */
   runLocalQueues?: boolean;
@@ -405,7 +410,7 @@ export function createQueue(
   async function invokeHttp(
     queueName: ValidQueueName,
     lease: QueueLease
-  ): Promise<{ timeoutSeconds?: number } | undefined> {
+  ): Promise<InvocationResult | undefined> {
     const baseUrl = deliveryBaseUrl();
     if (!baseUrl) {
       throw new Error(
@@ -449,18 +454,23 @@ export function createQueue(
         `Workflow queue delivery failed: HTTP ${response.status}${text ? `: ${text}` : ''}`
       );
     }
-    if (!text) return;
+    const deliveryCommitted =
+      response.headers.get('x-ursula-delivery-committed') === '1';
+    if (!text) return deliveryCommitted ? { deliveryCommitted } : undefined;
     const result = JSON.parse(text) as { timeoutSeconds?: unknown };
-    return typeof result.timeoutSeconds === 'number'
-      ? { timeoutSeconds: result.timeoutSeconds }
-      : undefined;
+    return {
+      ...(typeof result.timeoutSeconds === 'number'
+        ? { timeoutSeconds: result.timeoutSeconds }
+        : {}),
+      ...(deliveryCommitted ? { deliveryCommitted } : {}),
+    };
   }
 
   async function invoke(
     queueName: ValidQueueName,
     lease: QueueLease,
     handler: QueueHandler | undefined
-  ): Promise<{ timeoutSeconds?: number } | undefined> {
+  ): Promise<InvocationResult | undefined> {
     if (!handler) return invokeHttp(queueName, lease);
     const call = async () =>
       (await handler(lease.message.message, {
@@ -469,9 +479,19 @@ export function createQueue(
         messageId: lease.message.messageId,
         requestId: lease.message.headers?.['x-vercel-id'],
       })) ?? undefined;
-    return executions
-      ? executions.run(deliveryExecution(queueName, lease), call)
-      : call();
+    const execution = deliveryExecution(queueName, lease);
+    if (!executions || !execution) return call();
+    return executions.run(execution, async () => {
+      const result = await call();
+      const committed = await executions.finishDelivery(
+        execution.runId,
+        result?.timeoutSeconds
+      );
+      return {
+        ...(result ?? {}),
+        ...(committed ? { deliveryCommitted: true } : {}),
+      };
+    });
   }
 
   async function heartbeat(
@@ -509,6 +529,7 @@ export function createQueue(
     );
     try {
       const result = await invoke(queueName, lease, handler);
+      if (result?.deliveryCommitted) return null;
       if (typeof result?.timeoutSeconds === 'number') {
         const timeoutMs = Math.max(0, result.timeoutSeconds) * 1000;
         await journalForLease(lease).retry(
@@ -700,6 +721,12 @@ export function createQueue(
 
   const queue: Queue['queue'] = async (queueName, message, options) => {
     ValidQueueNameSchema.parse(queueName);
+    if (!('__healthCheck' in message)) {
+      // A continuation must never become visible before the run mutations
+      // that made it necessary. Finish the current local batch first; the
+      // lease extension keeps this delivery authoritative until its final ACK.
+      await executions?.flushRunTransaction?.(message.runId);
+    }
     const runId = runLocalQueues ? affinityForMessage(message) : undefined;
     const partition = runLocalQueues ? 0 : queuePartition(message, partitionCount);
     const journal = journalForTarget(queueName, partition, runId);
@@ -794,7 +821,11 @@ export function createQueue(
                 expiresAt,
               }
             : undefined;
-        if (execution && executions?.allowsOwnedLazyStarts()) {
+        if (
+          execution &&
+          (executions?.allowsOwnedLazyStarts() ||
+            executions?.allowsDeliveryTransactions())
+        ) {
           const journal = journalForTarget(
             queueName.data,
             execution.queuePartition,
@@ -814,10 +845,22 @@ export function createQueue(
             );
           }
         }
-        const result = executions
-          ? await executions.run(execution, call)
-          : await call();
-        return Response.json(result ?? { ok: true });
+        const completed =
+          executions && execution
+            ? await executions.run(execution, async () => {
+                const result = await call();
+                const committed = await executions.finishDelivery(
+                  execution.runId,
+                  result?.timeoutSeconds
+                );
+                return { result, committed };
+              })
+            : { result: await call(), committed: false };
+        return Response.json(completed.result ?? { ok: true }, {
+          headers: completed.committed
+            ? { 'x-ursula-delivery-committed': '1' }
+            : undefined,
+        });
       } catch (error) {
         return Response.json(String(error), { status: 500 });
       }
@@ -842,6 +885,21 @@ export function createQueue(
         new Date(Date.now() + leaseDurationMs)
       );
     });
+    executions.setDeliveryCommitter(
+      async (delivery, append, timeoutSeconds) => {
+        const journal = journalForTarget(
+          delivery.queueName as ValidQueueName,
+          delivery.queuePartition,
+          delivery.runId
+        );
+        if (!journal) {
+          throw new Error(
+            `Invalid Ursula queue partition ${delivery.queuePartition}`
+          );
+        }
+        await journal.commitDelivery(delivery, append, timeoutSeconds);
+      }
+    );
   }
 
   return {

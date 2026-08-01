@@ -16,6 +16,11 @@ export interface UrsulaWorldConfig
    */
   experimentalOwnedStepTransactions?: boolean;
   /**
+   * Stages all compatible run mutations produced by one queue delivery and
+   * commits them with that delivery's ACK or retry transition.
+   */
+  experimentalDeliveryTransactions?: boolean;
+  /**
    * Writes successful owned-step transactions in the compact journal format.
    *
    * Reader support is unconditional. Enable writing only after every process
@@ -128,6 +133,8 @@ function environmentConfig(): UrsulaWorldConfig {
     ),
     experimentalOwnedStepTransactions:
       process.env.WORKFLOW_URSULA_EXPERIMENTAL_OWNED_STEP_TRANSACTIONS === '1',
+    experimentalDeliveryTransactions:
+      process.env.WORKFLOW_URSULA_EXPERIMENTAL_DELIVERY_TRANSACTIONS === '1',
     experimentalCompactCompletedStepCommits:
       process.env
         .WORKFLOW_URSULA_EXPERIMENTAL_COMPACT_COMPLETED_STEP_COMMITS === '1',
@@ -163,11 +170,12 @@ export function createWorld(
   config: UrsulaWorldConfig = environmentConfig()
 ): World {
   if (
-    config.experimentalOwnedStepTransactions &&
+    (config.experimentalOwnedStepTransactions ||
+      config.experimentalDeliveryTransactions) &&
     !config.experimentalGroupTransactions
   ) {
     throw new Error(
-      'experimentalOwnedStepTransactions requires experimentalGroupTransactions'
+      'Ursula delivery transactions require experimentalGroupTransactions'
     );
   }
   const client = new UrsulaClient(config);
@@ -178,6 +186,7 @@ export function createWorld(
   });
   const executions = new RunExecutionCoordinator({
     allowOwnedLazyStarts: config.experimentalOwnedStepTransactions,
+    allowDeliveryTransactions: config.experimentalDeliveryTransactions,
   });
   const { storage } = createStorage(client, { journal, executions });
   const queue = createQueue(

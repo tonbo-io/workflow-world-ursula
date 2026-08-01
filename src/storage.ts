@@ -67,7 +67,7 @@ function mergeChanges<T>(
   return [...merged].map(([id, value]) => ({ id, value }));
 }
 
-function combineStepCommits(
+function combineRunCommits(
   operationId: string,
   started: PendingRunCommit,
   terminal: PendingRunCommit
@@ -330,6 +330,8 @@ export function createStorage(
     runId: string,
     options: { cache?: boolean } = {}
   ): Promise<RunJournalState> {
+    const staged = executions?.stagedRunState(runId);
+    if (staged) return staged;
     try {
       let state = await journal.load(runId, { cache: options.cache });
       if (!state.run) throw new WorkflowRunNotFoundError(runId);
@@ -401,6 +403,109 @@ export function createStorage(
       }
     );
     return states.filter((state): state is RunJournalState => state !== null);
+  }
+
+  async function stagedEventResult(
+    result: EventResult,
+    runId: string,
+    request: AnyEventRequest,
+    params: CreateEventParams | undefined
+  ): Promise<EventResult> {
+    const commit = executions?.stagedRunCommit(runId);
+    const base = executions?.stagedRunBaseState(runId);
+    if (!commit || !base) return result;
+    const preload =
+      request.eventType === 'run_started' && params?.skipPreload !== true;
+    const delta =
+      (request.eventType === 'step_completed' ||
+        request.eventType === 'step_failed') &&
+      typeof params?.sinceCursor === 'string';
+    if (!preload && !delta) return result;
+    const persisted = await journal.events(runId, base.nextRecord);
+    const events = [...persisted, ...commit.events];
+    const { start, limit } = paginationBounds({
+      cursor: delta ? params?.sinceCursor : undefined,
+      limit: MAX_LIMIT,
+      sortOrder: 'asc',
+    });
+    const page = events.slice(start, start + limit);
+    const next = start + page.length;
+    return {
+      ...result,
+      events: page.map((event) =>
+        stripEventDataRefs(event, params?.resolveData ?? 'all')
+      ),
+      cursor: page.length > 0 ? encodeCursor(next) : null,
+      hasMore: next < events.length,
+    };
+  }
+
+  async function stageDeliveryMutation(
+    runId: string,
+    request: AnyEventRequest,
+    params: CreateEventParams | undefined,
+    callId: string
+  ): Promise<EventResult | undefined> {
+    const coordinator = executions;
+    const delivery = coordinator?.current(runId);
+    if (
+      !coordinator?.allowsDeliveryTransactions() ||
+      !delivery ||
+      delivery.runId !== runId
+    ) {
+      return;
+    }
+
+    return coordinator.exclusive(runId, async () => {
+      const working = coordinator.stagedRunState(runId);
+      const hasExternalHookState =
+        request.eventType === 'hook_created' ||
+        request.eventType === 'hook_disposed' ||
+        ((request.eventType === 'run_completed' ||
+          request.eventType === 'run_failed' ||
+          request.eventType === 'run_cancelled') &&
+          (working?.hooks.size ?? 0) > 0);
+      if (hasExternalHookState) {
+        await coordinator.flushRunTransaction(runId);
+        return;
+      }
+
+      const base =
+        coordinator.stagedRunBaseState(runId) ??
+        (await journal.loadForMutation(runId));
+      const state = coordinator.stagedRunState(runId) ?? base;
+      const materialized = materializeEvent(state, request, {
+        eventId: `evnt_${ulid()}`,
+        syntheticEventId: `evnt_${ulid()}`,
+        operationId: mutationOperationId(
+          state,
+          request,
+          callId,
+          params?.requestId
+        ),
+        now: new Date(),
+        params,
+      });
+      if (!materialized.commit) return materialized.result;
+      const previous = coordinator.stagedRunCommit(runId);
+      const operationId = `run-delivery:${runId}:${delivery.token}:${base.nextRecord}:${requestDigest(request)}`;
+      const commit = previous
+        ? combineRunCommits(operationId, previous, materialized.commit)
+        : { ...materialized.commit, operationId };
+      const preview = journal.preview(base, commit);
+      coordinator.stageRunTransaction(runId, {
+        baseState: base,
+        state: preview,
+        commit,
+        append: journal.prepareAppend(base, commit),
+      });
+      return stagedEventResult(
+        materialized.result,
+        runId,
+        request,
+        params
+      );
+    });
   }
 
   async function stageStepStart(
@@ -597,7 +702,7 @@ export function createStorage(
           staged.request.eventData?.ownerMessageId ??
           staged.callId;
         const operationId = `run-step-transaction:${runId}:${owner}:${stepId}:${requestDigest(request)}`;
-        const commit = combineStepCommits(
+        const commit = combineRunCommits(
           operationId,
           started.commit,
           terminal.commit
@@ -721,6 +826,13 @@ export function createStorage(
             'runId is required for non-run_created events'
           );
         }
+        const deliveryResult = await stageDeliveryMutation(
+          effectiveRunId,
+          data,
+          params,
+          callId
+        );
+        if (deliveryResult) return deliveryResult;
         if (data.eventType === 'step_started') {
           const staged = await stageStepStart(
             effectiveRunId,
@@ -883,7 +995,12 @@ export function createStorage(
       },
       async get(runId, eventId, params) {
         await loadRun(runId);
-        const event = (await journal.events(runId)).find(
+        const staged = executions?.stagedRunCommit(runId)?.events ?? [];
+        const base = executions?.stagedRunBaseState(runId);
+        const event = [
+          ...(await journal.events(runId, base?.nextRecord)),
+          ...staged,
+        ].find(
           (candidate) => candidate.eventId === eventId
         );
         if (!event)
@@ -892,7 +1009,12 @@ export function createStorage(
       },
       async list(params) {
         await loadRun(params.runId);
-        const events = (await journal.events(params.runId)).map((event) =>
+        const staged = executions?.stagedRunCommit(params.runId)?.events ?? [];
+        const base = executions?.stagedRunBaseState(params.runId);
+        const events = [
+          ...(await journal.events(params.runId, base?.nextRecord)),
+          ...staged,
+        ].map((event) =>
           stripEventDataRefs(event, params.resolveData ?? 'all')
         );
         if (params.pagination?.sortOrder === 'desc') events.reverse();
